@@ -1,0 +1,44 @@
+# Local configuration and secrets (keep documented samples)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_temp/
+scratch/
+.tmp/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.uv-cache/
+
+# Runtime state, media, and logs
+runtime/
+media/
+recordings/
+clips/
+logs/
+*.log
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

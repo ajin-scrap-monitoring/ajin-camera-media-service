@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "camera-media-service"
+version = "0.1.0"
+description = "Camera media ingest, live session, and storage runtime packaging"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "websockets>=13,<14",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.24,<0.25",
+  "ruff>=0.9,<0.10",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/camera_media_service"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src/camera_media_service", "tests", "pyproject.toml", "uv.lock", "README.md"]
+exclude = ["**/__pycache__/**", "**/*.pyc"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
