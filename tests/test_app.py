@@ -29,8 +29,14 @@ class FakeSslContext:
 
 
 @pytest.mark.asyncio
-async def test_create_app_exposes_camera_stream_route_and_ingests_valid_jpeg() -> None:
-    settings = Settings(camera_tokens={"cam-1": "secret-token"}, host="127.0.0.1", port=0)
+async def test_create_app_exposes_camera_stream_route_and_ingests_valid_jpeg(tmp_path) -> None:
+    settings = Settings(
+        camera_tokens={"cam-1": "secret-token"},
+        host="127.0.0.1",
+        port=0,
+        api_port=0,
+        media_root=str(tmp_path),
+    )
     app = create_app(settings)
 
     async with app.serve() as server:
@@ -49,8 +55,14 @@ async def test_create_app_exposes_camera_stream_route_and_ingests_valid_jpeg() -
 
 
 @pytest.mark.asyncio
-async def test_create_app_rejects_unauthorized_handshake_before_ingest() -> None:
-    settings = Settings(camera_tokens={"cam-1": "secret-token"}, host="127.0.0.1", port=0)
+async def test_create_app_rejects_unauthorized_handshake_before_ingest(tmp_path) -> None:
+    settings = Settings(
+        camera_tokens={"cam-1": "secret-token"},
+        host="127.0.0.1",
+        port=0,
+        api_port=0,
+        media_root=str(tmp_path),
+    )
     app = create_app(settings)
 
     async with app.serve() as server:
@@ -66,8 +78,14 @@ async def test_create_app_rejects_unauthorized_handshake_before_ingest() -> None
 
 
 @pytest.mark.asyncio
-async def test_create_app_rejects_route_mismatch_before_ingest() -> None:
-    settings = Settings(camera_tokens={"cam-1": "secret-token"}, host="127.0.0.1", port=0)
+async def test_create_app_rejects_route_mismatch_before_ingest(tmp_path) -> None:
+    settings = Settings(
+        camera_tokens={"cam-1": "secret-token"},
+        host="127.0.0.1",
+        port=0,
+        api_port=0,
+        media_root=str(tmp_path),
+    )
     app = create_app(settings)
 
     async with app.serve() as server:
@@ -87,9 +105,15 @@ async def test_create_app_rejects_route_mismatch_before_ingest() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_app_accepts_a_jpeg_larger_than_the_websockets_default_limit() -> None:
+async def test_create_app_accepts_a_jpeg_larger_than_the_websockets_default_limit(tmp_path) -> None:
     frame = b"\xff\xd8" + (b"a" * (1024 * 1024)) + b"\xff\xd9"
-    settings = Settings(camera_tokens={"cam-1": "secret-token"}, host="127.0.0.1", port=0)
+    settings = Settings(
+        camera_tokens={"cam-1": "secret-token"},
+        host="127.0.0.1",
+        port=0,
+        api_port=0,
+        media_root=str(tmp_path),
+    )
     app = create_app(settings)
 
     async with app.serve() as server:
@@ -107,9 +131,15 @@ async def test_create_app_accepts_a_jpeg_larger_than_the_websockets_default_limi
 
 
 @pytest.mark.asyncio
-async def test_create_app_rejects_a_frame_above_the_configured_limit() -> None:
+async def test_create_app_rejects_a_frame_above_the_configured_limit(tmp_path) -> None:
     frame = b"\xff\xd8" + (b"a" * (4 * 1024 * 1024)) + b"\xff\xd9"
-    settings = Settings(camera_tokens={"cam-1": "secret-token"}, host="127.0.0.1", port=0)
+    settings = Settings(
+        camera_tokens={"cam-1": "secret-token"},
+        host="127.0.0.1",
+        port=0,
+        api_port=0,
+        media_root=str(tmp_path),
+    )
     app = create_app(settings)
 
     async with app.serve() as server:
@@ -132,6 +162,7 @@ async def test_create_app_rejects_a_frame_above_the_configured_limit() -> None:
 @pytest.mark.asyncio
 async def test_websocket_server_builds_tls_context_and_passes_frame_limit_to_listener(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     served: dict[str, object] = {}
 
@@ -144,6 +175,8 @@ async def test_websocket_server_builds_tls_context_and_passes_frame_limit_to_lis
     monkeypatch.setattr(app_module.ssl, "SSLContext", FakeSslContext)
     settings = Settings(
         camera_tokens={},
+        api_port=0,
+        media_root=str(tmp_path),
         server_cert_path="/run/secrets/cert.pem",
         server_key_path="/run/secrets/key.pem",
     )
@@ -161,6 +194,7 @@ async def test_websocket_server_builds_tls_context_and_passes_frame_limit_to_lis
 @pytest.mark.asyncio
 async def test_websocket_server_uses_internal_reverse_proxy_mode_without_tls_paths(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     served: dict[str, object] = {}
 
@@ -171,7 +205,7 @@ async def test_websocket_server_uses_internal_reverse_proxy_mode_without_tls_pat
 
     monkeypatch.setattr(app_module, "serve", fake_serve)
 
-    async with create_app(Settings(camera_tokens={})).serve():
+    async with create_app(Settings(camera_tokens={}, api_port=0, media_root=str(tmp_path))).serve():
         pass
 
     assert served["ssl"] is None

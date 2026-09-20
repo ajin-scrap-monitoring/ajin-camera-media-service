@@ -16,6 +16,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest_temp/
+.test-*/
 scratch/
 .tmp/
 .ruff_cache/

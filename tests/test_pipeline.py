@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from camera_media_service.pipeline import FrameValidator, LiveFrameHub
 from camera_media_service.store import LatestFrameStore
 
@@ -47,3 +49,17 @@ def test_live_frame_hub_drops_oldest_frame_when_subscriber_queue_is_full() -> No
     assert queue.qsize() == 2
     items = [queue.get_nowait(), queue.get_nowait()]
     assert items == [env2, env3]
+
+
+@pytest.mark.asyncio
+async def test_recording_barrier_accounts_for_dropped_frames():
+    import asyncio
+
+    hub = LiveFrameHub(LatestFrameStore())
+    queue = hub.subscribe(maxsize=1, recording=True)
+    hub.publish("cam-1", VALID_JPEG)
+    barrier = asyncio.create_task(queue.wait_received())
+    await asyncio.sleep(0)
+    hub.publish("cam-1", VALID_JPEG + b"next")
+    await asyncio.wait_for(barrier, 0.5)
+    assert queue.qsize() == 1

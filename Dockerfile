@@ -7,6 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN useradd --create-home --uid 10002 --shell /usr/sbin/nologin cameramedia
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/camera-media \
+    && chown cameramedia:cameramedia /var/lib/camera-media
 
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src

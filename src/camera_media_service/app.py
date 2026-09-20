@@ -7,6 +7,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 
 from websockets.asyncio.server import ServerConnection, serve
@@ -120,12 +121,35 @@ class WebSocketServer:
 
     @asynccontextmanager
     async def serve(self):
-        if self.segment_writer is not None:
-            self.segment_writer.start()
+        runner = None
+        api_port = None
         if self.stats_task is not None:
             self.stats_task.start()
 
         try:
+            from aiohttp import web
+
+            from camera_media_service.http_api import create_http_app
+            from camera_media_service.recording import RecordingService
+
+            assert self.hub is not None
+            recording = RecordingService(
+                Path(self.settings.media_root),
+                set(self.settings.camera_tokens),
+                self.hub,
+                ffmpeg=self.settings.ffmpeg_path,
+                max_buffer_bytes=self.settings.max_buffer_bytes,
+                max_jobs=self.settings.max_clip_jobs,
+            )
+            runner = web.AppRunner(
+                create_http_app(recording),
+                shutdown_timeout=2,
+                access_log=None,
+            )
+            await runner.setup()
+            site = web.TCPSite(runner, self.settings.api_host, self.settings.api_port)
+            await site.start()
+            api_port = runner.addresses[0][1]
             async with serve(
                 self._handler,
                 host=self.settings.host,
@@ -135,8 +159,10 @@ class WebSocketServer:
                 max_size=self.settings.max_frame_bytes,
                 ssl=self._ssl_context(),
             ) as server:
-                yield SimpleNamespace(socket=server.sockets[0], server=server)
+                yield SimpleNamespace(socket=server.sockets[0], server=server, api_port=api_port)
         finally:
+            if runner is not None:
+                await runner.cleanup()
             if self.stats_task is not None:
                 await self.stats_task.stop()
             if self.segment_writer is not None:

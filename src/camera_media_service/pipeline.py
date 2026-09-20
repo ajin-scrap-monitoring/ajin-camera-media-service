@@ -17,6 +17,32 @@ class FrameEnvelope:
     jpeg: bytes
 
 
+class RecordingQueue(asyncio.Queue[FrameEnvelope]):
+    """A finite receipt barrier, independent of frames arriving after the snapshot."""
+
+    def __init__(self, maxsize: int):
+        super().__init__(maxsize)
+        self._sequence = 0
+        self._pending: dict[int, int] = {}
+        self._changed = asyncio.Event()
+
+    def put_nowait(self, item: FrameEnvelope) -> None:
+        super().put_nowait(item)
+        self._sequence += 1
+        self._pending[id(item)] = self._sequence
+
+    def acknowledge(self, item: FrameEnvelope) -> None:
+        self._pending.pop(id(item))
+        self.task_done()
+        self._changed.set()
+
+    async def wait_received(self) -> None:
+        through = self._sequence
+        while any(sequence <= through for sequence in self._pending.values()):
+            self._changed.clear()
+            await self._changed.wait()
+
+
 class FrameValidator:
     def __init__(self, max_frame_bytes: int) -> None:
         self.max_frame_bytes = max_frame_bytes
@@ -32,6 +58,7 @@ class LiveFrameHub:
     def __init__(self, frame_store: LatestFrameStore) -> None:
         self.frame_store = frame_store
         self._subscribers: set[asyncio.Queue[FrameEnvelope]] = set()
+        self.latest: dict[str, FrameEnvelope] = {}
 
     def publish(self, camera_id: str, jpeg: bytes) -> FrameEnvelope:
         generation = self.frame_store.put(camera_id, jpeg)
@@ -42,11 +69,16 @@ class LiveFrameHub:
             generation=generation,
             jpeg=jpeg,
         )
+        self.latest[camera_id] = envelope
 
         for queue in list(self._subscribers):
             if queue.full():
                 try:
-                    queue.get_nowait()
+                    dropped = queue.get_nowait()
+                    if isinstance(queue, RecordingQueue):
+                        queue.acknowledge(dropped)
+                    else:
+                        queue.task_done()
                 except asyncio.QueueEmpty:
                     pass
             try:
@@ -56,8 +88,10 @@ class LiveFrameHub:
 
         return envelope
 
-    def subscribe(self, maxsize: int = 100) -> asyncio.Queue[FrameEnvelope]:
-        queue: asyncio.Queue[FrameEnvelope] = asyncio.Queue(maxsize=maxsize)
+    def subscribe(
+        self, maxsize: int = 100, *, recording: bool = False
+    ) -> asyncio.Queue[FrameEnvelope]:
+        queue = RecordingQueue(maxsize) if recording else asyncio.Queue(maxsize=maxsize)
         self._subscribers.add(queue)
         return queue
 

@@ -21,6 +21,11 @@ class Settings:
     web_application_credential: str = ""
     server_cert_path: str = ""
     server_key_path: str = ""
+    api_host: str = "127.0.0.1"
+    api_port: int = 8889
+    ffmpeg_path: str = "ffmpeg"
+    max_buffer_bytes: int = 2 * 1024**3
+    max_clip_jobs: int = 32
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> Settings:
@@ -79,6 +84,11 @@ class Settings:
             web_application_credential=web_application_credential,
             server_cert_path=server_cert_path,
             server_key_path=server_key_path,
+            api_host=_read_required_text(environ, "MEDIA_API_HOST", "127.0.0.1"),
+            api_port=_read_int(environ, "MEDIA_API_PORT", 8889, 1, 65535),
+            ffmpeg_path=_read_required_text(environ, "FFMPEG_PATH", "ffmpeg"),
+            max_buffer_bytes=_read_int(environ, "MAX_BUFFER_BYTES", 2 * 1024**3, 1),
+            max_clip_jobs=_read_int(environ, "MAX_CLIP_JOBS", 32, 1),
         )
 
 
