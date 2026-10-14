@@ -143,3 +143,11 @@ Linux 개발용 imageio-ffmpeg7.0.2는 유효 TS 읽기에서 종료 코드-11�
 
 서버 시험 데이터: `/var/lib/ajin-camera-daily-validation-20261014`. 로그·합성 결과: `/home/kyuncho/ajin-daily-validation-results` 및 `ajin-daily-final-tests.log`. 시험 저장 예산16GiB, 최소 여유5GiB. 이 저장 예산은 운영30일 보관 용량을 확정한 값이 아니다.
 
+
+### 24시간 합성 시험 시작 기록
+
+2026-10-14 22:53:32 한국 시각(13:53:32 UTC)에 ajin-daily-probe-24h를 시작했다. 종료 목표는2026-10-15 22:54경이며 종료 판정/파일 조회 대기 시간이 더해질 수 있다. 실제 구현 이미지 ajin-camera-media-daily:ed98bc4에서 기록 중이다. 첫120초 경과 표본과 오늘 영상 길이 증가/error=null을 확인했다. 이 기록 시점은 state=running이며24시간 성공으로 보고하지 않는다.
+
+결과 파일은 /home/kyuncho/ajin-daily-validation-results/soak-24h.json, 프로세스는 ajin-daily-probe-24h다. state=passed와 컨테이너 종료 코드0, 자정 전후 날짜/coverage/누락 및 저장량을 함께 확인해야 인수 완료다. 로그가 새로 쓰이지 않거나 입력/저장이 멈추면 실행 중 표시만으로 성공 판단하지 않는다.
+
+최종 main 병합 결과도129개 시험(56.97초), Ruff check/format을 통과했다. 기존 미커밋 운영 문서는 작업 초기 커밋에 포함했고 원본을 로컬 stash에 보존했다. 계획 제목 공백8건 외에 초기 복사와 원본의 내용 차이가 없음을 확인했다.
