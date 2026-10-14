@@ -26,6 +26,16 @@ class Settings:
     ffmpeg_path: str = "ffmpeg"
     max_buffer_bytes: int = 2 * 1024**3
     max_clip_jobs: int = 32
+    daily_recording_enabled: bool = False
+    daily_segment_seconds: int = 10
+    max_daily_storage_bytes: int | None = None
+    min_free_storage_bytes: int = 5 * 1024**3
+    daily_export_cache_hours: int = 24
+    max_daily_export_jobs: int = 8
+    max_daily_pending_seconds: int = 30
+    daily_width: int = 1920
+    daily_height: int = 1080
+    daily_fps: int = 30
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> Settings:
@@ -71,6 +81,17 @@ class Settings:
         edge_auth_secret = _read_required_text(environ, "EDGE_AUTH_SECRET", default="")
         camera_tokens = _read_camera_tokens(edge_auth_secret)
 
+        daily_enabled = _read_bool(environ, "DAILY_RECORDING_ENABLED", False)
+        daily_budget = _read_int(environ, "MAX_DAILY_STORAGE_BYTES", 0, 0)
+        if daily_enabled and not daily_budget:
+            raise SettingsError(
+                "MAX_DAILY_STORAGE_BYTES must be explicitly set when daily recording is enabled"
+            )
+        daily_width = _read_int(environ, "DAILY_WIDTH", 1920, 2, 3840)
+        daily_height = _read_int(environ, "DAILY_HEIGHT", 1080, 2, 2160)
+        if daily_width % 2 or daily_height % 2:
+            raise SettingsError("DAILY_WIDTH and DAILY_HEIGHT must be even")
+
         return cls(
             camera_tokens=camera_tokens,
             host=host,
@@ -89,11 +110,28 @@ class Settings:
             ffmpeg_path=_read_required_text(environ, "FFMPEG_PATH", "ffmpeg"),
             max_buffer_bytes=_read_int(environ, "MAX_BUFFER_BYTES", 2 * 1024**3, 1),
             max_clip_jobs=_read_int(environ, "MAX_CLIP_JOBS", 32, 1),
+            daily_recording_enabled=daily_enabled,
+            daily_segment_seconds=_read_int(environ, "DAILY_SEGMENT_SECONDS", 10, 2, 60),
+            max_daily_storage_bytes=daily_budget or None,
+            min_free_storage_bytes=_read_int(environ, "MIN_FREE_STORAGE_BYTES", 5 * 1024**3, 0),
+            daily_export_cache_hours=_read_int(environ, "DAILY_EXPORT_CACHE_HOURS", 24, 1, 168),
+            max_daily_export_jobs=_read_int(environ, "MAX_DAILY_EXPORT_JOBS", 8, 1, 32),
+            max_daily_pending_seconds=_read_int(environ, "MAX_DAILY_PENDING_SECONDS", 30, 10, 300),
+            daily_width=daily_width,
+            daily_height=daily_height,
+            daily_fps=_read_int(environ, "DAILY_FPS", 30, 1, 60),
         )
 
 
 class SettingsError(ValueError):
     pass
+
+
+def _read_bool(environ: Mapping[str, str], key: str, default: bool) -> bool:
+    raw = environ.get(key, str(default)).strip().lower()
+    if raw not in ("true", "false"):
+        raise SettingsError(f"{key} must be true or false")
+    return raw == "true"
 
 
 def _read_required_text(environ: Mapping[str, str], key: str, default: str) -> str:

@@ -9,6 +9,7 @@ import math
 import shutil
 import sqlite3
 import time
+import uuid
 from collections.abc import Callable
 
 from camera_media_service.daily_catalog import DailyCatalog
@@ -27,14 +28,14 @@ class DailyRecordingService:
         recording: RecordingService,
         catalog: DailyCatalog,
         *,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] | None = None,
         settings,
     ):
         self.recording, self.catalog, self.settings, self.clock = (
             recording,
             catalog,
             settings,
-            clock,
+            clock or time.time,
         )
         self.db, self.lock = recording.db, recording.lock
         self.db.executescript(
@@ -48,6 +49,7 @@ class DailyRecordingService:
         self.offline = {}
         self.last_error = None
         self._closed = False
+        self.storage_reservations = {}
 
     def notify_loss(self, camera_id: str, start_at: float, end_at: float, reason_code: str) -> None:
         if end_at > start_at and camera_id in self.recording.cameras:
@@ -100,18 +102,29 @@ class DailyRecordingService:
     def _flush_losses(self, now: float) -> None:
         losses, self.losses = self.losses, []
         for camera, start, end, reason in losses:
+            self._save_loss(camera, start, end, reason)
+        for camera, start in self.offline.items():
+            # Completed windows consult this open interval as well as durable loss records.
+            if now > start:
+                self._save_loss(camera, start, now, "CAMERA_DISCONNECTED")
+                self.offline[camera] = now
+
+    def _save_loss(self, camera, start, end, reason):
+        row = self.db.execute(
+            "SELECT id,start,end FROM daily_gaps WHERE camera=? AND reason=? "
+            "AND start<=? AND end>=? ORDER BY id DESC LIMIT 1",
+            (camera, reason, end, start),
+        ).fetchone()
+        if row:
+            self.db.execute(
+                "UPDATE daily_gaps SET start=?,end=? WHERE id=?",
+                (min(start, row["start"]), max(end, row["end"]), row["id"]),
+            )
+        else:
             self.db.execute(
                 "INSERT INTO daily_gaps(camera,start,end,reason) VALUES(?,?,?,?)",
                 (camera, start, end, reason),
             )
-        for camera, start in self.offline.items():
-            # Completed windows consult this open interval as well as durable loss records.
-            if now > start:
-                self.db.execute(
-                    "INSERT INTO daily_gaps(camera,start,end,reason) VALUES(?,?,?,?)",
-                    (camera, start, now, "CAMERA_DISCONNECTED"),
-                )
-                self.offline[camera] = now
 
     def segment_path(self, segment: dict):
         day = self.catalog.get_day(segment["recording_id"])
@@ -202,17 +215,8 @@ class DailyRecordingService:
         start, end = epoch(day["window_start_at"]), epoch(day["window_end_at"])
         until = max(epoch(day["coverage_as_of_at"]), min(end, until))
         segments = self.catalog.segments(day["recording_id"], ready_only=True)
-        intervals = []
         offset = 0.0
         for segment in segments:
-            intervals.append(
-                {
-                    "start_at": iso(segment["start_at"]),
-                    "end_at": iso(segment["end_at"]),
-                    "playback_start_seconds": round(offset, 3),
-                    "playback_end_seconds": round(offset + segment["duration"], 3),
-                }
-            )
             offset += segment["duration"]
         spans = []
         point = start
@@ -253,7 +257,7 @@ class DailyRecordingService:
             recorded_seconds=round(offset, 3),
             gaps=gaps,
             has_gaps=bool(gaps),
-            available_intervals=build_available_intervals(segments),
+            available_intervals=build_available_intervals(segments, gaps),
             playable_until_at=iso(segments[-1]["end_at"]) if segments else None,
             playback_state="ready" if segments else "pending",
             playback_path=f"/api/v2/daily-recordings/{day['recording_id']}/hls/index.m3u8"
@@ -315,6 +319,9 @@ class DailyRecordingService:
                     async with self.lock:
                         with self.db:
                             day = self.catalog.ensure_day(camera, window, policy["retention_days"])
+                            if now >= window.end_at and day["status"] == "recording":
+                                day["status"] = "finalizing"
+                                self.catalog.save_day(day)
                     slot_end = min(
                         window.end_at,
                         (math.floor(cursor / self.settings.daily_segment_seconds) + 1)
@@ -360,17 +367,16 @@ class DailyRecordingService:
                             )
 
     async def _record_slot(self, day: dict, start: float, end: float) -> None:
+        lease_id = str(uuid.uuid4())
         async with self.lock:
             with self.db:
-                lease = self.catalog.begin_segment(day["recording_id"], start, end)
-                frames = self.recording.pin_frames(
-                    lease["segment_id"], day["camera_id"], start, end
-                )
+                frames = self.recording.pin_frames(lease_id, day["camera_id"], start, end)
                 loss = self.db.execute(
                     "SELECT start,end FROM daily_gaps WHERE camera=? AND start<? AND end>?",
                     (day["camera_id"], end, start),
                 ).fetchall()
                 existing = self.catalog.segments(day["recording_id"], ready_only=True)
+                profile = existing[0]["profile"] if existing else self.profile
         groups = []
         for frame in frames:
             if any(s["start_at"] <= frame.received_at < s["end_at"] for s in existing):
@@ -386,19 +392,13 @@ class DailyRecordingService:
                 groups.append([])
             groups[-1].append(frame)
         try:
-            async with self.lock:
-                with self.db:
-                    self.db.execute(
-                        "UPDATE daily_segments SET status='empty' WHERE id=?",
-                        (lease["segment_id"],),
-                    )
             for group in groups:
                 async with self.lock:
                     with self.db:
                         segment = self.catalog.begin_segment(
                             day["recording_id"], group[0].received_at, end
                         )
-                        segment["profile"] = self.profile
+                        segment["profile"] = profile
                         self.db.execute(
                             "UPDATE daily_segments SET body=? WHERE id=?",
                             (json.dumps(segment), segment["segment_id"]),
@@ -416,7 +416,7 @@ class DailyRecordingService:
                         self.recording.buffer,
                         path,
                         group,
-                        {**self.profile, "end_at": group_end},
+                        {**profile, "end_at": group_end},
                     )
                     metadata["path"] = str(path.relative_to(self.recording.root))
                     async with self.lock:
@@ -458,9 +458,11 @@ class DailyRecordingService:
         finally:
             async with self.lock:
                 with self.db:
-                    self.recording.release_frames(lease["segment_id"])
+                    self.recording.release_frames(lease_id)
 
     async def check_space(self, reserve: int = 0) -> None:
+        reserve += sum(self.storage_reservations.values())
+
         def usage():
             total = sum(
                 p.stat().st_size
@@ -530,8 +532,10 @@ class DailyRecordingService:
         self.task = asyncio.create_task(self._loop())
 
     async def _loop(self) -> None:
-        while True:
+        while not self._closed:
             await asyncio.sleep(0.25)
+            if self._closed:
+                break
             try:
                 await self.tick(self.clock())
             except (OSError, RuntimeError, ApiError, sqlite3.Error):
@@ -573,8 +577,11 @@ class DailyRecordingService:
             return
         self._closed = True
         if self.task:
-            self.task.cancel()
-            await asyncio.gather(self.task, return_exceptions=True)
+            try:
+                await asyncio.wait_for(asyncio.shield(self.task), timeout=25)
+            except TimeoutError:
+                self.task.cancel()
+                await asyncio.gather(self.task, return_exceptions=True)
         try:
             await asyncio.wait_for(self._finish_tail(), timeout=25)
         except (TimeoutError, OSError, RuntimeError, sqlite3.Error):

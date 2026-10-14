@@ -9,6 +9,24 @@ def playback():
     return importlib.import_module("camera_media_service.daily_playback")
 
 
+def test_normal_frame_jitter_merges_but_confirmed_short_loss_does_not():
+    from camera_media_service.recording import iso
+
+    segments = [
+        {"start_at": 100.0, "end_at": 110.0, "duration": 10.0},
+        {"start_at": 110.02, "end_at": 120.0, "duration": 9.98},
+    ]
+    assert len(playback().build_available_intervals(segments)) == 1
+    assert (
+        len(
+            playback().build_available_intervals(
+                segments, [{"start_at": iso(110), "end_at": iso(110.02)}]
+            )
+        )
+        == 2
+    )
+
+
 def fixture():
     start = epoch("2026-10-13T15:00:00.000Z")
     day = {"recording_id": "day-id", "status": "recording"}

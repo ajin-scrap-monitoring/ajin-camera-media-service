@@ -13,6 +13,7 @@ import time
 
 from aiohttp import web
 
+from camera_media_service.media_files import stream_file
 from camera_media_service.recording import ACTIVE, ApiError, RecordingService, epoch
 
 LOG = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ def query_fields(request, allowed):
         raise ApiError(400, "INVALID_ARGUMENT", "Unknown or duplicate query parameter.")
 
 
-def create_http_app(service: RecordingService) -> web.Application:
+def create_http_app(service: RecordingService, *, daily=None, exports=None) -> web.Application:
     key = service.cursor_key
     viewers = 0
 
@@ -82,10 +83,16 @@ def create_http_app(service: RecordingService) -> web.Application:
     app = web.Application(middlewares=[boundary], client_max_size=16384)
 
     async def lifecycle(app):
-        await service.start()
         try:
+            await service.start()
+            if daily is not None:
+                await daily.start()
+                await exports.start()
             yield
         finally:
+            if daily is not None:
+                await exports.close()
+                await daily.close()
             await service.close()
 
     app.cleanup_ctx.append(lifecycle)
@@ -242,55 +249,13 @@ def create_http_app(service: RecordingService) -> web.Application:
         try:
             file.seek(0, 2)
             size = file.tell()
-            start, end, status = 0, size - 1, 200
-            raw = request.headers.get("Range", "")
-            if raw and "," not in raw:
-                try:
-                    match = re.fullmatch(r"bytes=(\d*)-(\d*)", raw)
-                    if match is None or not any(match.groups()):
-                        raise ValueError()
-                    left, right = match.groups()
-                    if left:
-                        start = int(left)
-                        end = min(int(right), size - 1) if right else size - 1
-                    else:
-                        length = int(right)
-                        if length <= 0:
-                            raise ValueError()
-                        start = max(0, size - length)
-                    if start >= size or end < start:
-                        raise ValueError()
-                    status = 206
-                except ValueError:
-                    return error_response(
-                        ApiError(416, "RANGE_NOT_SATISFIABLE", "Invalid range."),
-                        {"Content-Range": f"bytes */{size}"},
-                    )
-            disposition = "attachment" if request.query.get("download") == "true" else "inline"
-            headers = {
-                "Content-Type": "video/mp4",
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(end - start + 1),
-                "Cache-Control": "no-store",
-                "Content-Disposition": f'{disposition}; filename="{body["clip_id"]}.mp4"',
-            }
-            if status == 206:
-                headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-            response = web.StreamResponse(status=status, headers=headers)
-            await response.prepare(request)
-            file.seek(start)
-            remaining = end - start + 1
-            try:
-                while remaining:
-                    data = await asyncio.to_thread(file.read, min(65536, remaining))
-                    if not data:
-                        break
-                    await asyncio.wait_for(response.write(data), 30)
-                    remaining -= len(data)
-            except (OSError, TimeoutError):
-                if request.transport:
-                    request.transport.close()
-            return response
+            return await stream_file(
+                request,
+                file,
+                size=size,
+                filename=body["clip_id"] + ".mp4",
+                content_type="video/mp4",
+            )
         finally:
             file.close()
 
@@ -303,4 +268,8 @@ def create_http_app(service: RecordingService) -> web.Application:
     app.router.add_get(prefix + "/clips/{clip_id}", detail, allow_head=False)
     app.router.add_delete(prefix + "/clips/{clip_id}", detail)
     app.router.add_get(prefix + "/clips/{clip_id}/content", content, allow_head=False)
+    if daily is not None:
+        from camera_media_service.daily_http_api import register_daily_routes
+
+        register_daily_routes(app, daily, exports)
     return app

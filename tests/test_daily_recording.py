@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import importlib.util
 from datetime import date
@@ -67,6 +68,20 @@ async def test_storage_limit_keeps_live_data_but_reports_recording_loss(tmp_path
         await service.close()
 
 
+@pytest.mark.asyncio
+async def test_export_reservations_protect_space_from_new_recording(tmp_path, monkeypatch):
+    from camera_media_service.recording import ApiError
+
+    clock = [DailyWindow.from_date(date(2026, 10, 14)).start_at]
+    service, daily = make_daily(tmp_path, clock, monkeypatch)
+    daily.settings.max_daily_storage_bytes = 1000
+    daily.storage_reservations = {"export": 900}
+    with pytest.raises(ApiError, match="storage"):
+        await daily.check_space(200)
+    await daily.close()
+    await service.close()
+
+
 def make_daily(tmp_path, clock, monkeypatch):
     import camera_media_service.recording as recording
 
@@ -89,6 +104,96 @@ def make_daily(tmp_path, clock, monkeypatch):
         service, DailyCatalog(service.db), clock=lambda: clock[0], settings=settings
     )
     return service, daily
+
+
+@pytest.mark.asyncio
+async def test_shutdown_allows_inflight_encoder_to_commit(tmp_path, monkeypatch):
+    import imageio_ffmpeg
+
+    import camera_media_service.daily_recording as module
+
+    window = DailyWindow.from_date(date(2026, 10, 14))
+    clock = [window.start_at]
+    service, daily = make_daily(tmp_path, clock, monkeypatch)
+    service.ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    await daily.tick(clock[0])
+    for i in range(10):
+        await service.store_frame(FrameEnvelope("camera-main", clock[0] + i / 10, i, jpeg()))
+    started, finish = asyncio.Event(), asyncio.Event()
+    original = module.encode_daily_segment
+
+    async def slow(*args):
+        started.set()
+        await finish.wait()
+        return await original(*args)
+
+    monkeypatch.setattr(module, "encode_daily_segment", slow)
+    clock[0] += 10
+    daily.task = asyncio.create_task(daily.tick(clock[0]))
+    await started.wait()
+    closing = asyncio.create_task(daily.close())
+    await asyncio.sleep(0.01)
+    finish.set()
+    await closing
+    day = (await daily.list_days("camera-main", {}, 20, None))[0]
+    assert day["playback_state"] == "ready"
+    assert len(daily.catalog.segments(day["recording_id"], ready_only=True)) == 1
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_offline_ticks_coalesce_loss_rows(tmp_path, monkeypatch):
+    window = DailyWindow.from_date(date(2026, 10, 14))
+    clock = [window.start_at]
+    service, daily = make_daily(tmp_path, clock, monkeypatch)
+    await daily.tick(clock[0])
+    daily.connection_changed("camera-main", False, clock[0])
+    for i in range(1, 101):
+        clock[0] = window.start_at + i / 4
+        await daily.tick(clock[0])
+    assert (
+        service.db.execute(
+            "SELECT count(*) FROM daily_gaps WHERE reason='CAMERA_DISCONNECTED'"
+        ).fetchone()[0]
+        == 1
+    )
+    await daily.close()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_profile_is_frozen_and_midnight_is_finalizing(tmp_path, monkeypatch):
+    import imageio_ffmpeg
+
+    import camera_media_service.daily_recording as module
+
+    window = DailyWindow.from_date(date(2026, 10, 14))
+    clock = [window.end_at - 20]
+    service, daily = make_daily(tmp_path, clock, monkeypatch)
+    service.ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    await daily.tick(clock[0])
+    raw = jpeg()
+    for i in range(10):
+        await service.store_frame(FrameEnvelope("camera-main", clock[0] + i / 10, i, raw))
+    clock[0] += 10
+    await daily.tick(clock[0])
+    day = (await daily.list_days("camera-main", {}, 20, None))[0]
+    daily.settings.daily_width = 640
+    for i in range(10):
+        await service.store_frame(FrameEnvelope("camera-main", clock[0] + i / 10, i, raw))
+    original = module.encode_daily_segment
+
+    async def inspect(*args):
+        assert (await daily.get_day(day["recording_id"]))["status"] == "finalizing"
+        return await original(*args)
+
+    monkeypatch.setattr(module, "encode_daily_segment", inspect)
+    clock[0] = window.end_at
+    await daily.tick(clock[0])
+    segments = daily.catalog.segments(day["recording_id"], ready_only=True)
+    assert len(segments) == 2 and segments[0]["profile"] == segments[1]["profile"]
+    await daily.close()
+    await service.close()
 
 
 @pytest.mark.asyncio

@@ -7,12 +7,17 @@ import math
 from camera_media_service.recording import epoch, iso
 
 
-def build_available_intervals(segments: list[dict]) -> list[dict]:
+def build_available_intervals(segments: list[dict], gaps: list[dict] = ()) -> list[dict]:
     intervals = []
     offset = 0.0
     for segment in segments:
         end = offset + segment["duration"]
-        if intervals and abs(epoch(intervals[-1]["end_at"]) - segment["start_at"]) <= 0.001:
+        previous_end = epoch(intervals[-1]["end_at"]) if intervals else None
+        known_loss = previous_end is not None and any(
+            epoch(g["start_at"]) < segment["start_at"] and epoch(g["end_at"]) > previous_end
+            for g in gaps
+        )
+        if intervals and 0 <= segment["start_at"] - previous_end <= 1 and not known_loss:
             intervals[-1].update(end_at=iso(segment["end_at"]), playback_end_seconds=round(end, 3))
         else:
             intervals.append(

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import shutil
+import sqlite3
 import uuid
 
 from camera_media_service.daily_recording import DailyRecordingService
@@ -26,7 +27,7 @@ class DailyExportService:
         self.slot = asyncio.Semaphore(1)
         self.task = None
         self.closed = False
-        self.reservations = {}
+        self.reservations = daily.storage_reservations
         self.db.execute("CREATE TABLE IF NOT EXISTS daily_cleanup(day_id TEXT PRIMARY KEY)")
         with self.db:
             for row in self.db.execute(
@@ -77,7 +78,7 @@ class DailyExportService:
                 raise ApiError(503, "EXPORT_CAPACITY_EXCEEDED", "Export queue is full.")
             segments = self.daily.catalog.segments(recording_id, ready_only=True)
             reserve = int(sum(s["size_bytes"] for s in segments) * 1.2) + 1048576
-            await self.daily.check_space(reserve + sum(self.reservations.values()))
+            await self.daily.check_space(reserve)
             job = {
                 "job_id": str(uuid.uuid4()),
                 "recording_id": recording_id,
@@ -105,8 +106,9 @@ class DailyExportService:
             return day, True
 
     def _done(self, key, task):
-        self.jobs.pop(key, None)
-        self.reservations.pop(key, None)
+        if self.jobs.get(key) is task:
+            self.jobs.pop(key, None)
+            self.reservations.pop(key, None)
         if not task.cancelled() and task.exception():
             LOG.error("Daily export failed", exc_info=task.exception())
 
@@ -116,7 +118,7 @@ class DailyExportService:
         metadata = None
         try:
             async with self.slot:
-                await self.daily.check_space(sum(self.reservations.values()))
+                await self.daily.check_space()
                 metadata = await merge_daily_mp4(
                     self.daily.recording.ffmpeg,
                     segments,
@@ -270,7 +272,7 @@ class DailyExportService:
             await asyncio.sleep(5)
             try:
                 await self.maintenance(self.daily.clock())
-            except OSError:
+            except (OSError, sqlite3.Error):
                 LOG.exception("Daily retention unavailable")
 
     async def close(self) -> None:

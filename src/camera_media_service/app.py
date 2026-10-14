@@ -133,6 +133,8 @@ class WebSocketServer:
             from camera_media_service.recording import RecordingService
 
             assert self.hub is not None
+            if self.settings.daily_recording_enabled and not self.settings.max_daily_storage_bytes:
+                raise ValueError("Daily recording requires MAX_DAILY_STORAGE_BYTES")
             recording = RecordingService(
                 Path(self.settings.media_root),
                 set(self.settings.camera_tokens),
@@ -141,8 +143,18 @@ class WebSocketServer:
                 max_buffer_bytes=self.settings.max_buffer_bytes,
                 max_jobs=self.settings.max_clip_jobs,
             )
+            daily, exports = None, None
+            if self.settings.daily_recording_enabled:
+                from camera_media_service.daily_catalog import DailyCatalog
+                from camera_media_service.daily_export import DailyExportService
+                from camera_media_service.daily_recording import DailyRecordingService
+
+                daily = DailyRecordingService(
+                    recording, DailyCatalog(recording.db), settings=self.settings
+                )
+                exports = DailyExportService(daily, self.settings)
             runner = web.AppRunner(
-                create_http_app(recording),
+                create_http_app(recording, daily=daily, exports=exports),
                 shutdown_timeout=2,
                 access_log=None,
             )

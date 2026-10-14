@@ -5,6 +5,27 @@ import pytest
 from camera_media_service.settings import Settings, SettingsError
 
 
+def test_daily_feature_requires_finite_storage_budget_and_parses_profile():
+    env = {"EDGE_AUTH_SECRET": '{"cam-1":"test"}', "DAILY_RECORDING_ENABLED": "true"}
+    with pytest.raises(SettingsError, match="MAX_DAILY_STORAGE_BYTES"):
+        Settings.from_env(env)
+    env.update(
+        MAX_DAILY_STORAGE_BYTES="1073741824", DAILY_WIDTH="1280", DAILY_HEIGHT="720", DAILY_FPS="15"
+    )
+    settings = Settings.from_env(env)
+    assert settings.daily_recording_enabled and settings.max_daily_storage_bytes == 1073741824
+    assert (
+        settings.daily_width == 1280 and settings.daily_height == 720 and settings.daily_fps == 15
+    )
+    for key, value in [
+        ("DAILY_FPS", "0"),
+        ("DAILY_WIDTH", "641"),
+        ("DAILY_RECORDING_ENABLED", "perhaps"),
+    ]:
+        with pytest.raises(SettingsError):
+            Settings.from_env({**env, key: value})
+
+
 def test_settings_from_env_rejects_documented_default_without_auth_secret() -> None:
     with pytest.raises(SettingsError, match="EDGE_AUTH_SECRET must not be empty"):
         Settings.from_env({})

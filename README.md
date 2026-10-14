@@ -1,8 +1,10 @@
 # ajin-camera-media-service
 
-카메라 엣지의 JPEG/WSS 수신, HTTP MJPEG 실시간 전달, 이벤트 전후 MP4 저장과 백엔드 제어 API를 제공하는 Python 서비스입니다.
+카메라 엣지의 JPEG/WSS 수신, HTTP MJPEG 실시간 전달, 이벤트 전후 MP4와 한국 날짜별 상시 녹화/HLS/하루 MP4 다운로드 API를 제공하는 Python 서비스입니다.
 
 백엔드 연동 규격은 [BACKEND_API_CONTRACT.md](docs/BACKEND_API_CONTRACT.md)에 있습니다. WHEP/WebRTC 송출은 제공하지 않습니다.
+
+동료에게 전달할 날짜 녹화 연동 문서는 [DAILY_RECORDING_API_GUIDE.md](docs/DAILY_RECORDING_API_GUIDE.md)입니다. 날짜 기능은 기본 비활성이며 아래 운영 설정으로 활성화합니다.
 
 ## 실행
 
@@ -40,7 +42,29 @@ HTTP API와 이벤트 녹화는 서비스 시작 시 항상 활성화됩니다. 
 | GET | `/clips/{clip_id}/content` | H.264/MP4, 단일 Range, 다운로드 |
 | DELETE | `/clips/{clip_id}` | 파일 삭제, 중복 기록 유지 |
 
-이벤트 최초 접수 시각과 당시 녹화 설정으로 구간을 고정합니다. 영상 구간은 서버 프레임 수신 시각 기준입니다. 실시간 조회 여부와 관계없이 버퍼를 유지하며, 이벤트 구간만 FFmpeg로 인코딩합니다.
+이벤트 최초 접수 시각과 당시 녹화 설정으로 구간을 고정합니다. 영상 구간은 서버 프레임 수신 시각 기준입니다. 실시간 조회 여부와 관계없이 버퍼를 유지합니다. 날짜 기능을 켜면 별도의 인코더가 짧은 H.264/TS 조각을 계속 저장하고, 조회 시 날짜당 한 건으로 제공합니다.
+
+## 날짜별 녹화
+
+`DAILY_RECORDING_ENABLED=true`와 양수 `MAX_DAILY_STORAGE_BYTES`를 함께 지정합니다. 기본 프로파일은1920×1080/30fps이며 입력을 정규화하고 한 날짜 안에서 출력 프로파일을 유지합니다. 변경한 프로파일은 다음 날짜부터 적용합니다. 같은 서버의 이벤트 인코딩과 CPU를 공유하므로 실제 영상으로 처리량과 저장량을 측정한 후 사용하세요.
+
+- 한국 자정마다 날짜를 전환합니다. 오늘은 완료된 조각까지 HLS로 재생하고, 지난 날짜는 HLS 재생 및 비동기 단일 MP4 준비가 가능합니다.
+- 실제 누락을 `gaps`, `has_gaps`, 종료 날짜의 `coverage=partial/none`으로 반환합니다. 미래 시간과 아직 처리 중인 꼬리는 누락으로 표시하지 않습니다.
+- MP4 준비는 저장된 H.264 조각을 다시 인코딩하지 않고 합칩니다. 누락 시간은 MP4 길이에 포함하지 않으므로 상세 API의 실제 시간 매핑과 함께 표시합니다.
+- API 목록·JSON·오류·Range·게이트웨이 경로는 [연동 가이드](docs/DAILY_RECORDING_API_GUIDE.md)를 참조하세요.
+
+| 환경 변수 | 기본값 / 역할 |
+| --- | --- |
+| `DAILY_RECORDING_ENABLED` | `false`, v2 서비스 활성화 |
+| `MAX_DAILY_STORAGE_BYTES` | 기본 미지정, 활성화 시 필수. 날짜 조각+MP4+임시 파일 예산 |
+| `MIN_FREE_STORAGE_BYTES` | `5368709120`, 최소 남겨 둘 공간(5GiB) |
+| `DAILY_WIDTH`, `DAILY_HEIGHT`, `DAILY_FPS` | `1920`, `1080`, `30` |
+| `DAILY_SEGMENT_SECONDS` | `10`, 조각 길이 목표(2..60초) |
+| `MAX_DAILY_PENDING_SECONDS` | `30`, 미처리 시간 상한 |
+| `DAILY_EXPORT_CACHE_HOURS` | `24`, MP4 캐시 유지 시간 |
+| `MAX_DAILY_EXPORT_JOBS` | `8`, 준비 중/대기 작업 총 상한. 실행은1개 |
+
+보관 기간 기본30일은 카메라별 v2 정책으로 정합니다. 버퍼·이벤트·DB는 날짜 예산에 포함하지 않습니다. 날짜 예산 도달 시 기존 자료를 임의로 조기 삭제하지 않고 새 저장 누락을 보고합니다. 새 프로파일로 기존 날짜 MP4를 재인코딩하지 않습니다.
 
 ## 주요 환경 변수
 
