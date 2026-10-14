@@ -8,9 +8,25 @@ import os
 import time
 from pathlib import Path
 
-from aiohttp import ClientSession
+from aiohttp import ClientConnectionError, ClientSession, ClientTimeout
 from PIL import Image, ImageDraw
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
+
+
+async def consume_mjpeg(client, url, received):
+    while True:
+        try:
+            async with client.get(url) as response:
+                if response.status == 503:
+                    await asyncio.sleep(0.2)
+                    continue
+                assert response.status == 200
+                async for chunk in response.content.iter_chunked(65536):
+                    received(len(chunk))
+        except (ClientConnectionError, TimeoutError):
+            pass
+        await asyncio.sleep(0.2)
 
 
 async def run(args):
@@ -26,21 +42,21 @@ async def run(args):
     event_id = "daily-probe-" + str(time.time_ns())
     event = None
     session_path = f"/api/v1/cameras/{args.camera}/live"
-    async with ClientSession() as client:
+    async with ClientSession(
+        timeout=ClientTimeout(total=None, sock_connect=5, sock_read=15)
+    ) as client:
         response = await client.put(
             args.api + f"/api/v1/cameras/{args.camera}/recording-policy",
             json={"pre_roll_seconds": 3, "post_roll_seconds": 3, "retention_days": 1},
         )
         assert response.status == 200, await response.text()
+        await response.read()
 
-        async def viewer():
+        def live_received(size):
             nonlocal mjpeg_bytes
-            async with client.get(args.api + session_path) as response:
-                assert response.status == 200
-                async for chunk in response.content.iter_chunked(65536):
-                    mjpeg_bytes += len(chunk)
+            mjpeg_bytes += size
 
-        view = asyncio.create_task(viewer())
+        view = asyncio.create_task(consume_mjpeg(client, args.api + session_path, live_received))
         next_sample = 0
         next_frame = time.monotonic()
         deliberate_disconnect = False
@@ -118,10 +134,10 @@ async def run(args):
                                 )
                                 next_sample += 60
                             next_frame += 1 / args.fps
-                            if next_frame < time.monotonic() - 1:
+                            if next_frame < time.monotonic() - 1 / args.fps:
                                 next_frame = time.monotonic()
                             await asyncio.sleep(max(0, next_frame - time.monotonic()))
-                except (OSError, TimeoutError) as exc:
+                except (OSError, TimeoutError, ConnectionClosed) as exc:
                     samples.append({"connection_error": type(exc).__name__})
                     await asyncio.sleep(1)
             await asyncio.sleep(12)

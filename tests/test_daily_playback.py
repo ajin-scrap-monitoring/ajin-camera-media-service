@@ -73,6 +73,8 @@ def test_live_target_duration_remains_fixed_after_short_first_segment():
     segments[0]["duration"] = 1
     short = playback().build_daily_playlist(day, segments[:1])
     full = playback().build_daily_playlist(day, segments)
+
     def target(text):
         return next(line for line in text.splitlines() if line.startswith("#EXT-X-TARGETDURATION:"))
+
     assert target(short) == target(full)
