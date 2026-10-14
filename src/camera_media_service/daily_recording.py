@@ -361,6 +361,16 @@ class DailyRecordingService:
                         "code": "CLOCK_ADJUSTED",
                         "message": "Wall clock moved backwards; recording pauses until safe time.",
                     }
+                    async with self.lock:
+                        with self.db:
+                            for item in self.db.execute(
+                                "SELECT body FROM daily_recordings WHERE camera=? "
+                                "AND status IN ('recording','finalizing')",
+                                (camera,),
+                            ).fetchall():
+                                paused = json.loads(item[0])
+                                paused["error"] = self.last_error
+                                self.catalog.save_day(paused)
                     continue
                 while cursor < now:
                     window = DailyWindow.from_date(seoul_date(cursor))

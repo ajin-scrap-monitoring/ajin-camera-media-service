@@ -47,6 +47,23 @@ async def wait_ready(exports, daily, recording_id):
 
 
 @pytest.mark.asyncio
+async def test_finished_job_waiting_for_callback_does_not_block_deletion(tmp_path, monkeypatch):
+    service, daily, clock, old = await recorded_day(tmp_path, monkeypatch)
+    exports = make_exports(daily)
+    finished = asyncio.get_running_loop().create_future()
+    finished.set_result(None)
+    exports.jobs[old["recording_id"]] = finished
+    try:
+        await exports.delete_day(old["recording_id"])
+        assert (await daily.get_day(old["recording_id"]))["status"] == "deleted"
+        assert not list((service.root / "daily" / old["recording_id"]).rglob("*.ts"))
+    finally:
+        await exports.close()
+        await daily.close()
+        await service.close()
+
+
+@pytest.mark.asyncio
 async def test_export_is_single_idempotent_mp4_and_survives_restart(tmp_path, monkeypatch):
     service, daily, clock, day = await recorded_day(tmp_path, monkeypatch)
     exports = make_exports(daily)

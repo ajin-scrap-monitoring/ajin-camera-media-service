@@ -270,6 +270,43 @@ async def test_shutdown_bounds_clock_jump_backlog(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_backward_clock_is_visible_without_future_gap(tmp_path, monkeypatch):
+    window = DailyWindow.from_date(date(2026, 10, 14))
+    clock = [window.start_at + 100]
+    service, daily = make_daily(tmp_path, clock, monkeypatch)
+    await daily.tick(clock[0])
+    clock[0] -= 10
+    await daily.tick(clock[0])
+    day = (await daily.list_days("camera-main", {}, 20, None))[0]
+    assert day["error"]["code"] == "CLOCK_ADJUSTED"
+    assert day["coverage"] is None
+    await daily.close()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_corrupt_jpeg_does_not_publish_silently_frozen_coverage(tmp_path, monkeypatch):
+    import imageio_ffmpeg
+
+    window = DailyWindow.from_date(date(2026, 10, 14))
+    clock = [window.start_at]
+    service, daily = make_daily(tmp_path, clock, monkeypatch)
+    service.ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    await daily.tick(clock[0])
+    for i in range(10):
+        raw = b"\xff\xd8invalid-jpeg\xff\xd9" if i == 5 else jpeg()
+        await service.store_frame(FrameEnvelope("camera-main", clock[0] + i / 10, i, raw))
+    clock[0] += 10
+    await daily.tick(clock[0])
+    day = (await daily.list_days("camera-main", {}, 20, None))[0]
+    assert day["recorded_seconds"] == 0
+    assert any(g["reason_code"] == "ENCODING_FAILED" for g in day["gaps"])
+    assert service.db.execute("SELECT count(*) FROM frame_pins").fetchone()[0] == 0
+    await daily.close()
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_empty_midnight_creates_one_day_each_and_never_marks_future_gap(
     tmp_path, monkeypatch
 ):

@@ -72,8 +72,10 @@ class DailyExportService:
             self._exportable(day)
             if day["export_state"] == "ready" and (self.output / (recording_id + ".mp4")).is_file():
                 return day, False
-            if recording_id in self.jobs:
+            if self._has_job(recording_id):
                 return day, False
+            for key in list(self.jobs):
+                self._has_job(key)
             if len(self.jobs) >= self.settings.max_daily_export_jobs:
                 raise ApiError(503, "EXPORT_CAPACITY_EXCEEDED", "Export queue is full.")
             segments = self.daily.catalog.segments(recording_id, ready_only=True)
@@ -111,6 +113,15 @@ class DailyExportService:
             self.reservations.pop(key, None)
         if not task.cancelled() and task.exception():
             LOG.error("Daily export failed", exc_info=task.exception())
+
+    def _has_job(self, key):
+        task = self.jobs.get(key)
+        if task is None:
+            return False
+        if task.done():
+            self._done(key, task)
+            return False
+        return True
 
     async def _export(self, job: dict, segments: list[dict]) -> None:
         recording_id = job["recording_id"]
@@ -179,7 +190,7 @@ class DailyExportService:
             day = self.daily.catalog.get_day(recording_id)
             if day["status"] in ("recording", "finalizing"):
                 raise ApiError(409, "RECORDING_ACTIVE", "Current day cannot be deleted.")
-            if recording_id in self.jobs:
+            if self._has_job(recording_id):
                 raise ApiError(409, "EXPORT_IN_PROGRESS", "Export is in progress.")
             if day["status"] != "expired":
                 day.update(status="deleted", deleted_at=iso(self.daily.clock()))
@@ -197,7 +208,7 @@ class DailyExportService:
         await self._cleanup(recording_id)
 
     async def _cleanup(self, recording_id: str) -> None:
-        if recording_id in self.jobs:
+        if self._has_job(recording_id):
             return
         # Values originate from the catalog; verify resolved deletion stays in owned roots.
         uuid.UUID(recording_id)
@@ -246,7 +257,7 @@ class DailyExportService:
                 elif (
                     day["export_expires_at"]
                     and epoch(day["export_expires_at"]) <= now
-                    and recording_id not in self.jobs
+                    and not self._has_job(recording_id)
                 ):
                     (self.output / (recording_id + ".mp4")).unlink(missing_ok=True)
                     day.update(

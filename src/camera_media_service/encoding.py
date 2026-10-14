@@ -160,6 +160,7 @@ async def encode_daily_segment(
             "-loglevel",
             "error",
             "-nostdin",
+            "-xerror",
             "-y",
             "-f",
             "concat",
