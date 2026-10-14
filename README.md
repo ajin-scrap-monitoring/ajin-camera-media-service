@@ -10,6 +10,8 @@
 
 Python 3.13과 FFmpeg(libx264 포함)가 필요합니다. `uv sync --frozen --extra dev`로 개발 의존성을 설치합니다. `.env.example`은 설정 예시이며 프로그램이 자동으로 읽지는 않습니다. 환경 변수를 프로세스에 주입하세요.
 
+운영과 CI는 Dockerfile의 Debian trixie/시스템 FFmpeg7.1 환경으로 검증합니다. Ubuntu FFmpeg6.1.1은 영상 길이·손상 입력 검증 시험에서 차이가 확인되어 지원 환경으로 검증되지 않았습니다. Linux 개발 번들7.0.2도 TS 읽기 충돌이 있어 시험에는 `IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg`를 지정합니다.
+
 PowerShell 로컬 실행 예시:
 
 ```powershell

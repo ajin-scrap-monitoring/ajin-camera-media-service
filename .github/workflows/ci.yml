@@ -12,20 +12,21 @@ jobs:
       - uses: astral-sh/setup-uv@v4
         with:
           version: "0.9.28"
-      - name: Install FFmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
-          ffmpeg -version
       - name: Verify lock
         run: uv sync --project . --frozen --extra dev
       - name: Ruff check
         run: uv run --project . ruff check .
       - name: Ruff format check
         run: uv run --project . ruff format --check .
-      - name: Pytest
-        env:
-          IMAGEIO_FFMPEG_EXE: /usr/bin/ffmpeg
-        run: uv run --project . pytest
       - name: Container build
         run: docker build -t camera-media-service:ci .
+      - name: Pytest
+        run: |
+          docker run --rm --user 0 \
+            --env IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg \
+            --volume "$PWD:/validation:ro" --workdir /validation \
+            --entrypoint /bin/sh camera-media-service:ci -ec '
+              ffmpeg -version
+              uv sync --project /app --frozen --extra dev
+              /app/.venv/bin/pytest -p no:cacheprovider
+            '

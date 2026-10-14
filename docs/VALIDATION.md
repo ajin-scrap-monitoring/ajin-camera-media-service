@@ -201,4 +201,6 @@ Linux 개발용 imageio-ffmpeg7.0.2는 유효 TS 읽기에서 종료 코드-11�
 
 기존 로컬/서버 검증과 별개로 GitHub Actions의 `cac87ab` 실행은18개 실패/118개 통과였다. CI가 Linux 개발 번들 FFmpeg7.0.2를 사용해 TS 검증에서 실패했고, `pytest` 콘솔 실행에서 프로젝트 루트가 import 경로에 없어 `tools.daily_server_probe`도 찾지 못했다.
 
-워크플로에서 시스템 FFmpeg를 설치하고 Pytest 단계에 `IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg`를 지정했다. 테스트 경로 설정에 프로젝트 루트와 src를 포함해 `pytest`와 `python -m pytest`에서 동일하게 도구를 찾도록 했다. 테스트를 생략하거나 실패 조건을 완화하지 않았다. 콘솔 실행으로 import 실패를 재현한 뒤 수정 후 전체136개 시험(33.55초), Ruff check/format 통과를 확인했다. GitHub 측 최종 판정에는 최신 main 실행의 Pytest와 Container build까지 성공했는지 확인해야 한다. 과거 실패 실행 이력은 수정 후에도 남는다.
+Ubuntu 시스템 FFmpeg6.1.1로 바꾼 첫 수정은132개 통과/4개 실패였다. 영상 길이와 손상 JPEG 처리 동작이 운영7.1 환경과 달랐다. 최종 워크플로는 실제 Dockerfile로 이미지를 빌드하고 그 이미지의 시스템 FFmpeg에서 전체 Pytest를 실행한다. 개발 의존성은 일회용 시험 컨테이너에만 설치하고 `IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg`를 지정한다. 이미지의 기본 운영 설치에는 개발 의존성을 추가하지 않는다.
+
+테스트 경로 설정에 프로젝트 루트와 src를 포함해 `pytest`와 `python -m pytest`에서 동일하게 도구를 찾도록 했다. 테스트를 생략하거나 영상 길이/손상 검증 조건을 완화하지 않았다. 콘솔 실행으로 import 실패를 재현한 뒤 수정 후 전체136개 시험(33.55초), Ruff check/format 통과를 확인했다. GitHub 측 최종 판정에는 최신 main 실행의 Pytest와 Container build까지 성공했는지 확인해야 한다. 과거 실패 실행 이력은 수정 후에도 남는다.
