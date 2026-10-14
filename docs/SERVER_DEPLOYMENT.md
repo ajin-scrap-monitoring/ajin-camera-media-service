@@ -1,6 +1,6 @@
 # 서버 A 상시 배포 및 백엔드 연결 안내
 
-2026-10-04에 서버 A `100.100.27.99`에 GitHub 커밋 `d84e659e016bc765ff3605f2ff26cc95fa164553`를 직접 내려받아 배포했다. 실행 상태와 배포 검증 결과는 VALIDATION.md를 참조한다.
+2026-10-04 서버 A `100.100.27.99`의 기존 운영 배포를 시작했다. 2026-10-15에는 GitHub main에서 날짜별 상시 녹화 버전을 가져와 같은 운영 컨테이너에 적용했다. 실행 상태와 배포 검증 결과는 VALIDATION.md를 참조한다.
 
 ## 백엔드 담당자에게 전달할 값
 
@@ -8,6 +8,7 @@
 | --- | --- |
 | 호스트에서 실행하는 백엔드의 API 기본 주소 | `http://127.0.0.1:8889/api/v1` |
 | 공유 Docker 네트워크에서 실행하는 백엔드의 API 기본 주소 | `http://camera-media-service:8889/api/v1` |
+| 날짜 녹화 API 기본 주소 | 호스트 `http://127.0.0.1:8889/api/v2`, 공유 네트워크 `http://camera-media-service:8889/api/v2` |
 | 공유 Docker 네트워크 이름 | `ajin-media` |
 | 카메라 ID | `camera-main` |
 | 실시간 영상 | `GET /cameras/camera-main/live` (HTTP MJPEG) |
@@ -20,7 +21,7 @@
 | API 인증 | 별도 토큰 없음. 호스트 공개 포트는 loopback에 제한 |
 | 초기 녹화 설정 | 이벤트 전 30초 / 후 30초, 보관 30일 |
 
-상세 요청·응답 JSON, 오류 코드와 중복 이벤트 처리는 [BACKEND_API_CONTRACT.md](BACKEND_API_CONTRACT.md)를 따른다. 기존 WHEP/WebRTC 중개는 이 서버의 MJPEG 규격에 맞춰 백엔드 담당자가 수정해야 한다. 브라우저는 백엔드의 영상 중개 경로를 사용한다.
+이벤트 요청·응답 JSON, 오류 코드와 중복 처리는 [BACKEND_API_CONTRACT.md](BACKEND_API_CONTRACT.md), 날짜별 조회·HLS·MP4·삭제는 [DAILY_RECORDING_API_GUIDE.md](DAILY_RECORDING_API_GUIDE.md)를 따른다. 실시간 영상은 MJPEG다. 브라우저는 백엔드의 영상 중개 경로를 사용한다.
 
 백엔드가 컨테이너 안에서 실행되면 `127.0.0.1`은 그 컨테이너 자체다. 백엔드 담당자는 자신의 Compose 서비스에 외부 네트워크 `ajin-media`를 연결하고 `camera-media-service:8889`로 요청해야 한다. 이미 실행 중인 다른 서비스의 네트워크는 이번 배포에서 변경하지 않았다.
 
@@ -52,15 +53,18 @@ networks:
 | 항목 | 값 |
 | --- | --- |
 | 컨테이너 | `ajin-camera-media-service` |
-| 이미지 | `ajin-camera-media-service:d84e659` |
+| 이미지 | `ajin-camera-media-service:c479f8b` |
 | 배포 파일 | `/home/kyuncho/ajin-camera-media-service/compose.server.yaml` |
 | 실행 환경 파일 | 같은 디렉터리의 `runtime.env` (권한 `0600`) |
 | 서버의 영구 저장 경로 | `/var/lib/ajin-camera-media` |
 | 저장 경로 소유자 | UID/GID `10002:10002`, 디렉터리 권한 `0750` |
-| 저장 내용 | `buffer/` JPEG, `clips/` MP4, `catalog.sqlite3` 및 SQLite 보조 파일 |
+| 저장 내용 | `buffer/` JPEG, `clips/` 이벤트 MP4, 날짜 녹화 TS/다운로드 MP4, `catalog.sqlite3` 및 SQLite 보조 파일 |
 | 자동 재시작 | Docker `unless-stopped`, Docker 서비스 자동 시작 활성화 |
 | 자원 제한 | CPU 2개, 메모리 3 GiB |
 | 버퍼·작업 한도 | JPEG 버퍼 2 GiB, 미완료 녹화 작업 최대 32개 |
+| 날짜 녹화 | 활성, 한국 자정 전환, H.264 1920×1080/30fps, 10초 조각 |
+| 날짜 저장 예산 | 원본 및 다운로드 캐시 합산 32 GiB, 최소 디스크 여유 5 GiB |
+| 날짜 보관·다운로드 | 정책 30일, 다운로드 캐시 24시간. 저장 예산 내 보관이며 실제 30일 분량 보장 아님 |
 | 로그 | 파일당 10 MiB, 최대 3개 순환 |
 | 상태 검사 | 30초마다 클립 목록 API 호출 |
 
@@ -85,11 +89,11 @@ df -h /var/lib/ajin-camera-media
 
 Docker 상태 검사 실패는 상태 표시이며, 그 자체로 컨테이너를 재시작하지 않는다. `unless-stopped`는 프로세스 종료와 Docker 재시작에 적용된다. 서버 전체 재부팅 시험은 기존 서비스에 영향이 있어 이번 배포 검증에 포함하지 않았다.
 
-전체 저장소 하드 쿼터와 오래된 메타데이터 자동 정리는 아직 없다. 완료 영상은 카메라 설정의 보관 기간으로 만료·삭제하며 디스크 여유 공간을 별도로 확인해야 한다.
+날짜 녹화에는 원본과 다운로드 캐시를 합산한 유한 저장 예산과 디스크 여유 검사가 있다. 이벤트 MP4를 포함한 전체 디렉터리의 파일시스템 하드 쿼터와 오래된 메타데이터 자동 정리는 별도다. 설정된 예산이 부족하면 누락을 표시하므로 실제 하루 저장량으로 필요한 디스크 용량을 확인해야 한다.
 
 ## 2026-10-14 날짜 녹화 검증 환경
 
-날짜 기능의 코드·API 및129개 서버 시험은 검증 완료했다. 구현 커밋 ed98bc4. 기존 상시 운영의 날짜 기능 활성화는 저장 공간과 실제 입력 프로파일 확인 뒤 진행한다. 새 환경은 기존 서비스와 별도 저장소를 사용한다.
+아래는 운영 교체 전 별도로 만든 검증 환경이다. 구현 커밋 ed98bc4의 코드·API 및129개 서버 시험을 완료했다. 운영 주소8889와 시험 주소18890은 서로 다른 저장소를 사용한다. 현재 운영 날짜 녹화는 위 설정으로 활성화했다.
 
 - 시험 컨테이너: ajin-camera-media-daily-validation, CPU2/메모리3GiB.
 - 호스트 API: http://127.0.0.1:18890/api/v2.
@@ -97,10 +101,10 @@ Docker 상태 검사 실패는 상태 표시이며, 그 자체로 컨테이너�
 - 시험 입력: 호스트127.0.0.1:18445 → 컨테이너8443. 합성 전용 토큰을 사용하고 운영 엣지 토큰을 읽거나 교체하지 않았다.
 - 시험 저장소: /var/lib/ajin-camera-daily-validation-20261014, 날짜 예산16GiB/최소 여유5GiB.
 - 시험 소스는 GitHub feat/daily-recordings에서 직접 fetch하고 Docker 이미지를 빌드했다.
-- 현재 운영 주소8889/camera-media-service와 외부 WSS9443은 기존 설정이다. 새 v2를 호출하려면 DAILY_RECORDING_ENABLED=true 및 양수 MAX_DAILY_STORAGE_BYTES가 필요하다.
+- 운영 주소8889/camera-media-service와 외부 WSS9443은 유지했다. 운영에는 DAILY_RECORDING_ENABLED=true 및32GiB MAX_DAILY_STORAGE_BYTES를 설정했다.
 
 동료용 문서는 [DAILY_RECORDING_API_GUIDE.md](DAILY_RECORDING_API_GUIDE.md) 하나로 전달한다. JSON 목록/정책/상태/MP4 준비/삭제 및 HLS 두 경로·Range 계약을 설명한다. 백엔드 내부 화면 API 경로는 동료가 정한다. 미디어 서비스가 백엔드로 완료 알림을 호출하는 방식은 추가하지 않았다.
 
-운영 용량은 카메라별 실제 GiB/day × 보관일 + MP4 동시 준비/캐시 + JPEG 버퍼/이벤트/DB + 여유 공간으로 계산한다. 합성 도형 영상의 낮은 저장량으로 실현장30일 보관을 승인하지 않는다. 현재약70GiB 여유이므로 날짜 상시 운영 활성화를 완료했다고 보고하지 않는다.
+운영 용량은 카메라별 실제 GiB/day × 보관일 + MP4 동시 준비/캐시 + JPEG 버퍼/이벤트/DB + 여유 공간으로 계산한다. 상시 운영은32GiB 예산으로 활성화했지만, 합성 도형 영상의 낮은 저장량으로 실현장30일 보관을 보장하지 않는다.
 
 재현 시험 도구는 tools/daily_server_probe.py다. 승인된 격리 환경에서만 실행하며 DAILY_TEST_EDGE_TOKEN 환경 변수로 시험 입력 토큰을 전달한다. --seconds 86400은 실제 시간24시간 시험이다. 서버 재시작 후 입력을 재접속하고, 첫 프레임 전 MJPEG503을 재시도한다. JSON state=running은 완료가 아니며 state=passed와 종료 코드0을 확인한다.
