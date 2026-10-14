@@ -12,6 +12,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from camera_media_service.daily_models import StoredFrame
 from camera_media_service.pipeline import FrameEnvelope, LiveFrameHub, RecordingQueue
 
 LOG = logging.getLogger(__name__)
@@ -88,6 +89,8 @@ class RecordingService:
             CREATE INDEX IF NOT EXISTS job_time ON jobs(accepted,id);
             CREATE INDEX IF NOT EXISTS job_status ON jobs(status);
             CREATE TABLE IF NOT EXISTS pending_cleanup(id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS frame_pins(
+                owner TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY(owner,path));
             CREATE TABLE IF NOT EXISTS service_metadata(key TEXT PRIMARY KEY, value BLOB NOT NULL);
         """)
         # Internal cursor integrity only; no shared API credential or operator configuration.
@@ -314,6 +317,23 @@ class RecordingService:
                 path.unlink(missing_ok=True)
                 raise
 
+    def pin_frames(
+        self, owner_id: str, camera_id: str, start_at: float, end_at: float
+    ) -> list[StoredFrame]:
+        """Caller holds lock/transaction; leases survive process interruption."""
+        rows = self.db.execute(
+            "SELECT * FROM frames WHERE camera=? AND timestamp>=? AND timestamp<? "
+            "ORDER BY timestamp,path",
+            (camera_id, start_at, end_at),
+        ).fetchall()
+        self.db.executemany(
+            "INSERT OR IGNORE INTO frame_pins VALUES(?,?)", ((owner_id, r["path"]) for r in rows)
+        )
+        return [StoredFrame(r["path"], r["timestamp"], r["size"]) for r in rows]
+
+    def release_frames(self, owner_id: str) -> None:
+        self.db.execute("DELETE FROM frame_pins WHERE owner=?", (owner_id,))
+
     async def _prune(self, now: float, reserve: int = 0) -> None:
         total = self.db.execute("SELECT coalesce(sum(size),0) FROM frames").fetchone()[0]
         cutoff = now - 300 if total + reserve <= self.max_buffer_bytes else float("inf")
@@ -323,6 +343,7 @@ class RecordingService:
                 SELECT 1 FROM jobs j WHERE j.camera=f.camera
                 AND j.status IN ('collecting','processing')
                 AND f.timestamp >= j.start AND f.timestamp < j.end)
+            AND NOT EXISTS(SELECT 1 FROM frame_pins p WHERE p.path=f.path)
             ORDER BY timestamp
         """,
             (cutoff,),
