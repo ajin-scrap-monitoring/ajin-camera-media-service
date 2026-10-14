@@ -154,8 +154,9 @@ async def test_real_segments_split_midnight_and_missing_middle(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("crash", [True, False])
 async def test_renamed_segment_is_recovered_without_reporting_unrecorded_tail(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, crash
 ):
     import imageio_ffmpeg
 
@@ -179,7 +180,8 @@ async def test_renamed_segment_is_recovered_without_reporting_unrecorded_tail(
             (__import__("json").dumps(body), segment["segment_id"]),
         )
         service.db.execute("UPDATE daily_cursors SET cursor=?", (window.start_at,))
-    await daily.close()
+    if not crash:
+        await daily.close()
     await service.close()
     service, daily = make_daily(tmp_path, clock, monkeypatch)
     service.ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()

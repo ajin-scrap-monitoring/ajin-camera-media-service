@@ -29,7 +29,7 @@ async def test_daily_ts_decodes_and_preserves_real_duration_without_long_freeze(
         {"width": 320, "height": 240, "fps": 30},
     )
     assert path.exists() and metadata["size_bytes"] == path.stat().st_size
-    assert 1.10 <= metadata["duration"] <= 1.30
+    assert metadata["duration"] == pytest.approx(1.2, abs=0.002)
     reader = imageio_ffmpeg.read_frames(str(path))
     header = next(reader)
     assert header["size"] == (320, 240)

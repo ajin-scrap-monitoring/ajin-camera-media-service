@@ -123,7 +123,7 @@ class DailyRecordingService:
             / (segment["segment_id"] + ".ts")
         )
 
-    async def _recover(self, now: float) -> None:
+    async def _recover_segments(self) -> None:
         for row in self.db.execute(
             "SELECT body FROM daily_segments WHERE status='processing'"
         ).fetchall():
@@ -176,6 +176,9 @@ class DailyRecordingService:
             finally:
                 with self.db:
                     self.recording.release_frames(segment["segment_id"])
+
+    async def _recover(self, now: float) -> None:
+        await self._recover_segments()
         async with self.lock:
             with self.db:
                 for row in self.db.execute("SELECT camera,cursor FROM daily_cursors").fetchall():
@@ -540,6 +543,7 @@ class DailyRecordingService:
     async def _finish_tail(self) -> None:
         if not self.initialized:
             return
+        await self._recover_segments()
         now = self.clock()
         if self.recording.queue is not None:
             await self.recording.queue.wait_received()

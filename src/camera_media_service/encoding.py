@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import statistics
@@ -85,14 +86,17 @@ async def probe_media(ffmpeg: str, path: Path) -> dict:
         str(path),
         "-map",
         "0:v:0",
+        "-progress",
+        "pipe:1",
+        "-nostats",
         "-f",
         "null",
         "-",
-        stdout=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        _, error = await asyncio.wait_for(process.communicate(), timeout=120)
+        progress, error = await asyncio.wait_for(process.communicate(), timeout=120)
     except BaseException:
         if process.returncode is None:
             process.kill()
@@ -102,7 +106,8 @@ async def probe_media(ffmpeg: str, path: Path) -> dict:
     match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", text)
     if process.returncode or not match or "Video: h264" not in text:
         raise RuntimeError("Media verification failed: " + text[-1500:])
-    duration = int(match[1]) * 3600 + int(match[2]) * 60 + float(match[3])
+    times = re.findall(rb"out_time_us=(\d+)", progress)
+    duration = int(times[-1]) / 1_000_000 if times else 0
     if duration <= 0:
         raise RuntimeError("Empty video")
     return {"duration": duration, "size_bytes": path.stat().st_size}
@@ -178,8 +183,8 @@ async def encode_daily_segment(
             str(fps),
             "-fps_mode",
             "cfr",
-            "-t",
-            f"{duration:.6f}",
+            "-frames:v",
+            str(max(1, math.ceil(duration * fps - 0.000001))),
             "-muxdelay",
             "0",
             "-muxpreload",
