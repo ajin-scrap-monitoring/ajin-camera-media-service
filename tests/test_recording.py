@@ -264,7 +264,7 @@ async def test_process_waits_for_pending_frame_writer(tmp_path, monkeypatch):
     service = make_service(tmp_path)
     release = asyncio.Event()
     entered = asyncio.Event()
-    original = service.store_frame
+    original = service.store_frames
 
     async def slow_store(frame):
         entered.set()
@@ -274,7 +274,7 @@ async def test_process_waits_for_pending_frame_writer(tmp_path, monkeypatch):
     async def encoder(*args):
         (service.clips / (job["clip_id"] + ".mp4")).write_bytes(b"encoded")
 
-    monkeypatch.setattr(service, "store_frame", slow_store)
+    monkeypatch.setattr(service, "store_frames", slow_store)
     monkeypatch.setattr(encoding, "encode_clip", encoder)
     await service.set_policy(
         "camera-main",
@@ -333,10 +333,10 @@ async def test_encoding_barrier_does_not_wait_for_future_frames(tmp_path, monkey
     service = make_service(tmp_path)
     first_started, first_release = asyncio.Event(), asyncio.Event()
     future_started, future_release = asyncio.Event(), asyncio.Event()
-    original = service.store_frame
+    original = service.store_frames
 
     async def slow_store(frame):
-        if frame.generation == 1:
+        if frame[0].generation == 1:
             first_started.set()
             await first_release.wait()
         else:
@@ -347,7 +347,7 @@ async def test_encoding_barrier_does_not_wait_for_future_frames(tmp_path, monkey
     async def encoder(*args):
         (service.clips / (job["clip_id"] + ".mp4")).write_bytes(b"encoded")
 
-    monkeypatch.setattr(service, "store_frame", slow_store)
+    monkeypatch.setattr(service, "store_frames", slow_store)
     monkeypatch.setattr(encoding, "encode_clip", encoder)
     await service.set_policy(
         "camera-main",

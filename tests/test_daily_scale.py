@@ -187,3 +187,41 @@ async def test_cleanup_failure_commits_successfully_removed_rows(tmp_path, monke
         assert not service.db.in_transaction
     finally:
         service.db.close()
+
+
+@pytest.mark.asyncio
+async def test_frame_batch_is_durable_and_rolls_back_on_partial_write(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from camera_media_service.pipeline import FrameEnvelope, LiveFrameHub
+    from camera_media_service.recording import RecordingService
+    from camera_media_service.store import LatestFrameStore
+
+    service = RecordingService(tmp_path, {"camera-main"}, LiveFrameHub(LatestFrameStore()))
+    try:
+        frames = [FrameEnvelope("camera-main", time.time(), i, b"jpeg") for i in range(10)]
+        statements = []
+        service.db.set_trace_callback(statements.append)
+        await service.store_frames(frames)
+        assert statements.count("COMMIT") == 1
+        assert service.db.execute("SELECT count(*) FROM frames").fetchone()[0] == 10
+        assert len(list(service.buffer.glob("*.jpg"))) == 10
+        unlink = Path.write_bytes
+        count = 0
+
+        def fail_second(path, data):
+            nonlocal count
+            count += 1
+            if count == 2:
+                path.write_text("partial")
+                raise OSError("injected batch write failure")
+            return unlink(path, data)
+
+        monkeypatch.setattr(Path, "write_bytes", fail_second)
+        with pytest.raises(OSError, match="injected batch write failure"):
+            await service.store_frames(frames)
+        assert service.db.execute("SELECT count(*) FROM frames").fetchone()[0] == 10
+        assert len(list(service.buffer.glob("*.jpg"))) == 10
+        assert not service.db.in_transaction
+    finally:
+        service.db.close()

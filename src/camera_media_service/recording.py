@@ -301,22 +301,32 @@ class RecordingService:
             await self._cleanup_pending(row[0])
 
     async def store_frame(self, frame: FrameEnvelope) -> None:
+        await self.store_frames([frame])
+
+    async def store_frames(self, frames: list[FrameEnvelope]) -> None:
+        if not frames:
+            return
+        reserve = sum(len(frame.jpeg) for frame in frames)
         async with self.lock:
-            await self._prune(time.time(), reserve=len(frame.jpeg))
+            await self._prune(time.time(), reserve=reserve)
             size = self.db.execute("SELECT coalesce(sum(size),0) FROM frames").fetchone()[0]
-            if size + len(frame.jpeg) > self.max_buffer_bytes:
+            if size + reserve > self.max_buffer_bytes:
                 raise OSError("Pinned frames exhausted the buffer budget")
-            name = f"{uuid.uuid4()}.jpg"
-            path = self.buffer / name
+            paths = []
             try:
-                await asyncio.to_thread(path.write_bytes, frame.jpeg)
                 with self.db:
-                    self.db.execute(
-                        "INSERT INTO frames VALUES (?,?,?,?)",
-                        (name, frame.camera_id, frame.received_at, len(frame.jpeg)),
-                    )
+                    for frame in frames:
+                        name = f"{uuid.uuid4()}.jpg"
+                        path = self.buffer / name
+                        paths.append(path)
+                        await asyncio.to_thread(path.write_bytes, frame.jpeg)
+                        self.db.execute(
+                            "INSERT INTO frames VALUES (?,?,?,?)",
+                            (name, frame.camera_id, frame.received_at, len(frame.jpeg)),
+                        )
             except BaseException:
-                path.unlink(missing_ok=True)
+                for path in paths:
+                    path.unlink(missing_ok=True)
                 raise
 
     def pin_frames(
@@ -457,21 +467,33 @@ class RecordingService:
         assert self.queue is not None
         while True:
             frame = await self.queue.get()
+            frames = [frame]
             try:
-                await self.store_frame(frame)
+                deadline = asyncio.get_running_loop().time() + 0.1
+                while len(frames) < 10:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        frames.append(await asyncio.wait_for(self.queue.get(), remaining))
+                    except TimeoutError:
+                        break
+                await self.store_frames(frames)
                 self.storage_error = False
             except (OSError, sqlite3.Error):
                 self.storage_error = True
                 LOG.exception("Recording frame storage failed")
                 if self.hub.loss_observer is not None:
-                    self.hub.loss_observer(
-                        frame.camera_id,
-                        frame.received_at,
-                        frame.received_at + 1 / 30,
-                        "STORAGE_ERROR",
-                    )
+                    for frame in frames:
+                        self.hub.loss_observer(
+                            frame.camera_id,
+                            frame.received_at,
+                            frame.received_at + 1 / 30,
+                            "STORAGE_ERROR",
+                        )
             finally:
-                self.queue.acknowledge(frame)
+                for frame in frames:
+                    self.queue.acknowledge(frame)
 
     async def _scheduler(self) -> None:
         maintenance_at = 0.0
