@@ -196,3 +196,9 @@ Linux 개발용 imageio-ffmpeg7.0.2는 유효 TS 읽기에서 종료 코드-11�
 - 같은 관찰 중 전후30초 이벤트 클립202→ready, MP4 Range206/1,024바이트 및 시험 클립 삭제204가 통과했다. 이벤트 완료 이후에도 날짜 녹화가 계속 증가하고 신규 누락은 없었다.
 - 최종 이미지에서 running/healthy/unless-stopped, 백엔드 컨테이너의 v1 설정/v2 정책/v2 목록200, MJPEG200/HLS EVENT200/TS Range206 및 기존 설정·자격증명 보존을 재확인했다.
 - 최종 보고서: `/home/kyuncho/ajin-daily-validation-results/production-batch-20261015.json`, state=passed. 이3분 관찰을24시간 무중단/실제30일 보관 용량 검증으로 확대하지 않는다.
+
+## 2026-10-15 GitHub Actions 실행 환경 수정
+
+기존 로컬/서버 검증과 별개로 GitHub Actions의 `cac87ab` 실행은18개 실패/118개 통과였다. CI가 Linux 개발 번들 FFmpeg7.0.2를 사용해 TS 검증에서 실패했고, `pytest` 콘솔 실행에서 프로젝트 루트가 import 경로에 없어 `tools.daily_server_probe`도 찾지 못했다.
+
+워크플로에서 시스템 FFmpeg를 설치하고 Pytest 단계에 `IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg`를 지정했다. 테스트 경로 설정에 프로젝트 루트와 src를 포함해 `pytest`와 `python -m pytest`에서 동일하게 도구를 찾도록 했다. 테스트를 생략하거나 실패 조건을 완화하지 않았다. 콘솔 실행으로 import 실패를 재현한 뒤 수정 후 전체136개 시험(33.55초), Ruff check/format 통과를 확인했다. GitHub 측 최종 판정에는 최신 main 실행의 Pytest와 Container build까지 성공했는지 확인해야 한다. 과거 실패 실행 이력은 수정 후에도 남는다.
