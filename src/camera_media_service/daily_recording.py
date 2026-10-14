@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Callable
 
 from camera_media_service.daily_catalog import DailyCatalog
+from camera_media_service.daily_gaps import build_gaps
 from camera_media_service.daily_models import DailyWindow, seoul_date
 from camera_media_service.daily_playback import build_available_intervals
 from camera_media_service.encoding import encode_daily_segment, probe_media
@@ -279,27 +280,7 @@ class DailyRecordingService:
             "WHERE camera=? AND start<? AND end>? ORDER BY id",
             (day["camera_id"], until, start),
         ).fetchall()
-        gaps = []
-        for a, b in spans:
-            if b <= a:
-                continue
-            boundaries = sorted(
-                {a, b, *[max(a, min(b, v)) for row in known for v in (row["start"], row["end"])]}
-            )
-            for left, right in zip(boundaries, boundaries[1:], strict=False):
-                reasons = [r["reason"] for r in known if r["start"] < right and r["end"] > left]
-                if reasons or right - left > 1:
-                    reason = reasons[-1] if reasons else "UNKNOWN_CAPTURE_LOSS"
-                    if (
-                        gaps
-                        and gaps[-1]["reason_code"] == reason
-                        and gaps[-1]["end_at"] == iso(left)
-                    ):
-                        gaps[-1]["end_at"] = iso(right)
-                    else:
-                        gaps.append(
-                            {"start_at": iso(left), "end_at": iso(right), "reason_code": reason}
-                        )
+        gaps = build_gaps(spans, known)
         day.update(
             coverage_as_of_at=iso(until),
             recorded_seconds=round(offset, 3),

@@ -86,11 +86,13 @@ class RecordingService:
                 path TEXT PRIMARY KEY, camera TEXT NOT NULL, timestamp REAL NOT NULL,
                 size INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS frame_time ON frames(camera,timestamp);
+            CREATE INDEX IF NOT EXISTS frame_timestamp ON frames(timestamp);
             CREATE INDEX IF NOT EXISTS job_time ON jobs(accepted,id);
             CREATE INDEX IF NOT EXISTS job_status ON jobs(status);
             CREATE TABLE IF NOT EXISTS pending_cleanup(id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS frame_pins(
                 owner TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY(owner,path));
+            CREATE INDEX IF NOT EXISTS frame_pin_path ON frame_pins(path);
             CREATE TABLE IF NOT EXISTS service_metadata(key TEXT PRIMARY KEY, value BLOB NOT NULL);
         """)
         # Internal cursor integrity only; no shared API credential or operator configuration.
