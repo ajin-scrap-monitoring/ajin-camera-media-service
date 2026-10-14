@@ -350,13 +350,20 @@ class RecordingService:
         """,
             (cutoff,),
         ).fetchall()
-        for row in rows:
-            if row["timestamp"] >= now - 300 and total + reserve <= self.max_buffer_bytes:
-                break
-            await asyncio.to_thread((self.buffer / row["path"]).unlink, missing_ok=True)
-            with self.db:
-                self.db.execute("DELETE FROM frames WHERE path=?", (row["path"],))
-            total -= row["size"]
+        removed = []
+        try:
+            for row in rows:
+                if row["timestamp"] >= now - 300 and total + reserve <= self.max_buffer_bytes:
+                    break
+                await asyncio.to_thread((self.buffer / row["path"]).unlink, missing_ok=True)
+                removed.append((row["path"],))
+                total -= row["size"]
+        finally:
+            # One FULL-synchronous commit for a backlog, rather than one fsync per old frame.
+            # Also retain successful cleanup when a later unlink fails or shutdown cancels it.
+            if removed:
+                with self.db:
+                    self.db.executemany("DELETE FROM frames WHERE path=?", removed)
 
     async def process_clip(self, clip_id: str) -> None:
         from camera_media_service.encoding import encode_clip

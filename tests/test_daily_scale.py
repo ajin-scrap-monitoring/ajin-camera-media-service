@@ -125,3 +125,65 @@ def test_prune_query_remains_fast_with_many_frames_and_pins(tmp_path):
         assert elapsed < 0.5, f"pin lookups blocked the writer for {elapsed:.3f}s"
     finally:
         service.db.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_frame_backlog_uses_one_durable_cleanup_commit(tmp_path):
+    from camera_media_service.pipeline import LiveFrameHub
+    from camera_media_service.recording import RecordingService
+    from camera_media_service.store import LatestFrameStore
+
+    service = RecordingService(tmp_path, {"camera-main"}, LiveFrameHub(LatestFrameStore()))
+    try:
+        with service.db:
+            for i in range(100):
+                name = f"{i}.jpg"
+                (service.buffer / name).write_bytes(b"jpeg")
+                service.db.execute(
+                    "INSERT INTO frames VALUES(?,?,?,?)", (name, "camera-main", i, 4)
+                )
+        statements = []
+        service.db.set_trace_callback(statements.append)
+        await service._prune(1000)
+        service.db.set_trace_callback(None)
+        assert service.db.execute("SELECT count(*) FROM frames").fetchone()[0] == 0
+        assert not list(service.buffer.glob("*.jpg"))
+        assert statements.count("COMMIT") == 1
+        assert service.db.execute("PRAGMA synchronous").fetchone()[0] == 2
+    finally:
+        service.db.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_commits_successfully_removed_rows(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from camera_media_service.pipeline import LiveFrameHub
+    from camera_media_service.recording import RecordingService
+    from camera_media_service.store import LatestFrameStore
+
+    service = RecordingService(tmp_path, {"camera-main"}, LiveFrameHub(LatestFrameStore()))
+    try:
+        with service.db:
+            for i in range(3):
+                name = f"{i}.jpg"
+                (service.buffer / name).write_bytes(b"jpeg")
+                service.db.execute(
+                    "INSERT INTO frames VALUES(?,?,?,?)", (name, "camera-main", i, 4)
+                )
+        unlink = Path.unlink
+
+        def fail_third(path, **kwargs):
+            if path.name == "2.jpg":
+                raise OSError("injected deletion failure")
+            return unlink(path, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_third)
+        with pytest.raises(OSError, match="injected deletion failure"):
+            await service._prune(1000)
+        assert [r[0] for r in service.db.execute("SELECT path FROM frames")] == ["2.jpg"]
+        assert (service.buffer / "2.jpg").exists()
+        assert not (service.buffer / "0.jpg").exists()
+        assert not service.db.in_transaction
+    finally:
+        service.db.close()
