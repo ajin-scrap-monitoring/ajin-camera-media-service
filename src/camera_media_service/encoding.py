@@ -75,7 +75,7 @@ async def encode_clip(
         temporary.unlink(missing_ok=True)
 
 
-async def probe_media(ffmpeg: str, path: Path) -> dict:
+async def probe_media(ffmpeg: str, path: Path, *, full_decode: bool = True) -> dict:
     """Read actual container duration and validate every video packet by decoding."""
     process = await asyncio.create_subprocess_exec(
         ffmpeg,
@@ -89,6 +89,7 @@ async def probe_media(ffmpeg: str, path: Path) -> dict:
         "-progress",
         "pipe:1",
         "-nostats",
+        *([] if full_decode else ["-frames:v", "3"]),
         "-f",
         "null",
         "-",
@@ -107,7 +108,11 @@ async def probe_media(ffmpeg: str, path: Path) -> dict:
     if process.returncode or not match or "Video: h264" not in text:
         raise RuntimeError("Media verification failed: " + text[-1500:])
     times = re.findall(rb"out_time_us=(\d+)", progress)
-    duration = int(times[-1]) / 1_000_000 if times else 0
+    duration = (
+        (int(times[-1]) / 1_000_000 if times else 0)
+        if full_decode
+        else (int(match[1]) * 3600 + int(match[2]) * 60 + float(match[3]))
+    )
     if duration <= 0:
         raise RuntimeError("Empty video")
     return {"duration": duration, "size_bytes": path.stat().st_size}
@@ -215,6 +220,63 @@ async def encode_daily_segment(
 
         await asyncio.to_thread(prepare)
         await asyncio.to_thread(os.replace, temporary, destination)
+        return metadata
+    finally:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.communicate()
+        manifest.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
+
+
+async def merge_daily_mp4(ffmpeg: str, segments: list[dict], temporary: Path, final: Path) -> dict:
+    if not segments or len({json.dumps(s["profile"], sort_keys=True) for s in segments}) != 1:
+        raise RuntimeError("EXPORT_INCOMPATIBLE_MEDIA")
+    final.parent.mkdir(parents=True, exist_ok=True)
+    manifest = final.with_suffix(".ffconcat")
+    lines = ["ffconcat version 1.0"]
+    for segment in segments:
+        path = Path(segment["path"]).as_posix()
+        lines.extend((f"file '../{path}'", f"duration {segment['duration']:.6f}"))
+    await asyncio.to_thread(manifest.write_text, "\n".join(lines) + "\n", encoding="utf-8")
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-xerror",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(manifest),
+            "-an",
+            "-c:v",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+            str(temporary),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, error = await asyncio.wait_for(process.communicate(), timeout=3600)
+        if process.returncode:
+            raise RuntimeError(error[-1500:].decode(errors="replace"))
+        metadata = await probe_media(ffmpeg, temporary, full_decode=False)
+        if abs(metadata["duration"] - sum(s["duration"] for s in segments)) > max(
+            0.1, len(segments) / 90000
+        ):
+            raise RuntimeError("Export duration differs from saved media")
+        await asyncio.to_thread(os.replace, temporary, final)
         return metadata
     finally:
         if process is not None and process.returncode is None:
