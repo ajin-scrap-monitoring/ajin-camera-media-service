@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -59,6 +60,8 @@ class IngestService:
             self.telemetry.record_connection_start()
 
         displaced = self.registry.claim_connection(camera_id, connection_id, websocket)
+        if self.hub.connection_observer is not None:
+            self.hub.connection_observer(camera_id, True, time.time())
         try:
             if displaced is not None:
                 try:
@@ -102,4 +105,9 @@ class IngestService:
         finally:
             if self.telemetry is not None:
                 self.telemetry.record_connection_end()
+            if (
+                self.registry.is_current(camera_id, connection_id)
+                and self.hub.connection_observer is not None
+            ):
+                self.hub.connection_observer(camera_id, False, time.time())
             self.registry.release(camera_id, connection_id)

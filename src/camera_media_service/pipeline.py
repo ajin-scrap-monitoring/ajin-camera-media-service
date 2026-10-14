@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -59,6 +60,8 @@ class LiveFrameHub:
         self.frame_store = frame_store
         self._subscribers: set[asyncio.Queue[FrameEnvelope]] = set()
         self.latest: dict[str, FrameEnvelope] = {}
+        self.loss_observer: Callable[[str, float, float, str], None] | None = None
+        self.connection_observer: Callable[[str, bool, float], None] | None = None
 
     def publish(self, camera_id: str, jpeg: bytes) -> FrameEnvelope:
         generation = self.frame_store.put(camera_id, jpeg)
@@ -69,6 +72,8 @@ class LiveFrameHub:
             generation=generation,
             jpeg=jpeg,
         )
+        previous = self.latest.get(camera_id)
+        period = max(0.001, min(1, received_at - previous.received_at)) if previous else 1 / 30
         self.latest[camera_id] = envelope
 
         for queue in list(self._subscribers):
@@ -77,6 +82,13 @@ class LiveFrameHub:
                     dropped = queue.get_nowait()
                     if isinstance(queue, RecordingQueue):
                         queue.acknowledge(dropped)
+                        if self.loss_observer is not None:
+                            self.loss_observer(
+                                dropped.camera_id,
+                                dropped.received_at,
+                                dropped.received_at + period,
+                                "BUFFER_DROPPED",
+                            )
                     else:
                         queue.task_done()
                 except asyncio.QueueEmpty:

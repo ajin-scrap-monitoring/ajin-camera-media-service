@@ -8,6 +8,22 @@ from camera_media_service.store import LatestFrameStore
 VALID_JPEG = b"\xff\xd8\xff\xe0synthetic-jpeg\xff\xd9"
 
 
+def test_only_recording_queue_drops_emit_loss_notification():
+    hub = LiveFrameHub(LatestFrameStore())
+    losses = []
+    hub.loss_observer = lambda *args: losses.append(args)
+    hub.subscribe(maxsize=1)  # Live viewer drops must not imply lost storage.
+    hub.publish("cam-1", VALID_JPEG)
+    hub.publish("cam-1", VALID_JPEG)
+    assert losses == []
+    hub.subscribe(maxsize=1, recording=True)
+    dropped = hub.publish("cam-1", VALID_JPEG)
+    hub.publish("cam-1", VALID_JPEG)
+    assert len(losses) == 1 and losses[0][0] == "cam-1"
+    assert losses[0][1] == dropped.received_at and losses[0][2] > dropped.received_at
+    assert losses[0][3] == "BUFFER_DROPPED"
+
+
 def test_frame_validator_detects_valid_and_invalid_jpeg() -> None:
     validator = FrameValidator(max_frame_bytes=100)
 

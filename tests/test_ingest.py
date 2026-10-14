@@ -51,6 +51,20 @@ class BlockingWebSocket(FakeWebSocket):
         return await super().__anext__()
 
 
+@pytest.mark.asyncio
+async def test_connection_replacement_does_not_report_old_socket_as_disconnected():
+    service = IngestService(ConnectionRegistry(), LatestFrameStore(), max_frame_bytes=1024)
+    transitions = []
+    service.hub.connection_observer = lambda *args: transitions.append(args)
+    old = BlockingWebSocket(VALID_JPEG)
+    old_task = asyncio.create_task(service.receive("cam-1", "old", old))
+    await old.started.wait()
+    await service.receive("cam-1", "new", FakeWebSocket([VALID_JPEG]))
+    old.release.set()
+    await old_task
+    assert [v[1] for v in transitions] == [True, True, False]
+
+
 class FailingCloseWebSocket(FakeWebSocket):
     async def close(self, code: int, reason: str) -> None:
         self.close_calls.append((code, reason))

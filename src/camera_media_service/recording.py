@@ -454,6 +454,13 @@ class RecordingService:
             except (OSError, sqlite3.Error):
                 self.storage_error = True
                 LOG.exception("Recording frame storage failed")
+                if self.hub.loss_observer is not None:
+                    self.hub.loss_observer(
+                        frame.camera_id,
+                        frame.received_at,
+                        frame.received_at + 1 / 30,
+                        "STORAGE_ERROR",
+                    )
             finally:
                 self.queue.acknowledge(frame)
 
