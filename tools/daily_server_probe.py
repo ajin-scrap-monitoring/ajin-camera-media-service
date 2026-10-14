@@ -47,7 +47,7 @@ async def run(args):
     ) as client:
         response = await client.put(
             args.api + f"/api/v1/cameras/{args.camera}/recording-policy",
-            json={"pre_roll_seconds": 3, "post_roll_seconds": 3, "retention_days": 1},
+            json={"pre_roll_seconds": 3, "post_roll_seconds": 3, "retention_days": 2},
         )
         assert response.status == 200, await response.text()
         await response.read()

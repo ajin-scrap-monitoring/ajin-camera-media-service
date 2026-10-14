@@ -22,7 +22,7 @@
 - 초기 프로파일1920×1080/약30fps/H.264/yuv420p/무음/veryfast/CRF23/threads2. 운영 프로파일은 서버 측정 단계에서 확정한다.
 - 추가 조각 인코딩1개, export 동시1개/대기8개. 파일시스템 최소 여유5GiB, export 캐시24시간.
 - 날짜 기능은 opt-in으로 배포하고 MAX_DAILY_STORAGE_BYTES 명시 시에만 활성화한다. 기존 보관 기간보다 빨리 자료를 자동 삭제하는 정책은 적용하지 않는다.
-- 로컬에는 기존 미커밋 운영 문서/배포 설정이 있다. 실행 시 변경을 보존하고 관련 부분만 수정한다. 이번 작업은 분석·계획 작성이며 제품 구현은 시작하지 않았다.
+- 로컬에는 기존 미커밋 운영 문서/배포 설정이 있다. 실행 시 변경을 보존하고 관련 부분만 수정한다. 이 문서는 구현 전 작성한 계획이며 실제 실행 결과는 docs/VALIDATION.md에 기록한다.
 
 ## Review Focus
 
@@ -48,7 +48,7 @@
 | 새 `src/camera_media_service/media_files.py` | 이미 열린 파일의 공용 Range/HEAD 전송 |
 | 새 `src/camera_media_service/daily_http_api.py` | v2 요청 검증/JSON/메타데이터·파일 라우트 |
 | 수정 `http_api.py`, `app.py`, `settings.py` | 기존 API 유지, 서비스 생성·생명주기·환경설정 |
-| 새 `docs/DAILY_RECORDING_API_CONTRACT.md` | 백엔드 최종 경로·필드·상태·오류·게이트웨이 하위 경로 |
+| 새 `docs/DAILY_RECORDING_API_GUIDE.md` | 백엔드 최종 경로·필드·상태·오류·게이트웨이 하위 경로 |
 | 수정 `.env.example`, README·ARCHITECTURE·운영 문서·배포 설정 | 활성화 조건과 운영/부하 실측 기록 |
 
 아래 Interfaces는 구현 시 사용할 초기 계약이다. 새 테이블은 RecordingService의 같은 connection/lock을 사용한다. DailyCatalog의 DB 메서드는 호출자가 공용 잠금을 보유하는 동기 메서드이며 자체 잠금을 중첩하지 않는다.
@@ -118,7 +118,7 @@
 
 ### Task 6: v2 HTTP 계약과 게이트웨이 경로
 
-**Files:** 새 daily_http_api.py, media_files.py, tests/test_daily_http_api.py, tests/test_media_files.py, docs/DAILY_RECORDING_API_CONTRACT.md; 수정 http_api.py 및 tests/test_http_api.py.
+**Files:** 새 daily_http_api.py, media_files.py, tests/test_daily_http_api.py, tests/test_media_files.py, docs/DAILY_RECORDING_API_GUIDE.md; 수정 http_api.py 및 tests/test_http_api.py.
 
 **Interfaces:** `register_daily_routes(app: web.Application, daily: DailyRecordingService, exports: DailyExportService) -> None`; `create_http_app(service: RecordingService, *, daily: DailyRecordingService|None=None, exports: DailyExportService|None=None) -> web.Application`; async `stream_file(request, file, *, size: int, filename: str, content_type: str, cache_control: str) -> web.StreamResponse`. file은 호출자가 카탈로그 잠금 아래 열고 전송 종료 후 닫는다.
 
@@ -143,7 +143,7 @@
 
 ### Task 8: 서버·브라우저·백엔드 연동 인수 검증
 
-**Files:** 새 tests/test_daily_smoke.py; 수정 docs/VALIDATION.md, docs/SERVER_DEPLOYMENT.md, docs/DAILY_RECORDING_API_CONTRACT.md.
+**Files:** 새 tests/test_daily_smoke.py; 수정 docs/VALIDATION.md, docs/SERVER_DEPLOYMENT.md, docs/DAILY_RECORDING_API_GUIDE.md.
 
 **Interfaces:** 기존 WSS JPEG 입력과 새 v2 HTTP/HLS를 사용한다. 백엔드/프론트 담당자에게 계약과 테스트용 recording_id를 제공한다.
 

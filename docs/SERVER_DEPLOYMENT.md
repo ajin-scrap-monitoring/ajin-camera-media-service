@@ -86,3 +86,21 @@ df -h /var/lib/ajin-camera-media
 Docker 상태 검사 실패는 상태 표시이며, 그 자체로 컨테이너를 재시작하지 않는다. `unless-stopped`는 프로세스 종료와 Docker 재시작에 적용된다. 서버 전체 재부팅 시험은 기존 서비스에 영향이 있어 이번 배포 검증에 포함하지 않았다.
 
 전체 저장소 하드 쿼터와 오래된 메타데이터 자동 정리는 아직 없다. 완료 영상은 카메라 설정의 보관 기간으로 만료·삭제하며 디스크 여유 공간을 별도로 확인해야 한다.
+
+## 2026-10-14 날짜 녹화 검증 환경
+
+날짜 기능의 코드·API 및129개 서버 시험은 검증 완료했다. 구현 커밋 ed98bc4. 기존 상시 운영의 날짜 기능 활성화는 저장 공간과 실제 입력 프로파일 확인 뒤 진행한다. 새 환경은 기존 서비스와 별도 저장소를 사용한다.
+
+- 시험 컨테이너: ajin-camera-media-daily-validation, CPU2/메모리3GiB.
+- 호스트 API: http://127.0.0.1:18890/api/v2.
+- 같은 ajin-media 네트워크의 백엔드에서: http://ajin-camera-media-daily-validation:8889/api/v2.
+- 시험 입력: 호스트127.0.0.1:18445 → 컨테이너8443. 합성 전용 토큰을 사용하고 운영 엣지 토큰을 읽거나 교체하지 않았다.
+- 시험 저장소: /var/lib/ajin-camera-daily-validation-20261014, 날짜 예산16GiB/최소 여유5GiB.
+- 시험 소스는 GitHub feat/daily-recordings에서 직접 fetch하고 Docker 이미지를 빌드했다.
+- 현재 운영 주소8889/camera-media-service와 외부 WSS9443은 기존 설정이다. 새 v2를 호출하려면 DAILY_RECORDING_ENABLED=true 및 양수 MAX_DAILY_STORAGE_BYTES가 필요하다.
+
+동료용 문서는 [DAILY_RECORDING_API_GUIDE.md](DAILY_RECORDING_API_GUIDE.md) 하나로 전달한다. JSON 목록/정책/상태/MP4 준비/삭제 및 HLS 두 경로·Range 계약을 설명한다. 백엔드 내부 화면 API 경로는 동료가 정한다. 미디어 서비스가 백엔드로 완료 알림을 호출하는 방식은 추가하지 않았다.
+
+운영 용량은 카메라별 실제 GiB/day × 보관일 + MP4 동시 준비/캐시 + JPEG 버퍼/이벤트/DB + 여유 공간으로 계산한다. 합성 도형 영상의 낮은 저장량으로 실현장30일 보관을 승인하지 않는다. 현재약70GiB 여유이므로 날짜 상시 운영 활성화를 완료했다고 보고하지 않는다.
+
+재현 시험 도구는 tools/daily_server_probe.py다. 승인된 격리 환경에서만 실행하며 DAILY_TEST_EDGE_TOKEN 환경 변수로 시험 입력 토큰을 전달한다. --seconds 86400은 실제 시간24시간 시험이다. 서버 재시작 후 입력을 재접속하고, 첫 프레임 전 MJPEG503을 재시도한다. JSON state=running은 완료가 아니며 state=passed와 종료 코드0을 확인한다.
