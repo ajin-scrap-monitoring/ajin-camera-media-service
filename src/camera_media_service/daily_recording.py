@@ -41,6 +41,9 @@ class DailyRecordingService:
         self.db.executescript(
             "CREATE TABLE IF NOT EXISTS daily_cursors("
             "camera TEXT PRIMARY KEY,cursor REAL NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS daily_policy_transitions("
+            "camera TEXT NOT NULL,at REAL NOT NULL,enabled INTEGER NOT NULL,"
+            "PRIMARY KEY(camera,at));"
         )
         self.initialized = False
         self.task = None
@@ -97,7 +100,39 @@ class DailyRecordingService:
                     "INSERT OR REPLACE INTO daily_policies VALUES(?,?)",
                     (camera_id, json.dumps(body)),
                 )
+                self.db.execute(
+                    "INSERT OR REPLACE INTO daily_policy_transitions VALUES(?,?,?)",
+                    (camera_id, self.clock(), int(body["enabled"])),
+                )
         return body
+
+    def _disabled_spans(self, camera, start, end):
+        rows = self.db.execute(
+            "SELECT at,enabled FROM daily_policy_transitions WHERE camera=? AND at<? ORDER BY at",
+            (camera, end),
+        ).fetchall()
+        enabled, point, spans = True, start, []
+        for row in rows:
+            if row["at"] <= start:
+                enabled = bool(row["enabled"])
+                continue
+            if not enabled:
+                spans.append((point, row["at"]))
+            point, enabled = row["at"], bool(row["enabled"])
+        if not enabled and point < end:
+            spans.append((point, end))
+        return spans
+
+    def _ensure_day(self, camera, window, retention):
+        day = self.catalog.ensure_day(camera, window, retention)
+        if "hls_target_duration" not in day:
+            day.update(
+                segment_seconds=self.settings.daily_segment_seconds,
+                hls_target_duration=self.settings.daily_segment_seconds + 1,
+                storage_profile=self.profile,
+            )
+            self.catalog.save_day(day)
+        return day
 
     def _flush_losses(self, now: float) -> None:
         losses, self.losses = self.losses, []
@@ -195,6 +230,19 @@ class DailyRecordingService:
         await self._recover_segments()
         async with self.lock:
             with self.db:
+                # This singleton recorder owns every daily pin. Old outer leases have no
+                # coroutine after restart, so reclaim them once segment recovery is finished.
+                self.db.execute(
+                    "DELETE FROM frame_pins WHERE owner NOT IN (SELECT id FROM daily_segments)"
+                )
+                for camera in self.recording.cameras:
+                    if not self.db.execute(
+                        "SELECT 1 FROM daily_policy_transitions WHERE camera=?", (camera,)
+                    ).fetchone():
+                        self.db.execute(
+                            "INSERT INTO daily_policy_transitions VALUES(?,?,?)",
+                            (camera, -1e30, int(self._policy(camera)["enabled"])),
+                        )
                 for row in self.db.execute("SELECT camera,cursor FROM daily_cursors").fetchall():
                     if row["cursor"] < now:
                         self.db.execute(
@@ -297,7 +345,7 @@ class DailyRecordingService:
                         cursor = now
                         window = DailyWindow.from_date(seoul_date(now))
                         with self.db:
-                            day = self.catalog.ensure_day(camera, window, policy["retention_days"])
+                            day = self._ensure_day(camera, window, policy["retention_days"])
                             if now > window.start_at:
                                 self.db.execute(
                                     "INSERT INTO daily_gaps(camera,start,end,reason) "
@@ -318,14 +366,13 @@ class DailyRecordingService:
                     window = DailyWindow.from_date(seoul_date(cursor))
                     async with self.lock:
                         with self.db:
-                            day = self.catalog.ensure_day(camera, window, policy["retention_days"])
+                            day = self._ensure_day(camera, window, policy["retention_days"])
                             if now >= window.end_at and day["status"] == "recording":
                                 day["status"] = "finalizing"
                                 self.catalog.save_day(day)
                     slot_end = min(
                         window.end_at,
-                        (math.floor(cursor / self.settings.daily_segment_seconds) + 1)
-                        * self.settings.daily_segment_seconds,
+                        (math.floor(cursor / day["segment_seconds"]) + 1) * day["segment_seconds"],
                     )
                     if slot_end > now:
                         break
@@ -344,10 +391,8 @@ class DailyRecordingService:
                             else "BUFFER_DROPPED"
                         )
                         self.notify_loss(camera, cursor, slot_end, reason)
-                    elif policy["enabled"]:
-                        await self._record_slot(day, cursor, slot_end)
                     else:
-                        self.notify_loss(camera, cursor, slot_end, "RECORDING_DISABLED")
+                        await self._record_slot(day, cursor, slot_end)
                     cursor = slot_end
                     async with self.lock:
                         with self.db:
@@ -360,7 +405,7 @@ class DailyRecordingService:
                 if seoul_date(cursor) == seoul_date(now):
                     async with self.lock:
                         with self.db:
-                            self.catalog.ensure_day(
+                            self._ensure_day(
                                 camera,
                                 DailyWindow.from_date(seoul_date(now)),
                                 policy["retention_days"],
@@ -370,13 +415,17 @@ class DailyRecordingService:
         lease_id = str(uuid.uuid4())
         async with self.lock:
             with self.db:
+                for a, b in self._disabled_spans(day["camera_id"], start, end):
+                    self._save_loss(day["camera_id"], a, b, "RECORDING_DISABLED")
                 frames = self.recording.pin_frames(lease_id, day["camera_id"], start, end)
                 loss = self.db.execute(
                     "SELECT start,end FROM daily_gaps WHERE camera=? AND start<? AND end>?",
                     (day["camera_id"], end, start),
                 ).fetchall()
                 existing = self.catalog.segments(day["recording_id"], ready_only=True)
-                profile = existing[0]["profile"] if existing else self.profile
+                profile = (
+                    existing[0]["profile"] if existing else day.get("storage_profile", self.profile)
+                )
         groups = []
         for frame in frames:
             if any(s["start_at"] <= frame.received_at < s["end_at"] for s in existing):
@@ -550,27 +599,33 @@ class DailyRecordingService:
             return
         await self._recover_segments()
         now = self.clock()
+        # Apply the same bounded catch-up policy before flushing a sub-slot tail.
+        await self.tick(now)
         if self.recording.queue is not None:
             await self.recording.queue.wait_received()
         async with self.tick_lock:
             for row in self.db.execute("SELECT camera,cursor FROM daily_cursors").fetchall():
                 camera, cursor = row["camera"], row["cursor"]
-                if cursor >= now or not self._policy(camera)["enabled"]:
-                    continue
-                end = min(now, DailyWindow.from_date(seoul_date(cursor)).end_at)
-                day = self.catalog.ensure_day(
-                    camera,
-                    DailyWindow.from_date(seoul_date(cursor)),
-                    self._policy(camera)["retention_days"],
-                )
-                await self._record_slot(day, cursor, end)
-                async with self.lock:
-                    with self.db:
-                        self._flush_losses(now)
-                        self._refresh(self.catalog.get_day(day["recording_id"]), end)
-                        self.db.execute(
-                            "UPDATE daily_cursors SET cursor=? WHERE camera=?", (end, camera)
-                        )
+                while cursor < now:
+                    day = self._ensure_day(
+                        camera,
+                        DailyWindow.from_date(seoul_date(cursor)),
+                        self._policy(camera)["retention_days"],
+                    )
+                    end = min(
+                        now,
+                        epoch(day["window_end_at"]),
+                        (math.floor(cursor / day["segment_seconds"]) + 1) * day["segment_seconds"],
+                    )
+                    await self._record_slot(day, cursor, end)
+                    async with self.lock:
+                        with self.db:
+                            self._flush_losses(now)
+                            self._refresh(self.catalog.get_day(day["recording_id"]), end)
+                            self.db.execute(
+                                "UPDATE daily_cursors SET cursor=? WHERE camera=?", (end, camera)
+                            )
+                    cursor = end
 
     async def close(self) -> None:
         if self._closed:

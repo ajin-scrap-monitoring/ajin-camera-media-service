@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 from camera_media_service.recording import epoch, iso
 
 
@@ -34,7 +32,7 @@ def build_available_intervals(segments: list[dict], gaps: list[dict] = ()) -> li
 
 def build_daily_playlist(day: dict, segments: list[dict]) -> str:
     closed = day["status"] == "closed"
-    target = max(1, math.ceil(max((s["duration"] for s in segments), default=10)))
+    target = day.get("hls_target_duration", 10)
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:6",
@@ -46,17 +44,8 @@ def build_daily_playlist(day: dict, segments: list[dict]) -> str:
     previous = None
     for segment in segments:
         if previous is not None:
-            known_loss = any(
-                epoch(g["start_at"]) < segment["start_at"]
-                and epoch(g["end_at"]) > previous["end_at"]
-                for g in day.get("gaps", [])
-            )
-            if (
-                segment["start_at"] - previous["end_at"] > 1
-                or known_loss
-                or segment.get("profile") != previous.get("profile")
-            ):
-                lines.append("#EXT-X-DISCONTINUITY")
+            # Independent encoders reset PTS even when the wall-clock spans are contiguous.
+            lines.append("#EXT-X-DISCONTINUITY")
         lines.extend(
             (
                 f"#EXT-X-PROGRAM-DATE-TIME:{iso(segment['start_at'])}",

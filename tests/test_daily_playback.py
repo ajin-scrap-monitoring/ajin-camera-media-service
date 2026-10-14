@@ -59,3 +59,20 @@ def test_closed_hls_is_vod_and_contiguous_intervals_merge():
     assert "#EXT-X-PLAYLIST-TYPE:VOD" in text and "#EXT-X-ENDLIST" in text
     intervals = playback().build_available_intervals(segments)
     assert len(intervals) == 1 and intervals[0]["playback_end_seconds"] == 20
+
+
+def test_each_independent_ts_timestamp_reset_is_declared():
+    day, segments = fixture()
+    segments[1]["start_at"] -= 10
+    segments[1]["end_at"] -= 10
+    assert playback().build_daily_playlist(day, segments).count("#EXT-X-DISCONTINUITY\n") == 1
+
+
+def test_live_target_duration_remains_fixed_after_short_first_segment():
+    day, segments = fixture()
+    segments[0]["duration"] = 1
+    short = playback().build_daily_playlist(day, segments[:1])
+    full = playback().build_daily_playlist(day, segments)
+    def target(text):
+        return next(line for line in text.splitlines() if line.startswith("#EXT-X-TARGETDURATION:"))
+    assert target(short) == target(full)

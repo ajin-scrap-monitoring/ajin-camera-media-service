@@ -53,6 +53,8 @@ Content-Type: application/json
 
 GET/PUT 성공200 응답도 같은 구조다. enabled는 boolean, retention_days는1~365 integer다. 두 필드 모두 필요하다. 기본값은 enabled=true/retention_days=30이며 서버 전체 날짜 기능 활성화 조건과 별개다.
 
+enabled 변경은 미디어 서비스가 PUT을 처리한 시각부터 적용합니다. 짧게 껐다가 같은 조각 시간 안에 다시 켜도 비활성 구간은 `RECORDING_DISABLED`로 남고, 끄기 전 확보한 영상은 유지합니다.
+
 이벤트의 pre_roll_seconds/post_roll_seconds/retention_days는 `/api/v1/.../recording-policy`에 남는다. 날짜 보관 기간 변경은 다음 날짜부터 적용하고 기존/현재 날짜에 소급하지 않는다. 비활성화한 구간의 녹화는 확보할 수 없다.
 
 ## 5. 날짜별 목록
@@ -144,6 +146,8 @@ playback_state가 ready면 playback_path를 인증된 영상 게이트웨이 주
 ```
 
 m3u8 안의 `/api/v2/.../media/...`는 미디어 서비스의 상대 경로다. 게이트웨이가 다른 prefix를 쓰면 목록 안의 URI도 변환한다. 목록만 프록시하고 조각 경로를 빠뜨리면 재생되지 않는다. 브라우저별 HLS 지원에 맞춰 플레이어를 연결한다.
+
+각 독립 TS의 타임스탬프 초기화를 HLS `EXT-X-DISCONTINUITY`로 표시합니다. 이 태그만 보고 누락 여부를 판단하지 마세요. 실제 누락은 JSON의 gaps로 표시합니다. TARGETDURATION은 날짜 안에서 고정됩니다. storage_profile/segment_seconds/hls_target_duration은 서버가 고정한 출력 정보이며 백엔드에서 변경하는 정책 필드가 아닙니다.
 
 - 목록 Content-Type: application/vnd.apple.mpegurl
 - 조각 Content-Type: video/mp2t

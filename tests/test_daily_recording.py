@@ -197,6 +197,79 @@ async def test_daily_profile_is_frozen_and_midnight_is_finalizing(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_recovery_reclaims_orphan_outer_slot_pins(tmp_path, monkeypatch):
+    window = DailyWindow.from_date(date(2026, 10, 14))
+    clock = [window.start_at]
+    service, daily = make_daily(tmp_path, clock, monkeypatch)
+    await daily.tick(clock[0])
+    for i in range(10):
+        await service.store_frame(FrameEnvelope("camera-main", clock[0] + i / 10, i, jpeg()))
+    with service.db:
+        service.pin_frames("crashed-outer-slot", "camera-main", clock[0], clock[0] + 10)
+    await service.close()
+    clock[0] += 600
+    service, daily = make_daily(tmp_path, clock, monkeypatch)
+    await daily.tick(clock[0])
+    async with service.lock:
+        with service.db:
+            await service._prune(clock[0])
+    assert service.db.execute("SELECT count(*) FROM frame_pins").fetchone()[0] == 0
+    assert service.db.execute("SELECT count(*) FROM frames").fetchone()[0] == 0
+    await daily.close()
+    await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reenable", [True, False])
+async def test_policy_effective_time_preserves_enabled_prefix(tmp_path, monkeypatch, reenable):
+    import imageio_ffmpeg
+
+    window = DailyWindow.from_date(date(2026, 10, 14))
+    clock = [window.start_at]
+    service, daily = make_daily(tmp_path, clock, monkeypatch)
+    service.ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    await daily.tick(clock[0])
+    for i in range(100):
+        await service.store_frame(FrameEnvelope("camera-main", window.start_at + i / 10, i, jpeg()))
+    clock[0] += 3
+    await daily.set_policy("camera-main", {"enabled": False, "retention_days": 30})
+    if reenable:
+        clock[0] = window.start_at + 7
+        await daily.set_policy("camera-main", {"enabled": True, "retention_days": 30})
+    clock[0] = window.start_at + 10
+    await daily.tick(clock[0])
+    day = (await daily.list_days("camera-main", {}, 20, None))[0]
+    assert abs(day["recorded_seconds"] - (6 if reenable else 3)) < 0.04
+    assert {
+        "start_at": iso(window.start_at + 3),
+        "end_at": iso(window.start_at + (7 if reenable else 10)),
+        "reason_code": "RECORDING_DISABLED",
+    } in day["gaps"]
+    await daily.close()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_bounds_clock_jump_backlog(tmp_path, monkeypatch):
+    window = DailyWindow.from_date(date(2026, 10, 14))
+    clock = [window.start_at]
+    service, daily = make_daily(tmp_path, clock, monkeypatch)
+    await daily.tick(clock[0])
+    calls = []
+
+    async def count(day, start, end):
+        calls.append((start, end))
+        if len(calls) > 5:
+            raise RuntimeError("Unbounded shutdown backlog")
+
+    monkeypatch.setattr(daily, "_record_slot", count)
+    clock[0] += 86400
+    await daily.close()
+    assert len(calls) <= 4
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_empty_midnight_creates_one_day_each_and_never_marks_future_gap(
     tmp_path, monkeypatch
 ):
