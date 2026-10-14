@@ -13,6 +13,7 @@ from collections.abc import Callable
 
 from camera_media_service.daily_catalog import DailyCatalog
 from camera_media_service.daily_models import DailyWindow, seoul_date
+from camera_media_service.daily_playback import build_available_intervals
 from camera_media_service.encoding import encode_daily_segment, probe_media
 from camera_media_service.recording import ApiError, RecordingService, epoch, iso
 
@@ -252,7 +253,7 @@ class DailyRecordingService:
             recorded_seconds=round(offset, 3),
             gaps=gaps,
             has_gaps=bool(gaps),
-            available_intervals=intervals,
+            available_intervals=build_available_intervals(segments),
             playable_until_at=iso(segments[-1]["end_at"]) if segments else None,
             playback_state="ready" if segments else "pending",
             playback_path=f"/api/v2/daily-recordings/{day['recording_id']}/hls/index.m3u8"
