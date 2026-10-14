@@ -154,7 +154,7 @@ Linux 개발용 imageio-ffmpeg7.0.2는 유효 TS 읽기에서 종료 코드-11�
 
 ## 2026-10-15 기존 운영 서비스 교체
 
-사용자 요청에 따라 기존 `ajin-camera-media-service`를 교체했다. 소스는 서버의 Git 저장소에서 GitHub main을 fetch/fast-forward했다. 실행 이미지는 `ajin-camera-media-service:c479f8b`이며 기존 loopback8889, ingest18443/Tailscale WSS9443, `ajin-media`의 `camera-media-service` 주소와 `/var/lib/ajin-camera-media` 저장소를 유지했다. 기존 이벤트 설정 및 엣지 자격증명은 백업과 비공개 비교로 보존을 확인했다. 날짜 녹화는 활성,1920×1080/30fps/10초 조각, 원본+다운로드 캐시32GiB 예산/최소 디스크 여유5GiB다. 보관 정책30일이 실제30일 용량 보장을 뜻하지 않는다.
+사용자 요청에 따라 기존 `ajin-camera-media-service`를 교체했다. 소스는 서버의 Git 저장소에서 GitHub main을 fetch/fast-forward했다. 실행 이미지는 `ajin-camera-media-service:e50fa64`이며 기존 loopback8889, ingest18443/Tailscale WSS9443, `ajin-media`의 `camera-media-service` 주소와 `/var/lib/ajin-camera-media` 저장소를 유지했다. 기존 이벤트 설정 및 엣지 자격증명은 백업과 비공개 비교로 보존을 확인했다. 날짜 녹화는 활성,1920×1080/30fps/10초 조각, 원본+다운로드 캐시32GiB 예산/최소 디스크 여유5GiB다. 보관 정책30일이 실제30일 용량 보장을 뜻하지 않는다.
 
 기존 연결의 camera-main 입력이 재접속해 날짜 TS를 저장하고 있다. 이 검증은 현재 연결된 영상 입력에 대한 결과이며 실제 장비가 특정 웹캠/RPi5라는 신원까지 확인한 것은 아니다. 오늘 날짜 ID는 `4765d881-36f6-43bc-a4e6-ed8adf4b0c50`이며 활성화 전 시간과 배포·지연 중 실제 누락을 유지한다.
 
@@ -168,7 +168,7 @@ Linux 개발용 imageio-ffmpeg7.0.2는 유효 TS 읽기에서 종료 코드-11�
 | 수정본 서버 전체 시험 | 133 passed,89.57초. CPU2/메모리3GiB, FFmpeg7.1.3 |
 | Ruff check/format | 통과 |
 | 운영 카탈로그 복사본 집계 | 누락4,537건/재생 구간657개에서0.084088초. 운영 데이터는 읽기 전용으로 복사 |
-| 운영 교체 후 실제 입력 관찰 | 90초 표본, 초기 안정화30초 이후60.042초 동안 저장 길이50초 증가(마지막10초 조각은 준비 중), coverage 지연3.7~13.8초 |
+| 첫 집계 수정 후 실제 입력 관찰 | 90초 표본, 초기 안정화30초 이후60.042초 동안 저장 길이50초 증가(마지막10초 조각은 준비 중), coverage 지연3.7~13.8초. 이후 추가 버퍼 누락이 확인되어 아래 저장 동기화 수정으로 이어짐 |
 | 신규 BUFFER_DROPPED | 관찰 중 추가0건, 기존4,585건 보존, 날짜 error=null |
 | 운영 상태 | running/healthy, unless-stopped |
 | 백엔드 컨테이너 접근 | scrap-monitoring-backend-check에서 운영 주소의 v1 설정/v2 정책/v2 목록200 |
@@ -180,4 +180,19 @@ Linux 개발용 imageio-ffmpeg7.0.2는 유효 TS 읽기에서 종료 코드-11�
 
 원본 배포 백업은 `/home/kyuncho/ajin-camera-media-service/backups/daily-rollout-20261014T151614Z`, 성능 수정 직전 백업은 같은 디렉터리의 `daily-perf-20261014T154457Z`다. 각 백업에는 설정 파일과 SQLite 온라인 백업이 있으며 외부 공유/Git 대상이 아니다. 운영 측정 결과는 `/home/kyuncho/ajin-daily-validation-results/production-rollout-20261015.json`, 동시 이벤트 결과는 같은 디렉터리의 `production-event-check-20261015.json`이다.
 
-합성24시간 시험은 운영 문제의 부하 분리를 위해 일시 정지했다가 운영 수정 후 재개했다. 별도 시험 컨테이너와 입력 프로세스는 다시 실행 중이지만, 중단을 포함하므로24시간 무중단 성공으로 보고하지 않는다. 마감 결과와 장시간 실제 입력 용량은 여전히 후속 검증 대상이다.
+합성24시간 시험은 운영 문제의 부하 분리를 위해 두 번 일시 정지했다가 재개했다. 별도 시험 서비스도 `e50fa64`로 교체하고 시험 데이터/설정/날짜 ID를 유지했다. 입력 프로세스는 재개했지만, 중단과 서비스 교체를 포함하므로 단일 버전24시간 무중단 성공으로 보고하지 않는다. 마감 결과와 장시간 실제 입력 용량은 여전히 후속 검증 대상이다.
+
+### 최종 저장 동기화 수정(e50fa64)
+
+첫 집계 수정만으로는 만료 프레임 정리 이후 추가 누락이 발생했다. 운영 SQLite 복사본을 계측한 결과30프레임 처리에서 커밋59회에3.114초가 걸렸고, SQL 조회/파일 쓰기·삭제는 상대적으로 짧았다. FULL 동기화 한 번에 약50ms가 걸리는 디스크에서 프레임마다 정리/삽입을 커밋하면30fps를 감당하기 어려웠다.
+
+만료 파일들의 성공한 삭제를 한 번에 커밋하고, 큐 입력은 최대10프레임/수집 대기100ms 단위로 묶어 저장한다. 수신 시각은 그대로이고 SQLite FULL 설정과 커밋 이후 receipt 완료 조건을 유지한다. 배치 중 쓰기 실패는 새 파일/행을 롤백하며, 만료 삭제 일부 실패 시 성공한 삭제 행은 보존한다. 미래 입력이 이벤트 저장을 무기한 막지 않는 기존 시험도 실제 배치 저장 경계에서 통과했다.
+
+- Windows 전체136개 시험 통과(21.33초), 서버 전체136개 시험 통과(108.71초), Ruff check/format 통과.
+- 실제 운영 카탈로그/프레임의 읽기 전용 복사 표본에서 기존60프레임 저장17.153초, 만료 삭제 배치만 적용한 표본5.047초, 최종10프레임 배치 저장 표본0.683초를 측정했다.
+- 운영 설정/SQLite 추가 백업: `/home/kyuncho/ajin-camera-media-service/backups/daily-batch-20261014T160546Z`.
+- 최종 운영 이미지와 별도 합성 시험 이미지는 `ajin-camera-media-service:e50fa64`다. 첫 수정의90초 표본만으로 최종 안정성을 판단하지 않는다.
+- 최종180초 실제 입력 관찰에서 초기30초 이후150.49초 동안 저장 길이149.933초 증가, 신규 BUFFER_DROPPED0건, 날짜 error=null, coverage 지연12.7~13.3초를 확인했다. 합성 입력도 함께 실행했으며 기존 누락6,894건은 보존했다.
+- 같은 관찰 중 전후30초 이벤트 클립202→ready, MP4 Range206/1,024바이트 및 시험 클립 삭제204가 통과했다. 이벤트 완료 이후에도 날짜 녹화가 계속 증가하고 신규 누락은 없었다.
+- 최종 이미지에서 running/healthy/unless-stopped, 백엔드 컨테이너의 v1 설정/v2 정책/v2 목록200, MJPEG200/HLS EVENT200/TS Range206 및 기존 설정·자격증명 보존을 재확인했다.
+- 최종 보고서: `/home/kyuncho/ajin-daily-validation-results/production-batch-20261015.json`, state=passed. 이3분 관찰을24시간 무중단/실제30일 보관 용량 검증으로 확대하지 않는다.

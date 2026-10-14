@@ -53,7 +53,7 @@ networks:
 | 항목 | 값 |
 | --- | --- |
 | 컨테이너 | `ajin-camera-media-service` |
-| 이미지 | `ajin-camera-media-service:c479f8b` |
+| 이미지 | `ajin-camera-media-service:e50fa64` |
 | 배포 파일 | `/home/kyuncho/ajin-camera-media-service/compose.server.yaml` |
 | 실행 환경 파일 | 같은 디렉터리의 `runtime.env` (권한 `0600`) |
 | 서버의 영구 저장 경로 | `/var/lib/ajin-camera-media` |
