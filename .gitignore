@@ -7,6 +7,8 @@
 *.p12
 *.pfx
 secrets/
+deploy/runtime.env
+deploy/camera-*.edge.env
 
 # Python environments and caches
 .venv/

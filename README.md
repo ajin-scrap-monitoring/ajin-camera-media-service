@@ -98,6 +98,7 @@ uv run ruff format --check .
 - [아키텍처](docs/ARCHITECTURE.md)
 - [검증 기록](docs/VALIDATION.md)
 - [남은 운영 검증](docs/REMAINING_WORK.md)
+- [서버 A 배포와 백엔드 연결](docs/SERVER_DEPLOYMENT.md)
 
 ## 이용 조건
 

@@ -11,6 +11,7 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
   "websockets>=13,<14",
   "aiohttp>=3.12,<4",
+  "tzdata>=2025.1",
 ]
 
 [project.optional-dependencies]

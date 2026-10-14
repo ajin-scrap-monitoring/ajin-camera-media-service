@@ -1,0 +1,42 @@
+services:
+  camera-media:
+    image: ${MEDIA_IMAGE:-ajin-camera-media-service:d84e659}
+    container_name: ajin-camera-media-service
+    restart: unless-stopped
+    env_file:
+      - runtime.env
+    ports:
+      - "127.0.0.1:8889:8889"
+      - "127.0.0.1:18443:8443"
+    volumes:
+      - "${MEDIA_DATA_DIR:-/var/lib/ajin-camera-media}:/var/lib/camera-media"
+    networks:
+      media:
+        aliases:
+          - camera-media-service
+    cpus: 2
+    mem_limit: 3g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8889/api/v1/clips?limit=1', timeout=3).close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  media:
+    name: ajin-media
