@@ -1,6 +1,6 @@
 services:
   camera-media:
-    image: ${MEDIA_IMAGE:-ajin-camera-media-service:e50fa64}
+    image: ${MEDIA_IMAGE:-ajin-camera-media-service:a0e470f}
     container_name: ajin-camera-media-service
     restart: unless-stopped
     env_file:

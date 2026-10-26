@@ -1,5 +1,36 @@
 # 검증 기록
 
+## 2026-10-26 운영 서버 구간 추출 배포 검증
+
+GitHub main에 구현 커밋 `a0e470f2cfc25ebe498cfd03ed83ce2be5efb83d`를 반영하고 서버가 GitHub에서 직접 fetch/fast-forward한 소스로 새 이미지를 빌드했다. 새 운영 이미지의 시스템 FFmpeg를 사용하는 격리 컨테이너에서 **165 passed in 145.73s**를 확인한 뒤 기존 운영 미디어서버를 교체했다.
+
+- 실행 이미지: `ajin-camera-media-service:a0e470f`, 이미지 ID `sha256:14e139e7f6345857499bc5cf442d03d4b22c559740f24f5ac749f2d4e8411bd0`.
+- 기존 관리 파일 `/srv/scrap-monitoring/development/main-refresh-20261015/compose.media.yaml`의 이미지 참조만 변경했다. 이전 Compose와 SQLite 백업을 보관했고 건강 상태 실패 시 자동 롤백하도록 배포했다. 실제 롤백은 필요하지 않았다.
+- 포트, Docker 네트워크, 저장 볼륨, CPU 2개/메모리 3GiB, 환경 파일 해시가 교체 전과 같음을 비교 확인했다. 실제 녹화 프로파일 1920×1080/15fps와 날짜 예산32GiB/최소 여유5GiB를 유지했다.
+- 기존 백엔드 컨테이너 `scrap-monitoring-backend-check` 안에서 `http://camera-media-service:8889/api/v1/cameras/camera-main/recording-policy`를 호출해200을 확인했다. 같은 컨테이너에서 live API의200·multipart·JPEG 파트도 확인했다. 백엔드 코드는 변경하지 않았다.
+
+운영 중인 `camera-main`의 기존 녹화를 사용했다. 모의 입력으로 운영 스트림을 교체하거나 녹화 설정을 변경하지 않았다.
+
+| 검증 | 결과 |
+| --- | --- |
+| 미래 기준 시각 | 400 `EVENT_TIME_IN_FUTURE` |
+| 영상이 없는 기준 시각 | 404 `RECORDING_NOT_FOUND_AT_TIME` |
+| 수신됐지만 아직 상시 녹화 처리 중인 시각 | 409 `RECORDING_NOT_READY` |
+| 미래 꼬리가 있는 요청 | 202 → ready, coverage partial, 미래/미완료 꼬리 사유 표시 |
+| 앞 30초 중 실제 과거가 부족한 요청 | ready/partial, 없는 앞 29초 표시, 실제 녹화 시작부터 제공 |
+| 동일 이벤트의 다른 시각 재요청 | 200, 최초 클립 ID·요청 구간 유지 |
+| MP4 | H.264, 1920×1080, 32.800초, 1,464,855바이트 |
+| 해당 표본의202 응답 후 ready 확인 | 약1.084초. 단일 표본이며 전체 요청 지연 보장은 아님 |
+| 절단 시작 | 요청06:38:28.000Z, 실제06:38:27.005Z: 추가 약0.995초로 허용 범위 이내 |
+| 파일 무결성 | FFmpeg 전체 디코딩 성공 |
+| Range | 선두1,024바이트206 |
+| 검증 파일 정리 | DELETE204, 반복204, 파일 재조회410. 추가 과거 부족 검증 파일도 삭제 |
+| 녹화 설정 | 검증 전후 전30초/후30초/보관30일 동일 |
+
+교체 후 새 녹화 조각이 계속 증가하는 것도 확인했다. 로그·결과·롤백 정보는 `/home/kyuncho/ajin-camera-media-service/deploy-20261026-a0e470f/`의 `pytest.log`, `deployment.json`, `verification.json`, `rollback.json`에 보관했다. SQLite 사본은 같은 디렉터리의 비공개 `catalog-before.sqlite3`, 이전 Compose는 관리 경로의 `compose.media.before-a0e470f-20261026.yaml`이다.
+
+이 검증은 미디어서버 운영 API와 백엔드 컨테이너의 네트워크 접근을 확인한 것이다. 백엔드의 실제 이벤트 처리 코드가 `event_at`을 보내는지, 대시보드 UI가 부분 구간을 표시하는지, 물리 웹캠/RPi5의 현장 입력인지는 이번 검증 범위에 포함하지 않는다. 기존10초 GOP 자료의 허용 오차 제한과 시각 없는 호출의 기존 인코딩 동작은 그대로다.
+
 ## 2026-10-26 이벤트 발생 시각 기반 구간 추출 (로컬)
 
 작업 브랜치 `codex/event-time-clips`에서 선택 필드 `event_at`을 추가했다. 기존 시각 없는 호출은 유지하며, 시각을 전달한 요청은 날짜 녹화의 H.264/TS 조각을 재인코딩 없이 MP4로 묶는다. 이번 검증은 로컬 Python 3.13 및 FFmpeg 7.1 기반이며 운영 서버 배포·실제 백엔드 통합 검증은 포함하지 않는다.

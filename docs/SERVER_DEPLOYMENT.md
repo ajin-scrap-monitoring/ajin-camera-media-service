@@ -2,6 +2,8 @@
 
 2026-10-04 서버 A `100.100.27.99`의 기존 운영 배포를 시작했다. 2026-10-15에는 GitHub main에서 날짜별 상시 녹화 버전을 가져와 같은 운영 컨테이너에 적용했다. 실행 상태와 배포 검증 결과는 VALIDATION.md를 참조한다.
 
+2026-10-26 이벤트 시각 기반 구간 추출 버전 `a0e470f`로 운영 컨테이너를 교체했다. 기존 배포 관리 경로 `/srv/scrap-monitoring/development/main-refresh-20261015/compose.media.yaml`에서 이미지 참조만 바꿨다. 프로젝트 이름 `scrap-media-dev-daf293e`는 배포 관리용 기존 이름으로 유지했으며 실행 코드 버전은 이미지로 확인한다. 환경 파일·포트·네트워크·영구 저장소·자원 한도는 그대로다.
+
 ## 백엔드 담당자에게 전달할 값
 
 | 항목 | 값 |
@@ -13,7 +15,7 @@
 | 카메라 ID | `camera-main` |
 | 실시간 영상 | `GET /cameras/camera-main/live` (HTTP MJPEG) |
 | 녹화 설정 | `GET / PUT /cameras/camera-main/recording-policy` |
-| 이벤트 저장 | `POST /clips`, JSON `{"camera_id":"camera-main","event_id":"고유 이벤트 ID"}` |
+| 이벤트 저장 | `POST /clips`, JSON `{"camera_id":"camera-main","event_id":"고유 이벤트 ID"}`. 선택 `event_at`을 추가하면 기존 녹화에서 재인코딩 없이 구간 추출 |
 | 목록 | `GET /clips?camera_id=camera-main` |
 | 상태 | `GET /clips/{clip_id}` |
 | 재생·다운로드 | `GET /clips/{clip_id}/content` (H.264 MP4, Range 지원) |
@@ -53,16 +55,16 @@ networks:
 | 항목 | 값 |
 | --- | --- |
 | 컨테이너 | `ajin-camera-media-service` |
-| 이미지 | `ajin-camera-media-service:e50fa64` |
-| 배포 파일 | `/home/kyuncho/ajin-camera-media-service/compose.server.yaml` |
-| 실행 환경 파일 | 같은 디렉터리의 `runtime.env` (권한 `0600`) |
+| 이미지 | `ajin-camera-media-service:a0e470f` |
+| 배포 파일 | `/srv/scrap-monitoring/development/main-refresh-20261015/compose.media.yaml` |
+| 실행 환경 파일 | `/home/kyuncho/ajin-camera-media-service/runtime.env` (비공개 파일, 이번 배포에서 내용 유지) |
 | 서버의 영구 저장 경로 | `/var/lib/ajin-camera-media` |
 | 저장 경로 소유자 | UID/GID `10002:10002`, 디렉터리 권한 `0750` |
 | 저장 내용 | `buffer/` JPEG, `clips/` 이벤트 MP4, 날짜 녹화 TS/다운로드 MP4, `catalog.sqlite3` 및 SQLite 보조 파일 |
 | 자동 재시작 | Docker `unless-stopped`, Docker 서비스 자동 시작 활성화 |
 | 자원 제한 | CPU 2개, 메모리 3 GiB |
 | 버퍼·작업 한도 | JPEG 버퍼 2 GiB, 미완료 녹화 작업 최대 32개 |
-| 날짜 녹화 | 활성, 한국 자정 전환, H.264 1920×1080/30fps, 10초 조각 |
+| 날짜 녹화 | 활성, 한국 자정 전환, H.264 1920×1080/15fps, 10초 조각, 새 녹화의 키프레임 간격 1초 |
 | 날짜 저장 예산 | 원본 및 다운로드 캐시 합산 32 GiB, 최소 디스크 여유 5 GiB |
 | 날짜 보관·다운로드 | 정책 30일, 다운로드 캐시 24시간. 저장 예산 내 보관이며 실제 30일 분량 보장 아님 |
 | 로그 | 파일당 10 MiB, 최대 3개 순환 |
@@ -79,8 +81,8 @@ sudo docker logs --tail 100 ajin-camera-media-service
 curl http://127.0.0.1:8889/api/v1/cameras/camera-main/recording-policy
 
 # 미디어서버만 재시작
-sudo docker compose -p ajin-camera-media \
-  -f /home/kyuncho/ajin-camera-media-service/compose.server.yaml restart
+sudo docker compose \
+  -f /srv/scrap-monitoring/development/main-refresh-20261015/compose.media.yaml restart camera-media
 
 # 디스크 사용량
 sudo du -sh /var/lib/ajin-camera-media
