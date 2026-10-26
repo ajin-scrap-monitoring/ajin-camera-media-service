@@ -182,7 +182,7 @@ async def encode_daily_segment(
             "-bf",
             "0",
             "-g",
-            str(fps * 10),
+            str(fps),
             "-sc_threshold",
             "0",
             "-r",

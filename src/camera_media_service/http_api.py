@@ -64,6 +64,9 @@ def query_fields(request, allowed):
 def create_http_app(service: RecordingService, *, daily=None, exports=None) -> web.Application:
     key = service.cursor_key
     viewers = 0
+    from camera_media_service.recorded_clips import RecordedClipService, event_timestamp
+
+    recorded_clips = RecordedClipService(service, daily) if daily is not None else None
 
     @web.middleware
     async def boundary(request, handler):
@@ -90,6 +93,8 @@ def create_http_app(service: RecordingService, *, daily=None, exports=None) -> w
                 await exports.start()
             yield
         finally:
+            if recorded_clips is not None:
+                await recorded_clips.close()
             if daily is not None:
                 await exports.close()
                 await daily.close()
@@ -109,9 +114,23 @@ def create_http_app(service: RecordingService, *, daily=None, exports=None) -> w
     async def create(request):
         query_fields(request, ())
         data = await body_json(request)
-        if set(data) != {"camera_id", "event_id"}:
+        if not {"camera_id", "event_id"} <= set(data) or set(data) - {
+            "camera_id",
+            "event_id",
+            "event_at",
+        }:
             raise ApiError(400, "INVALID_ARGUMENT", "camera_id and event_id are required.")
-        result, created = await service.create_clip(data["camera_id"], data["event_id"])
+        if "event_at" in data:
+            event_timestamp(data["event_at"])
+            if recorded_clips is None:
+                raise ApiError(
+                    503, "RECORDING_NOT_ENABLED", "Enable daily recording to extract clips."
+                )
+            result, created = await recorded_clips.create_clip(
+                data["camera_id"], data["event_id"], data["event_at"]
+            )
+        else:
+            result, created = await service.create_clip(data["camera_id"], data["event_id"])
         fields = (
             "clip_id",
             "event_id",
@@ -121,8 +140,24 @@ def create_http_app(service: RecordingService, *, daily=None, exports=None) -> w
             "requested_start_at",
             "requested_end_at",
         )
+        response = {k: result[k] for k in fields}
+        if "event_at" in result:
+            response.update(
+                {
+                    k: result[k]
+                    for k in (
+                        "event_at",
+                        "coverage",
+                        "actual_start_at",
+                        "actual_end_at",
+                        "gaps",
+                        "extraction_mode",
+                        "available_intervals",
+                    )
+                }
+            )
         return web.json_response(
-            {k: result[k] for k in fields},
+            response,
             status=202 if created else 200,
             headers={"Location": f"/api/v1/clips/{result['clip_id']}"},
         )

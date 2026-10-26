@@ -192,6 +192,10 @@ class DailyExportService:
                 raise ApiError(409, "RECORDING_ACTIVE", "Current day cannot be deleted.")
             if self._has_job(recording_id):
                 raise ApiError(409, "EXPORT_IN_PROGRESS", "Export is in progress.")
+            if self.db.execute(
+                "SELECT 1 FROM clip_recording_pins WHERE day_id=? LIMIT 1", (recording_id,)
+            ).fetchone():
+                raise ApiError(409, "EXPORT_IN_PROGRESS", "Event clip uses this recording.")
             if day["status"] != "expired":
                 day.update(status="deleted", deleted_at=iso(self.daily.clock()))
             day.update(
@@ -210,6 +214,11 @@ class DailyExportService:
     async def _cleanup(self, recording_id: str) -> None:
         if self._has_job(recording_id):
             return
+        async with self.lock:
+            if self.db.execute(
+                "SELECT 1 FROM clip_recording_pins WHERE day_id=? LIMIT 1", (recording_id,)
+            ).fetchone():
+                return
         # Values originate from the catalog; verify resolved deletion stays in owned roots.
         uuid.UUID(recording_id)
         folder = self.root / "daily" / recording_id

@@ -25,17 +25,24 @@ class RecordingQueue(asyncio.Queue[FrameEnvelope]):
         super().__init__(maxsize)
         self._sequence = 0
         self._pending: dict[int, int] = {}
+        self._receipt_times: dict[int, tuple[str, float]] = {}
         self._changed = asyncio.Event()
 
     def put_nowait(self, item: FrameEnvelope) -> None:
         super().put_nowait(item)
         self._sequence += 1
         self._pending[id(item)] = self._sequence
+        self._receipt_times[id(item)] = (item.camera_id, item.received_at)
 
     def acknowledge(self, item: FrameEnvelope) -> None:
         self._pending.pop(id(item))
+        self._receipt_times.pop(id(item))
         self.task_done()
         self._changed.set()
+
+    def pending_timestamps(self, camera_id: str) -> list[float]:
+        """Include queued and writer-owned receipts until their durable acknowledgement."""
+        return [at for camera, at in self._receipt_times.values() if camera == camera_id]
 
     async def wait_received(self) -> None:
         through = self._sequence

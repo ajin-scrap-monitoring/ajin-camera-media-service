@@ -28,6 +28,8 @@ class DailyCatalog:
             CREATE INDEX IF NOT EXISTS daily_gap_time ON daily_gaps(camera,start,end);
             CREATE TABLE IF NOT EXISTS daily_exports(
                 day_id TEXT PRIMARY KEY, status TEXT NOT NULL, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS clip_recording_pins(
+                clip_id TEXT NOT NULL,day_id TEXT NOT NULL,PRIMARY KEY(clip_id,day_id));
         """)
 
     def ensure_day(self, camera_id: str, window: DailyWindow, retention_days: int) -> dict:
