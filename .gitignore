@@ -10,6 +10,10 @@ secrets/
 deploy/runtime.env
 deploy/camera-*.edge.env
 
+# Local agent planning artifacts
+/docs/superpowers/
+/.superpowers/
+
 # Python environments and caches
 .venv/
 venv/
