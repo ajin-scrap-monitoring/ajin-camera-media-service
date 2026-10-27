@@ -356,7 +356,7 @@ Range: bytes=0-1048575
 
 - 일반 재생은 `Content-Disposition: inline`으로 제공한다.
 - 다중 Range 요청은 v1에서 지원하지 않으며 Range를 무시하고 전체 파일을 `200`으로 반환한다.
-- 출력은 브라우저 재생 호환성을 고려한 H.264 8-bit YUV 4:2:0과 fast-start MP4로 생성한다. MP4는 실시간 전달과 별도로 이벤트 구간만 인코딩한다.
+- 출력은 브라우저 재생 호환성을 고려한 H.264 8-bit YUV 4:2:0과 fast-start MP4다. `event_at` 없는 이벤트는 JPEG 버퍼에서 해당 구간을 인코딩하고, `event_at`이 있으면 이미 인코딩된 상시 영상에서 스트림 복사한다. 날짜 녹화를 활성화하면 별도 H.264 인코더가 계속 동작한다. 실시간 MJPEG 전송은 이 인코더와 별개다.
 - 파일 내부 재생 시간 0은 `actual_start_at`에 대응한다. 프레임 간 시간 간격을 유지하고, 중간 공백은 직전 프레임 유지로 표현한다. 부족한 선행·후행 구간을 정상 촬영 영상으로 꾸며 넣지 않는다. 누락 판정은 반드시 상세 응답의 `coverage`와 `gaps`로 확인한다.
 - `collecting`, `processing`, `failed`의 파일 요청은 `409 CLIP_NOT_READY`이다.
 - `deleted`는 `410 CLIP_DELETED`, `expired`는 `410 CLIP_EXPIRED`이다.
