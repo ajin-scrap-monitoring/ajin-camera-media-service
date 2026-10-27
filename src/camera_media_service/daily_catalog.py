@@ -59,6 +59,7 @@ class DailyCatalog:
             "playback_path": None,
             "export_allowed": False,
             "export_state": "not_requested",
+            "archive_state": "segments",
             "download_path": None,
             "size_bytes": None,
             "expires_at": None,

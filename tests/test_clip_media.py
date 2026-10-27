@@ -212,3 +212,131 @@ async def test_cfr_rounded_tail_does_not_move_start_after_event(tmp_path):
     assert result["start_at"] == 1004.0
     assert result["start_at"] <= 1004.990
     assert abs(result["duration"] - 1.8) < 0.1
+
+
+@pytest.mark.asyncio
+async def test_archived_mp4_slice_uses_recorded_media_offset(tmp_path):
+    from camera_media_service.encoding import merge_daily_mp4
+
+    module = importlib.import_module("camera_media_service.clip_media")
+    path = make_ts(tmp_path, seconds=18)
+    archive = tmp_path / "daily-exports" / "master.mp4"
+    profile = {"width": 160, "height": 120, "fps": 10}
+    await merge_daily_mp4(
+        imageio_ffmpeg.get_ffmpeg_exe(),
+        [{"path": str(path.relative_to(tmp_path)), "duration": 18.0, "profile": profile}],
+        archive.with_suffix(".tmp.mp4"),
+        archive,
+    )
+    path.unlink()
+    result = await module.remux_clip(
+        imageio_ffmpeg.get_ffmpeg_exe(),
+        tmp_path,
+        [
+            {
+                "path": str(archive.relative_to(tmp_path)),
+                "media_start": 6.0,
+                "duration": 6.0,
+                "start_at": 1000.0,
+                "end_at": 1006.0,
+                "clip_start": 1001.35,
+                "clip_end": 1004.25,
+                "profile": profile,
+            }
+        ],
+        tmp_path / "clip.mp4",
+    )
+    assert result["start_at"] == 1001.0
+    assert 1004.25 <= result["end_at"] < 1004.4
+    assert abs(result["duration"] - 3.3) < 0.1
+
+
+@pytest.mark.asyncio
+async def test_archive_keyframe_inspection_reads_only_requested_media_window(tmp_path):
+    from camera_media_service.encoding import merge_daily_mp4
+
+    module = importlib.import_module("camera_media_service.clip_media")
+    path = make_ts(tmp_path, seconds=60)
+    archive = tmp_path / "daily-exports" / "master.mp4"
+    await merge_daily_mp4(
+        imageio_ffmpeg.get_ffmpeg_exe(),
+        [
+            {
+                "path": str(path.relative_to(tmp_path)),
+                "duration": 60.0,
+                "profile": {"width": 160, "height": 120, "fps": 10},
+            }
+        ],
+        archive.with_suffix(".tmp.mp4"),
+        archive,
+    )
+    origin, keys = await module.inspect_keyframes(
+        imageio_ffmpeg.get_ffmpeg_exe(), archive, start=40.0, duration=5.0
+    )
+    actual = [origin + k for k in keys]
+    assert 39 <= min(actual) <= 40
+    assert 44 <= max(actual) <= 47
+    assert len(keys) <= 9
+
+
+@pytest.mark.asyncio
+async def test_fractional_archive_boundary_does_not_choose_previous_segment(tmp_path):
+    from camera_media_service.encoding import merge_daily_mp4
+
+    module = importlib.import_module("camera_media_service.clip_media")
+    path = tmp_path / "daily" / "fractional.ts"
+    path.parent.mkdir()
+    subprocess.run(
+        [
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=30",
+            "-frames:v",
+            "31",
+            "-c:v",
+            "libx264",
+            "-bf",
+            "0",
+            "-g",
+            "30",
+            "-f",
+            "mpegts",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    profile = {"width": 160, "height": 120, "fps": 30}
+    segments = [
+        {"path": str(path.relative_to(tmp_path)), "duration": 1.033333, "profile": profile}
+        for _ in range(6)
+    ]
+    archive = tmp_path / "daily-exports" / "master.mp4"
+    await merge_daily_mp4(
+        imageio_ffmpeg.get_ffmpeg_exe(), segments, archive.with_suffix(".tmp.mp4"), archive
+    )
+    result = await module.remux_clip(
+        imageio_ffmpeg.get_ffmpeg_exe(),
+        tmp_path,
+        [
+            {
+                "path": str(archive.relative_to(tmp_path)),
+                "media_start": 5.166665,
+                "duration": 1.033333,
+                "start_at": 1000.0,
+                "end_at": 1001.033333,
+                "clip_start": 1000.0,
+                "clip_end": 1000.5,
+                "min_start": 1000.0,
+                "max_end": 1001.033333,
+                "profile": profile,
+            }
+        ],
+        tmp_path / "clip.mp4",
+    )
+    assert result["start_at"] == 1000.0
+    assert abs(result["duration"] - 0.5) < 0.04

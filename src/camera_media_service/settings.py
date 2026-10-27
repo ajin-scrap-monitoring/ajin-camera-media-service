@@ -27,6 +27,7 @@ class Settings:
     max_buffer_bytes: int = 2 * 1024**3
     max_clip_jobs: int = 32
     daily_recording_enabled: bool = False
+    daily_archive_enabled: bool = True
     daily_segment_seconds: int = 10
     max_daily_storage_bytes: int | None = None
     min_free_storage_bytes: int = 5 * 1024**3
@@ -111,6 +112,7 @@ class Settings:
             max_buffer_bytes=_read_int(environ, "MAX_BUFFER_BYTES", 2 * 1024**3, 1),
             max_clip_jobs=_read_int(environ, "MAX_CLIP_JOBS", 32, 1),
             daily_recording_enabled=daily_enabled,
+            daily_archive_enabled=_read_bool(environ, "DAILY_ARCHIVE_ENABLED", True),
             daily_segment_seconds=_read_int(environ, "DAILY_SEGMENT_SECONDS", 10, 2, 60),
             max_daily_storage_bytes=daily_budget or None,
             min_free_storage_bytes=_read_int(environ, "MIN_FREE_STORAGE_BYTES", 5 * 1024**3, 0),

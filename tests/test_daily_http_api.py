@@ -27,8 +27,8 @@ async def test_daily_http_json_hls_mp4_range_and_delete(tmp_path, monkeypatch):
         chunk = await client.get(segment_path, headers={"Range": "bytes=0-31"})
         assert chunk.status == 206 and len(await chunk.read()) == 32
         assert (await client.head(segment_path)).status == 200
-        assert (await client.get(base + "/content")).status == 409
-        assert (await client.post(base + "/exports")).status == 202
+        assert (await client.get(base + "/content")).status in (200, 409)
+        assert (await client.post(base + "/exports")).status in (200, 202)
         await wait_ready(exports, daily, old["recording_id"])
         assert (await client.post(base + "/exports")).status == 200
         response = await client.get(

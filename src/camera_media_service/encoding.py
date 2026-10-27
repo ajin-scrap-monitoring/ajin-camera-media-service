@@ -14,6 +14,22 @@ from pathlib import Path
 from camera_media_service.daily_models import StoredFrame
 
 
+async def start_media_process(*args, **kwargs):
+    """Retain the OS child handle even if shutdown interrupts subprocess creation."""
+    creation = asyncio.create_task(asyncio.create_subprocess_exec(*args, **kwargs))
+    try:
+        return await asyncio.shield(creation)
+    except asyncio.CancelledError:
+        child = await creation
+        if child.returncode is None:
+            try:
+                child.kill()
+            except ProcessLookupError:
+                pass
+        await child.communicate()
+        raise
+
+
 async def encode_clip(
     ffmpeg: str, buffer: Path, output: Path, clip_id: str, frames: list[tuple[str, float]]
 ) -> None:
@@ -242,7 +258,7 @@ async def merge_daily_mp4(ffmpeg: str, segments: list[dict], temporary: Path, fi
     await asyncio.to_thread(manifest.write_text, "\n".join(lines) + "\n", encoding="utf-8")
     process = None
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await start_media_process(
             ffmpeg,
             "-hide_banner",
             "-loglevel",
@@ -285,3 +301,63 @@ async def merge_daily_mp4(ffmpeg: str, segments: list[dict], temporary: Path, fi
             await process.communicate()
         manifest.unlink(missing_ok=True)
         temporary.unlink(missing_ok=True)
+
+
+async def verify_archive(ffmpeg: str, path: Path, segments: list[dict]) -> dict:
+    """Decode every frame once before discarding TS; never encode another video."""
+    if not segments or len({json.dumps(s["profile"], sort_keys=True) for s in segments}) != 1:
+        raise RuntimeError("EXPORT_INCOMPATIBLE_MEDIA")
+    process = await start_media_process(
+        ffmpeg,
+        "-hide_banner",
+        "-nostdin",
+        "-xerror",
+        "-threads",
+        "2",
+        "-i",
+        str(path),
+        "-map",
+        "0:v:0",
+        "-fps_mode",
+        "passthrough",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        "-f",
+        "null",
+        "-",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        progress, error = await asyncio.wait_for(
+            process.communicate(), timeout=max(3600, sum(s["duration"] for s in segments) * 2)
+        )
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+    text = error.decode(errors="replace")
+    match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    frames = re.findall(rb"frame=(\d+)", progress)
+    if process.returncode or not match or not frames or "Video: h264" not in text:
+        raise RuntimeError("Archive verification failed: " + text[-1500:])
+    duration = int(match[1]) * 3600 + int(match[2]) * 60 + float(match[3])
+    expected = sum(s["duration"] for s in segments)
+    packet_count = int(frames[-1])
+    expected_count = sum(round(s["duration"] * s["profile"]["fps"]) for s in segments)
+    if abs(duration - expected) > max(0.1, len(segments) / 90000) or packet_count != expected_count:
+        raise RuntimeError("Archive packet count or duration differs from sources")
+
+    def durable():
+        with path.open("r+b") as file:
+            os.fsync(file.fileno())
+        if os.name != "nt":
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+
+    await asyncio.to_thread(durable)
+    return {"duration": duration, "size_bytes": path.stat().st_size, "packet_count": packet_count}

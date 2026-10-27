@@ -36,7 +36,7 @@
 | GET | `/daily-recordings/{recording_id}` | 상세/누락/준비 상태 |
 | GET | `/daily-recordings/{recording_id}/hls/index.m3u8` | 오늘/지난 날짜 재생 목록 |
 | GET / HEAD | `/daily-recordings/{recording_id}/media/{segment_id}.ts` | 완료된 영상 조각 |
-| POST | `/daily-recordings/{recording_id}/exports` | 지난 날짜 MP4 준비 |
+| POST | `/daily-recordings/{recording_id}/exports` | 지난 날짜 MP4 준비 상태 확인(호환 경로) |
 | GET / HEAD | `/daily-recordings/{recording_id}/content` | 준비된 MP4 |
 | DELETE | `/daily-recordings/{recording_id}` | 지난 날짜 영상 삭제 |
 
@@ -125,9 +125,10 @@ items는 날짜 내림차순의 녹화 정보다. next_cursor가 있으면 **동
 | recorded_seconds | 실제 저장된 영상 길이 합. 하루 시간창 길이와 다를 수 있음 |
 | playback_state | pending/ready/unavailable |
 | export_state | not_requested/processing/ready/failed. closed와 별개 |
+| archive_state | segments=TS 원본, mp4=검증 완료한 보관 MP4 원본 |
 | size_bytes | 준비 완료 MP4 크기. 준비 전 null |
 | expires_at | 날짜 원본 만료 시각. 녹화 중 null |
-| export_expires_at | 다운로드용 MP4 캐시 만료 시각. 원본보다 먼저 만료 가능 |
+| export_expires_at | MP4 준비 완료 시 날짜 원본의 expires_at과 동일 |
 | error | 오류가 있으면 code/message. 정상은 null |
 
 오늘의 window_end_at은 미래다. 그 시각까지 저장됐다는 뜻이 아니다. **아직 오지 않은 시간과 인코딩 중인 꼬리를 gaps로 만들지 않는다.** 미래/처리 중 구간과 실제 누락 구간을 서로 다르게 표시한다.
@@ -159,21 +160,23 @@ m3u8 안의 `/api/v2/.../media/...`는 미디어 서비스의 상대 경로다. 
 
 ## 8. 하루 MP4 다운로드
 
-오늘은 전체 다운로드 버튼을 비활성화한다. 다음 날짜로 넘어가고 status가 closed가 된 뒤 준비 요청한다. 부분 저장 날짜도 확보된 영상이 있으면 다운로드할 수 있다.
+오늘은 전체 다운로드 버튼을 비활성화한다. 다음 날짜로 넘어가고 status가 closed가 되면 서버가 MP4를 자동 준비한다. 부분 저장 날짜도 확보된 영상이 있으면 대상이다. 보관 중인 이전 날짜도 순서대로 자동 처리한다. 다운로드 클릭이나 아래 POST가 하루 병합·인코딩을 시작하지 않는다.
 
 ```http
 POST /api/v2/daily-recordings/{recording_id}/exports
 ```
 
-본문 없이 호출하거나 `{}`를 보낸다. 최초/진행 중202, 이미 준비됐으면200. 응답은 해당 날짜 정보이고 Location은 상세 조회 경로다. 동일 날짜의 중복 요청은 같은 준비 작업으로 처리한다.
+본문 없이 호출하거나 `{}`를 보낸다. 아직 준비 전/진행 중/실패 상태는202, 이미 준비됐으면200. 응답은 해당 날짜 정보이고 Location은 상세 조회 경로다. 호환 경로로 유지되며 호출 없이도 서버가 자동 준비한다.
 
-1. POST exports로 준비 접수.
-2. GET 상세를 적당한 간격으로 조회. 초기 권장 간격2초, 긴 작업은 간격을 늘린다.
+1. 목록 또는 GET 상세에서 export_state를 확인한다. 기존 POST exports 호출도 사용할 수 있다.
+2. 준비 중이면 GET 상세를 적당한 간격으로 조회한다. 초기 권장 간격2초, 긴 작업은 간격을 늘린다.
 3. export_state=ready면 download_path를 게이트웨이 주소로 변환.
 4. `GET {download_path}?download=true`로 다운로드.
-5. failed면 error.code를 표시하고, 원인이 해결된 후 같은 recording_id로 다시 POST.
+5. failed면 error.code를 표시한다. 서버가30초 이후 자동 재시도하므로 POST 반복 호출은 필요 없다.
 
-파일은 H.264/MP4 무음이며 실제 확보 영상만 포함한다. 부분 저장 파일은 실제 길이와 원래 누락 시간을 함께 알려야 한다. MP4 캐시가 만료되면 다시 준비할 수 있고 날짜 ID는 바뀌지 않는다.
+파일은 H.264/MP4 무음이며 실제 확보 영상만 포함한다. 부분 저장 파일은 실제 길이와 원래 누락 시간을 함께 알려야 한다. 전체 프레임 검사·디스크 반영·시간 매핑 저장이 끝난 뒤 중복 TS를 정리하고, MP4를 날짜 보관 만료 또는 명시적 삭제까지 유지한다. 별도24시간 다운로드 캐시 만료는 없다. MP4 준비 중에는 일시적으로 TS와 MP4를 함께 저장할 공간이 필요하다. 부족하면 원본 TS를 유지하고 오류·자동 재시도로 처리한다.
+
+오늘/지난 날짜 HLS 경로와 JSON 시간 매핑은 동일하다. MP4 전환 후에는 요청된 짧은 조각만 스트림 복사해 임시 TS로 제공하며 하루 전체 파일을 만들지 않는다. 임시 캐시는 최대64MiB, 미사용60초 만료, 동시 변환2개/대기 포함8개다. 한도를 넘으면503을 반환하므로 플레이어가 재시도할 수 있어야 한다. 재인코딩은 없지만 짧은 구간 읽기·구성에 따른 첫 응답 지연은 남는다.
 
 Content-Type video/mp4, Content-Disposition attachment, 파일명 `daily_<한국날짜>_<recording_id>.mp4`. Content-Length/Accept-Ranges 및206 응답의 Content-Range를 지원한다. 파일 전체를 메모리에 모아 응답하지 않는다.
 
@@ -210,10 +213,10 @@ DELETE /api/v2/daily-recordings/{recording_id}
 | 410 DAILY_RECORDING_DELETED / DAILY_RECORDING_EXPIRED | 삭제/원본 보관 만료 |
 | 415 UNSUPPORTED_MEDIA_TYPE | JSON 요청의 Content-Type 잘못됨 |
 | 416 RANGE_NOT_SATISFIABLE | 잘못된 파일 범위 |
-| 503 INSUFFICIENT_STORAGE / EXPORT_CAPACITY_EXCEEDED | 용량 부족/준비 대기 한도 |
+| 503 INSUFFICIENT_STORAGE / PLAYBACK_CAPACITY_EXCEEDED | 용량 부족/재생용 조각 대기 한도 |
 | 503 RECORDING_STORAGE_ERROR / STORAGE_UNAVAILABLE | 파일 또는 카탈로그 저장소 문제 |
 
-비동기 준비 실패는 상세의 export_state=failed와 error로 표시된다. 예: EXPORT_FAILED, EXPORT_INCOMPATIBLE_MEDIA, JOB_INTERRUPTED, STORAGE_ERROR. 재시작 후 미완료 export는 실패로 조회되며 재요청할 수 있다. 날짜 원본의 부분 저장 상태와 export 실패를 혼동하지 않는다.
+비동기 준비 실패는 상세의 export_state=failed와 error로 표시된다. 예: EXPORT_FAILED, EXPORT_INCOMPATIBLE_MEDIA, JOB_INTERRUPTED, STORAGE_ERROR. 미완료 작업은 재시작 후 자동 재시도한다. 날짜 원본의 부분 저장 상태와 export 실패를 혼동하지 않는다. 검증 실패 시 TS를 삭제하지 않는다. MP4 생성·전체 디코딩 검증은 백그라운드 작업이므로 준비 완료까지 CPU·디스크 부하와 시간이 필요하다.
 
 ## 11. 기존 이벤트 기능과의 관계
 
@@ -225,7 +228,7 @@ DELETE /api/v2/daily-recordings/{recording_id}
 2. 오늘의 날짜·한국 시각·recording/null coverage 확인.
 3. 완료 조각 생성 후 HLS 목록과 조각 모두 조회·재생 확인.
 4. 카메라를 끊었다가 연결한 테스트 날짜에서 has_gaps와 누락 시간 표시 확인.
-5. 지난 날짜 closed/partial의 MP4 준비202→ready→다운로드200/Range206 확인.
+5. 지난 날짜 closed/partial의 자동 MP4 준비→ready→다운로드200/Range206 확인. exports POST가 새 작업을 시작하지 않는지도 확인한다.
 6. 오늘 준비409, 영상 없음409, 삭제204/재조회410 확인.
 7. 게이트웨이를 통한 브라우저 seek·날짜 시간축·사용자 권한 확인.
 
@@ -238,7 +241,7 @@ DELETE /api/v2/daily-recordings/{recording_id}
 - 운영 카메라: camera-main. 기존 이벤트 API는 같은 주소의 /api/v1에 유지한다.
 - 한국 날짜2026-10-15부터 운영 날짜 녹화를 활성화했다. 날짜 ID는 목록으로 조회한다. 활성화 이전 시간과 배포 중 실제 누락은 gaps로 표시한다.
 - 저장 예산32GiB, 최소 디스크 여유5GiB, 보관 정책30일이다. 이 예산이 실제30일 분량을 보장하는 것은 아니다.
-- 오늘은 완료된 HLS 구간까지 재생하고, 한국 자정에 날짜가 마감된 뒤 하루 MP4 준비를 요청한다.
+- 오늘은 완료된 HLS 구간까지 재생하고, 한국 자정에 날짜가 마감된 뒤 서버가 하루 MP4를 자동 준비한다. 백엔드는 ready 상태를 확인해 다운로드를 제공한다.
 
 ### 별도 합성 시험 환경
 

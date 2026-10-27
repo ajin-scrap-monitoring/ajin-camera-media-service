@@ -506,7 +506,7 @@ class DailyRecordingService:
         def usage():
             total = sum(
                 p.stat().st_size
-                for folder in ("daily", "daily-exports")
+                for folder in ("daily", "daily-exports", "daily-playback")
                 for p in (self.recording.root / folder).rglob("*")
                 if p.is_file()
             )

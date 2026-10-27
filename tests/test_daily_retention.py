@@ -9,21 +9,20 @@ from camera_media_service.recording import ApiError, epoch
 
 
 @pytest.mark.asyncio
-async def test_export_cache_expires_before_original_and_can_be_prepared_again(
-    tmp_path, monkeypatch
-):
+async def test_canonical_mp4_survives_old_cache_ttl_until_original_retention(tmp_path, monkeypatch):
     service, daily, clock, old = await recorded_day(tmp_path, monkeypatch)
     exports = make_exports(daily)
     try:
-        await exports.request_export(old["recording_id"])
+        await exports.maintenance(clock[0])
         ready = await wait_ready(exports, daily, old["recording_id"])
-        clock[0] = epoch(ready["export_expires_at"]) + 1
+        assert ready["export_expires_at"] == ready["expires_at"]
+        clock[0] += 25 * 3600
         await exports.maintenance(clock[0])
         day = await daily.get_day(old["recording_id"])
-        assert day["status"] == "closed" and day["export_state"] == "not_requested"
+        assert day["status"] == "closed" and day["export_state"] == "ready"
         assert daily.catalog.segments(old["recording_id"], ready_only=True)
         _, created = await exports.request_export(old["recording_id"])
-        assert created
+        assert not created
         assert (await wait_ready(exports, daily, old["recording_id"]))["export_state"] == "ready"
         clock[0] = epoch(old["expires_at"]) + 1
         await exports.maintenance(clock[0])

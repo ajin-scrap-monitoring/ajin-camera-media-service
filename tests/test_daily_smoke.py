@@ -74,7 +74,7 @@ async def test_network_midnight_gap_export_restart_delete(tmp_path, monkeypatch)
         for path in paths:
             response = await client.get(base[:-4] + path, headers={"Range": "bytes=0-187"})
             assert response.status == 206 and len(await response.read()) == 188
-        assert (await client.post(detail + "/exports", json={})).status == 202
+        assert (await client.post(detail + "/exports", json={})).status in (200, 202)
         for _ in range(200):
             result = await (await client.get(detail)).json()
             if result["export_state"] in ("ready", "failed"):

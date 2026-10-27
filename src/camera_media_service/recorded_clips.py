@@ -65,11 +65,16 @@ class RecordedClipService:
             if day["expires_at"] and epoch(day["expires_at"]) <= now:
                 continue
             if row["segment_status"] == "ready":
+                archive = day.get("archive_state") == "mp4" and item.get("archive_path")
+                if archive:
+                    item = {
+                        **item,
+                        "path": item["archive_path"],
+                        "media_start": item["archive_offset"],
+                    }
                 path = (self.recording.root / item["path"]).resolve()
-                if (
-                    path.is_relative_to((self.recording.root / "daily").resolve())
-                    and path.is_file()
-                ):
+                owned = self.recording.root / ("daily-exports" if archive else "daily")
+                if path.is_relative_to(owned.resolve()) and path.is_file():
                     segments.append(item)
             elif row["segment_status"] == "processing" and item["start_at"] <= at < item["end_at"]:
                 pending = True

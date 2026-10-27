@@ -71,7 +71,7 @@ def register_daily_routes(app, daily, exports) -> None:
                 date.fromisoformat(after[0])
             except (ValueError, KeyError, TypeError) as exc:
                 raise ApiError(400, "INVALID_CURSOR", "Invalid cursor.") from exc
-        await exports.maintenance(daily.clock())
+        await exports.refresh_retention(daily.clock())
         items = await daily.list_days(camera, filters, limit + 1, after)
         cursor = None
         if len(items) > limit:
@@ -91,7 +91,7 @@ def register_daily_routes(app, daily, exports) -> None:
     async def detail(request):
         query_fields(request, ())
         recording_id = request.match_info["recording_id"]
-        await exports.maintenance(daily.clock())
+        await exports.refresh_retention(daily.clock())
         if request.method == "DELETE":
             await exports.delete_day(recording_id)
             return web.Response(status=204)
@@ -99,7 +99,7 @@ def register_daily_routes(app, daily, exports) -> None:
 
     async def playlist(request):
         query_fields(request, ())
-        await exports.maintenance(daily.clock())
+        await exports.refresh_retention(daily.clock())
         day, segments = await daily.playback_snapshot(request.match_info["recording_id"])
         if not segments:
             raise ApiError(409, "PLAYBACK_NOT_READY", "No completed media segments.")
@@ -122,7 +122,7 @@ def register_daily_routes(app, daily, exports) -> None:
 
     async def segment(request):
         query_fields(request, ())
-        await exports.maintenance(daily.clock())
+        await exports.refresh_retention(daily.clock())
         recording_id = request.match_info["recording_id"]
         segment_id = request.match_info["segment_id"]
         async with daily.lock:
@@ -135,15 +135,21 @@ def register_daily_routes(app, daily, exports) -> None:
             if row is None:
                 raise ApiError(404, "SEGMENT_NOT_FOUND", "Completed segment does not exist.")
             item = json.loads(row[0])
-            path = daily.segment_path(item)
-            if not path.resolve().is_relative_to((daily.recording.root / "daily").resolve()):
-                raise OSError("Invalid media path")
-            try:
-                file = path.open("rb")
-            except OSError as exc:
-                raise ApiError(503, "RECORDING_STORAGE_ERROR", "Saved media unavailable.") from exc
-            file.seek(0, 2)
-            size = file.tell()
+            archived = day.get("archive_state") == "mp4"
+            if not archived:
+                path = daily.segment_path(item)
+                if not path.resolve().is_relative_to((daily.recording.root / "daily").resolve()):
+                    raise OSError("Invalid media path")
+                try:
+                    file = path.open("rb")
+                except OSError as exc:
+                    raise ApiError(
+                        503, "RECORDING_STORAGE_ERROR", "Saved media unavailable."
+                    ) from exc
+                file.seek(0, 2)
+                size = file.tell()
+        if archived:
+            file, size = await exports.playback.open_segment(recording_id, segment_id)
         return await stream_file(
             request, file, size=size, filename=segment_id + ".ts", content_type="video/mp2t"
         )
@@ -152,7 +158,7 @@ def register_daily_routes(app, daily, exports) -> None:
         query_fields(request, ("download",))
         if request.query.get("download", "false") not in ("true", "false"):
             raise ApiError(400, "INVALID_ARGUMENT", "download must be true or false.")
-        await exports.maintenance(daily.clock())
+        await exports.refresh_retention(daily.clock())
         recording_id = request.match_info["recording_id"]
         async with daily.lock:
             day = daily.catalog.get_day(recording_id)

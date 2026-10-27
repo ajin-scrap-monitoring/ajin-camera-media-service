@@ -9,18 +9,22 @@ import os
 import re
 from pathlib import Path
 
-from camera_media_service.encoding import probe_media
+from camera_media_service.encoding import probe_media, start_media_process
 from camera_media_service.recording import ApiError, epoch, iso
 
 
-async def inspect_keyframes(ffmpeg: str, path: Path) -> tuple[float, list[float]]:
-    process = await asyncio.create_subprocess_exec(
+async def inspect_keyframes(
+    ffmpeg: str, path: Path, *, start: float | None = None, duration: float | None = None
+) -> tuple[float, list[float]]:
+    window = [] if start is None else ["-ss", str(max(0, start - 1)), "-t", str(duration + 2)]
+    process = await start_media_process(
         ffmpeg,
         "-hide_banner",
         "-nostdin",
         "-copyts",
         "-skip_frame",
         "nokey",
+        *window,
         "-i",
         str(path),
         "-an",
@@ -40,11 +44,21 @@ async def inspect_keyframes(ffmpeg: str, path: Path) -> tuple[float, list[float]
         if process.returncode is None:
             process.kill()
             await process.communicate()
-    times = [float(t) for t in re.findall(rb"pts_time:([-+\d.e]+)", error)]
-    if process.returncode or not times:
+    base = re.search(rb"config in time_base: (\d+)/(\d+)", error)
+    ticks = re.findall(rb"\bpts:\s*(-?\d+)\s+pts_time:", error)
+    if process.returncode or not base or not ticks:
         raise RuntimeError("Cannot read recording keyframes")
+    # pts_time is printed with six significant digits and loses subframe
+    # precision late in a full-day file. Integer PTS retains the media timebase.
+    times = [int(t) * int(base[1]) / int(base[2]) for t in ticks]
     origin = times[0]
     return origin, [t - origin for t in times]
+
+
+def snap_archive_start(offset: float, origin: float, keys: list[float]) -> float:
+    """Resolve microsecond concat rounding to the segment's actual TS keyframe."""
+    nearest = min((origin + key for key in keys), key=lambda value: abs(value - offset))
+    return nearest if abs(nearest - offset) <= 2 / 90000 + 0.000001 else offset
 
 
 async def remux_clip(ffmpeg: str, root: Path, slices: list[dict], output: Path) -> dict:
@@ -55,18 +69,24 @@ async def remux_clip(ffmpeg: str, root: Path, slices: list[dict], output: Path) 
     inspection = {}
     for item in slices:
         path = (root / item["path"]).resolve()
-        if not path.is_relative_to((root / "daily").resolve()):
+        archive = "media_start" in item
+        owned = root / ("daily-exports" if archive else "daily")
+        if not path.is_relative_to(owned.resolve()):
             raise OSError("Recording path is outside daily storage")
-        if path not in inspection:
-            inspection[path] = await inspect_keyframes(ffmpeg, path)
-        origin, keys = inspection[path]
+        cache_key = (path, item.get("media_start"))
+        if cache_key not in inspection:
+            inspection[cache_key] = await inspect_keyframes(
+                ffmpeg, path, start=item.get("media_start"), duration=item["duration"]
+            )
+        origin, keys = inspection[cache_key]
+        source_start = snap_archive_start(item["media_start"], origin, keys) if archive else origin
         # CFR rounds the last frame; it does not stretch the recording's time axis.
-        target_start = item["clip_start"] - item["start_at"]
+        target_start = source_start + item["clip_start"] - item["start_at"] - origin
         possible = [key for key in keys if key <= target_start + 0.000001]
         if not possible:
             raise ApiError(409, "RECORDING_BOUNDARY_UNAVAILABLE", "No preceding keyframe.")
         start = max(possible)
-        wall_start = item["start_at"] + start
+        wall_start = item["start_at"] + origin + start - source_start
         if (
             item["clip_start"] - wall_start > 1.000001
             or wall_start < item.get("min_start", item["start_at"]) - 0.000001
@@ -74,11 +94,15 @@ async def remux_clip(ffmpeg: str, root: Path, slices: list[dict], output: Path) 
             raise ApiError(409, "RECORDING_BOUNDARY_UNAVAILABLE", "Cut exceeds one-second limit.")
         fps = item["profile"]["fps"]
         target_end = item["clip_end"] - item["start_at"]
-        end = min(item["duration"], math.ceil(target_end * fps - 0.000001) / fps)
-        wall_end = min(item["end_at"], item["start_at"] + end)
+        end = (
+            source_start
+            - origin
+            + min(item["duration"], math.ceil(target_end * fps - 0.000001) / fps)
+        )
+        wall_end = min(item["end_at"], item["start_at"] + origin + end - source_start)
         if wall_end > item.get("max_end", item["end_at"]) + 0.000001:
             # At a known gap or the last available packet, do not invent extra coverage.
-            end = target_end
+            end = source_start + target_end - origin
             wall_end = item["clip_end"]
         if wall_end - item["clip_end"] > 1.000001:
             raise ApiError(409, "RECORDING_BOUNDARY_UNAVAILABLE", "Cut exceeds one-second limit.")
@@ -106,7 +130,7 @@ async def remux_clip(ffmpeg: str, root: Path, slices: list[dict], output: Path) 
     process = None
     try:
         await asyncio.to_thread(manifest.write_text, "\n".join(lines) + "\n", encoding="utf-8")
-        process = await asyncio.create_subprocess_exec(
+        process = await start_media_process(
             ffmpeg,
             "-hide_banner",
             "-loglevel",

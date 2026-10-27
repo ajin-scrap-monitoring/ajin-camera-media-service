@@ -71,7 +71,10 @@ async def test_export_is_single_idempotent_mp4_and_survives_restart(tmp_path, mo
         results = await asyncio.gather(
             *[exports.request_export(day["recording_id"]) for _ in range(10)]
         )
-        assert sum(created for _, created in results) == 1
+        assert sum(created for _, created in results) == 0
+        assert not exports.jobs
+        await exports.maintenance(clock[0])
+        assert len(exports.jobs) == 1
         ready = await wait_ready(exports, daily, day["recording_id"])
         assert ready["export_state"] == "ready", ready
         assert ready["size_bytes"] > 0
@@ -106,13 +109,13 @@ async def test_export_failure_is_retryable_with_same_day_id(tmp_path, monkeypatc
 
     monkeypatch.setattr(module, "merge_daily_mp4", fail)
     try:
-        await exports.request_export(old["recording_id"])
+        await exports.maintenance(clock[0])
         failed = await wait_ready(exports, daily, old["recording_id"])
         assert failed["export_state"] == "failed" and failed["coverage"] == old["coverage"]
         await asyncio.sleep(0)
         monkeypatch.setattr(module, "merge_daily_mp4", real)
-        _, created = await exports.request_export(old["recording_id"])
-        assert created
+        clock[0] += 31
+        await exports.maintenance(clock[0])
         assert (await wait_ready(exports, daily, old["recording_id"]))["export_state"] == "ready"
     finally:
         await exports.close()
@@ -130,9 +133,10 @@ async def test_today_none_and_insufficient_space_are_rejected(tmp_path, monkeypa
             await exports.request_export(today["recording_id"])
         assert error.value.code == "DAY_NOT_CLOSED"
         daily.settings.max_daily_storage_bytes = 1
-        with pytest.raises(ApiError) as error:
-            await exports.request_export(old["recording_id"])
-        assert error.value.code == "INSUFFICIENT_STORAGE"
+        await exports.request_export(old["recording_id"])
+        await exports.maintenance(clock[0])
+        failed = await daily.get_day(old["recording_id"])
+        assert failed["error"]["code"] == "INSUFFICIENT_STORAGE"
         assert not exports.jobs
     finally:
         await exports.close()
@@ -149,7 +153,7 @@ async def test_delete_is_idempotent_and_active_day_cannot_be_deleted(tmp_path, m
         with pytest.raises(ApiError) as error:
             await exports.delete_day(today["recording_id"])
         assert error.value.code == "RECORDING_ACTIVE"
-        await exports.request_export(old["recording_id"])
+        await exports.maintenance(clock[0])
         await wait_ready(exports, daily, old["recording_id"])
         await exports.delete_day(old["recording_id"])
         await exports.delete_day(old["recording_id"])

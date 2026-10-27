@@ -16,7 +16,9 @@ JPEG/WSS → IngestService → LiveFrameHub
 
 날짜 기능 활성화 시 `DailyCatalog`는 기존 SQLite 연결/잠금을 공유하며 `DailyRecordingService`가 짧은 JPEG 구간을 pin하여 H.264/TS를 만듭니다. 별도 인코더1개를 사용하고 종료 시 진행 작업과 짧은 꼬리를 저장한 뒤 공용 DB를 닫습니다. 정상 종료에 최대50초를 허용하므로 Compose 종료 유예는60초입니다.
 
-`DailyExportService`는 종료 날짜만1개씩 stream-copy MP4로 합칩니다. 원본 조각과 MP4를 동시에 둘 공간을 예약하며, 삭제/만료는 UUID의 전용 디렉터리만 정리합니다. 오늘은 HLS EVENT, 종료 날짜는 VOD/ENDLIST로 제공합니다. 날짜 상태·누락·실제 시간 매핑은 v2 JSON에 포함합니다.
+`DailyExportService`는 종료 날짜를 백그라운드에서1개씩 stream-copy MP4로 합칩니다. 원본 조각과 MP4를 동시에 둘 공간을 예약합니다. 전체 프레임 디코딩 검사와 파일·디렉터리 fsync 후 원래 시각→MP4 오프셋을 SQLite에 한 트랜잭션으로 저장하고, 기존 원본 사용 작업이 끝나면 중복 TS를 정리합니다. 검증은 디코더2스레드를 사용하며 재인코딩은 하지 않습니다. MP4가 날짜 보관 만료까지 원본이므로 다운로드 요청은 파일 전송만 수행합니다. 준비 실패·재시작은 자동 재시도하고 원본을 유지합니다.
+
+오늘은 HLS EVENT, 종료 날짜는 VOD/ENDLIST로 제공합니다. `ArchivedPlaybackService`는 보관 MP4에서 요청받은 짧은 구간만 TS로 스트림 복사합니다. 캐시는64MiB/미사용60초이며 동시 작업2개, 대기 포함8개입니다. 이벤트 추출은 오늘 TS/보관 MP4를 모두 지원합니다. 삭제/만료는 UUID 전용 파일만 정리하고, 진행 중 클립·HLS 작업은 원본을 pin합니다. 날짜 상태·누락·실제 시간 매핑은 v2 JSON에 포함합니다.
 
 `daily/날짜UUID/10분블록/조각UUID.ts`, `.prepared.json`과 `daily-exports/날짜UUID.mp4`는 내부 저장 구조입니다. 완료 rename 뒤 DB 반영 전 중단은 검증된 prepared 메타데이터로 복구합니다. 날짜별 첫 조각의 출력 프로파일을 유지하여 같은 날짜 MP4 병합의 호환성을 보존합니다.
 
