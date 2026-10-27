@@ -308,6 +308,15 @@ async def test_startup_locked_stale_cache_still_counts_toward_cap(tmp_path, monk
     # Windows refuses to unlink an open response handle. The bytes must keep
     # consuming the cap, including after service restart cleanup cannot unlink.
     held = stale.open("rb")
+    unlink = Path.unlink
+
+    def locked_unlink(path, *args, **kwargs):
+        # Exercise that failure on POSIX too, where real open handles may be unlinked.
+        if path == stale and not held.closed:
+            raise PermissionError("Simulated open response handle")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", locked_unlink)
     playback = ArchivedPlaybackService(daily, max_bytes=17000)
     try:
         with pytest.raises(ApiError) as error:
