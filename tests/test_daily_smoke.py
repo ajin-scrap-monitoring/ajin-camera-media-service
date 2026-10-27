@@ -57,7 +57,8 @@ async def test_network_midnight_gap_export_restart_delete(tmp_path, monkeypatch)
             # Wait for the server to observe the intentional disconnection before advancing time.
             await asyncio.sleep(0.03)
         clock[0] = window.end_at + 10
-        for _ in range(200):
+        # The automatic worker polls every five seconds; POST only reads status.
+        for _ in range(1000):
             response = await client.get(base + "/v2/cameras/camera-main/daily-recordings")
             items = (await response.json())["items"]
             if len(items) == 2 and items[1]["status"] == "closed":
