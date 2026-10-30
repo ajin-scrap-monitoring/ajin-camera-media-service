@@ -1,6 +1,6 @@
 # ajin-camera-media-service
 
-2026-10-30 연동 PR #1은 main `1bcce51`에 병합하고 운영 서버에 배포했습니다(한국 시간2026-10-31 검증 완료). 요청별 구간 추출·카메라 상태·실제 파일 정보·삭제 수정은 [추가 계약](docs/INTEGRATION_HANDOFF_2026-10-30.md), 담당자 회신은 [회신 문서](docs/INTEGRATION_REPLY_2026-10-30.md)를 참조하세요.
+연동 PR #1과 아카이브 운영 후속 PR #2를 main에 병합하고, 운영 서버에 `ajin-camera-media-service:f4019cb`로 배포했습니다(한국 시간2026-10-31). 자동 MP4 보관을 다시 활성화했고 실제 백엔드 API와 새 녹화 증가를 확인했습니다. 대용량 기존 날짜의 전체 안전 검증은 백그라운드에서 진행 중이며 상세 결과는 [검증 기록](docs/VALIDATION.md)을 참조하세요. 요청별 구간 추출·카메라 상태·실제 파일 정보·삭제 수정은 [추가 계약](docs/INTEGRATION_HANDOFF_2026-10-30.md), 담당자 회신은 [회신 문서](docs/INTEGRATION_REPLY_2026-10-30.md)를 참조하세요.
 
 카메라 엣지의 JPEG/WSS 수신, HTTP MJPEG 실시간 전달, 이벤트 전후 MP4와 한국 날짜별 상시 녹화/HLS/하루 MP4 다운로드 API를 제공하는 Python 서비스입니다.
 

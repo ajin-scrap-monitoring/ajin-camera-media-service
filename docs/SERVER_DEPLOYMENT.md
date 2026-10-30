@@ -8,7 +8,7 @@
 
 ## 백엔드 담당자에게 전달할 값
 
-한국 시간2026-10-31 PR #1의 main `1bcce51`로 운영 배포를 확인했다. 검증된 PR 소스와 병합 main의 파일 트리가 동일함을 확인하고, 서버에서 테스트한 이미지를 운영 태그로 사용했다. 현재 이미지는 `ajin-camera-media-service:1bcce51`이며 기존 설정·인증 정보·네트워크·포트·볼륨·자원 한도는 유지했다. 신규 API와 실제 백엔드 접근 결과는 VALIDATION.md의 최신 운영 검증을 참조한다.
+한국 시간2026-10-31 연동 PR #1에 이어 아카이브 공간 예약/디스크 I/O 후속 PR #2를 main `f4019cb6e94a5b9663b3ae696f29cc7a1b77e2ed`에 병합해 배포했다. 검증한 PR `7ca9501`과 병합 main의 파일 트리가 동일함을 서버에서 확인했다. 현재 이미지는 `ajin-camera-media-service:f4019cb`이며 기존 설정·인증 정보·네트워크·포트·볼륨·CPU2/메모리3GiB·저장 예산32GiB/최소 여유5GiB를 유지했다. 임시 아카이브 중지 override는 실행에서 제외했고 원래 Compose 파일만 사용해 자동 보관을 재개했다. 신규 API와 실제 백엔드 접근 결과는 VALIDATION.md의 최신 운영 검증을 참조한다.
 
 | 항목 | 값 |
 | --- | --- |
@@ -59,7 +59,7 @@ networks:
 | 항목 | 값 |
 | --- | --- |
 | 컨테이너 | `ajin-camera-media-service` |
-| 이미지 | `ajin-camera-media-service:1bcce51` |
+| 이미지 | `ajin-camera-media-service:f4019cb` |
 | 배포 파일 | `/srv/scrap-monitoring/development/main-refresh-20261015/compose.media.yaml` |
 | 실행 환경 파일 | `/home/kyuncho/ajin-camera-media-service/runtime.env` (비공개 파일, 이번 배포에서 내용 유지) |
 | 서버의 영구 저장 경로 | `/var/lib/ajin-camera-media` |
@@ -114,3 +114,5 @@ Docker 상태 검사 실패는 상태 표시이며, 그 자체로 컨테이너�
 운영 용량은 카메라별 실제 GiB/day × 보관일 + MP4 준비 중 중복 저장/HLS 캐시 + JPEG 버퍼/이벤트/DB + 여유 공간으로 계산한다. 상시 운영은32GiB 예산으로 활성화했지만, 합성 도형 영상의 낮은 저장량으로 실현장30일 보관을 보장하지 않는다.
 
 재현 시험 도구는 tools/daily_server_probe.py다. 승인된 격리 환경에서만 실행하며 DAILY_TEST_EDGE_TOKEN 환경 변수로 시험 입력 토큰을 전달한다. --seconds 86400은 실제 시간24시간 시험이다. 서버 재시작 후 입력을 재접속하고, 첫 프레임 전 MJPEG503을 재시도한다. JSON state=running은 완료가 아니며 state=passed와 종료 코드0을 확인한다.
+
+후속 배포 증거와 복구 정보는 서버 `/home/kyuncho/ajin-camera-media-service/deploy-20261031-archivefix/`에 보관한다. 이전1bcce51로 복구할 때는 그 버전의 임시 아카이브 중지 override를 함께 적용해야 같은 공간 계산 문제가 재발하지 않는다. 백업 SQLite를 새 녹화 데이터 위에 덮어쓰지 않는다.
