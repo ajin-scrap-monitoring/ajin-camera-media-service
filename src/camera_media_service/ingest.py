@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Protocol
 
+from camera_media_service.camera_status import CameraStatusTracker
 from camera_media_service.pipeline import FrameValidator, LiveFrameHub
 from camera_media_service.registry import ConnectionRegistry
 from camera_media_service.store import LatestFrameStore
@@ -48,6 +49,7 @@ class IngestService:
     validator: FrameValidator | None = None
     hub: LiveFrameHub | None = None
     telemetry: IngestTelemetryTracker | None = None
+    status_tracker: CameraStatusTracker | None = None
 
     def __post_init__(self) -> None:
         if self.validator is None:
@@ -60,9 +62,12 @@ class IngestService:
             self.telemetry.record_connection_start()
 
         displaced = self.registry.claim_connection(camera_id, connection_id, websocket)
-        if self.hub.connection_observer is not None:
-            self.hub.connection_observer(camera_id, True, time.time())
+        disconnect_reason = "CONNECTION_CLOSED"
         try:
+            if self.status_tracker is not None:
+                self.status_tracker.connected(camera_id, connection_id)
+            if self.hub.connection_observer is not None:
+                self.hub.connection_observer(camera_id, True, time.time())
             if displaced is not None:
                 try:
                     await displaced.close(1008, "replaced by newer connection")
@@ -75,6 +80,7 @@ class IngestService:
                 if isinstance(message, str):
                     if self.telemetry is not None:
                         self.telemetry.record_frame_rejected()
+                    disconnect_reason = "TEXT_FRAME_REJECTED"
                     error = TextFrameRejectedError()
                     await websocket.close(error.close_code, error.reason)
                     raise error
@@ -84,6 +90,7 @@ class IngestService:
                 if not self.validator.is_within_size(frame):
                     if self.telemetry is not None:
                         self.telemetry.record_frame_rejected()
+                    disconnect_reason = "FRAME_TOO_LARGE"
                     error = OversizedFrameError()
                     await websocket.close(error.close_code, error.reason)
                     raise error
@@ -91,6 +98,7 @@ class IngestService:
                 if not self.validator.is_jpeg(frame):
                     if self.telemetry is not None:
                         self.telemetry.record_frame_rejected()
+                    disconnect_reason = "INVALID_JPEG"
                     error = InvalidJpegFrameError()
                     await websocket.close(error.close_code, error.reason)
                     raise error
@@ -99,12 +107,23 @@ class IngestService:
                     return
 
                 assert self.hub is not None
-                self.hub.publish(camera_id, frame)
+                envelope = self.hub.publish(camera_id, frame)
+                if self.status_tracker is not None:
+                    self.status_tracker.frame(camera_id, connection_id, envelope.received_at)
                 if self.telemetry is not None:
                     self.telemetry.record_frame_ingested(len(frame))
+        except asyncio.CancelledError:
+            disconnect_reason = "CANCELLED"
+            raise
+        except Exception:
+            if disconnect_reason == "CONNECTION_CLOSED":
+                disconnect_reason = "CONNECTION_ERROR"
+            raise
         finally:
             if self.telemetry is not None:
                 self.telemetry.record_connection_end()
+            if self.status_tracker is not None:
+                self.status_tracker.disconnected(camera_id, connection_id, disconnect_reason)
             if (
                 self.registry.is_current(camera_id, connection_id)
                 and self.hub.connection_observer is not None

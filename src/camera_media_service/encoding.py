@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 
 from camera_media_service.daily_models import StoredFrame
+from camera_media_service.media_info import MEDIA_INFO_FILTER, parse_media_info
 
 
 async def start_media_process(*args, **kwargs):
@@ -93,7 +94,7 @@ async def encode_clip(
 
 async def probe_media(ffmpeg: str, path: Path, *, full_decode: bool = True) -> dict:
     """Read actual container duration and validate every video packet by decoding."""
-    process = await asyncio.create_subprocess_exec(
+    process = await start_media_process(
         ffmpeg,
         "-hide_banner",
         "-nostdin",
@@ -102,6 +103,8 @@ async def probe_media(ffmpeg: str, path: Path, *, full_decode: bool = True) -> d
         str(path),
         "-map",
         "0:v:0",
+        "-vf",
+        MEDIA_INFO_FILTER,
         "-progress",
         "pipe:1",
         "-nostats",
@@ -131,7 +134,12 @@ async def probe_media(ffmpeg: str, path: Path, *, full_decode: bool = True) -> d
     )
     if duration <= 0:
         raise RuntimeError("Empty video")
-    return {"duration": duration, "size_bytes": path.stat().st_size}
+    size_bytes = path.stat().st_size
+    return {
+        "duration": duration,
+        "size_bytes": size_bytes,
+        "media_info": parse_media_info(text, size_bytes),
+    }
 
 
 async def encode_daily_segment(
@@ -318,6 +326,8 @@ async def verify_archive(ffmpeg: str, path: Path, segments: list[dict]) -> dict:
         str(path),
         "-map",
         "0:v:0",
+        "-vf",
+        MEDIA_INFO_FILTER,
         "-fps_mode",
         "passthrough",
         "-progress",
@@ -360,4 +370,10 @@ async def verify_archive(ffmpeg: str, path: Path, segments: list[dict]) -> dict:
                 os.close(directory)
 
     await asyncio.to_thread(durable)
-    return {"duration": duration, "size_bytes": path.stat().st_size, "packet_count": packet_count}
+    size_bytes = path.stat().st_size
+    return {
+        "duration": duration,
+        "size_bytes": size_bytes,
+        "packet_count": packet_count,
+        "media_info": parse_media_info(text, size_bytes),
+    }

@@ -1,5 +1,7 @@
 # ajin-camera-media-service
 
+2026-10-30 연동 PR의 요청별 구간 추출·카메라 상태·실제 파일 정보·삭제 수정은 [추가 계약](docs/INTEGRATION_HANDOFF_2026-10-30.md), 담당자 회신 초안은 [회신 문서](docs/INTEGRATION_REPLY_2026-10-30.md)에 있습니다. 운영 반영은 PR 검토·병합·배포 후 진행합니다.
+
 카메라 엣지의 JPEG/WSS 수신, HTTP MJPEG 실시간 전달, 이벤트 전후 MP4와 한국 날짜별 상시 녹화/HLS/하루 MP4 다운로드 API를 제공하는 Python 서비스입니다.
 
 백엔드 연동 규격은 [BACKEND_API_CONTRACT.md](docs/BACKEND_API_CONTRACT.md)에 있습니다. WHEP/WebRTC 송출은 제공하지 않습니다.

@@ -8,6 +8,7 @@ import logging
 import shutil
 import sqlite3
 import uuid
+from pathlib import Path
 
 from camera_media_service.archive_playback import ArchivedPlaybackService
 from camera_media_service.daily_recording import DailyRecordingService
@@ -27,6 +28,7 @@ class DailyExportService:
         self.jobs = {}
         self.slot = asyncio.Semaphore(1)
         self.maintenance_lock = asyncio.Lock()
+        self.file_locks = {}
         self.task = None
         self.closed = False
         self.reservations = daily.storage_reservations
@@ -36,6 +38,19 @@ class DailyExportService:
             CREATE TABLE IF NOT EXISTS daily_compactions(day_id TEXT PRIMARY KEY);
         """)
         with self.db:
+            # Recover unfinished deletion even if interrupted before queue insertion.
+            for row in self.db.execute(
+                "SELECT body FROM daily_recordings WHERE status IN ('deleted','expired')"
+            ).fetchall():
+                day = json.loads(row["body"])
+                if day.get("cleanup_state") != "complete":
+                    day.setdefault("cleanup_state", "pending")
+                    day.update(cleanup_completed_at=None, space_reclaimed=None)
+                    day.setdefault("cleanup_error", None)
+                    daily.catalog.save_day(day)
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO daily_cleanup VALUES(?)", (day["recording_id"],)
+                    )
             for row in self.db.execute(
                 "SELECT day_id,body FROM daily_exports WHERE status='processing'"
             ).fetchall():
@@ -214,6 +229,7 @@ class DailyExportService:
                         archive_state="mp4",
                         export_state="ready",
                         size_bytes=metadata["size_bytes"],
+                        media_info=metadata.get("media_info"),
                         download_path=f"/api/v2/daily-recordings/{recording_id}/content",
                         export_expires_at=day["expires_at"],
                         archive_retry_at=None,
@@ -226,11 +242,44 @@ class DailyExportService:
         if error:
             final.unlink(missing_ok=True)
 
+    def _file_lock(self, recording_id: str) -> asyncio.Lock:
+        return self.file_locks.setdefault(recording_id, asyncio.Lock())
+
+    async def _file_work(self, operation) -> None:
+        # Cancelling to_thread does not stop its OS thread. Keep the day lock until
+        # that thread finishes, including repeated cancellation during shutdown.
+        worker = asyncio.create_task(asyncio.to_thread(operation))
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(worker)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+
+    @staticmethod
+    def _remove_folder(folder: Path) -> None:
+        try:
+            shutil.rmtree(folder)
+        except FileNotFoundError as exc:
+            # Python 3.13 already ignores nested ENOENT. Only an absent owned
+            # root is success here; other storage failures must remain visible.
+            if exc.filename is None or Path(exc.filename) != folder:
+                raise
+
     async def _compact(self, recording_id: str) -> None:
+        async with self._file_lock(recording_id):
+            await self._compact_locked(recording_id)
+
+    async def _compact_locked(self, recording_id: str) -> None:
         if self._has_job(recording_id):
             return
         async with self.lock:
             day = self.daily.catalog.get_day(recording_id)
+            if day["status"] in ("deleted", "expired"):
+                return
             if day.get("archive_state") != "mp4":
                 return
             if self.db.execute(
@@ -270,8 +319,7 @@ class DailyExportService:
             folder = self.root / "daily" / recording_id
             if not folder.resolve().is_relative_to((self.root / "daily").resolve()):
                 raise OSError("Invalid compaction path")
-        if folder.exists():
-            await asyncio.to_thread(shutil.rmtree, folder)
+        await self._file_work(lambda: self._remove_folder(folder))
         async with self.lock:
             with self.db:
                 self.db.execute("DELETE FROM daily_compactions WHERE day_id=?", (recording_id,))
@@ -287,8 +335,12 @@ class DailyExportService:
                 "SELECT 1 FROM clip_recording_pins WHERE day_id=? LIMIT 1", (recording_id,)
             ).fetchone():
                 raise ApiError(409, "EXPORT_IN_PROGRESS", "A media request uses this recording.")
+            if day.get("cleanup_state") == "complete":
+                return
             if day["status"] != "expired":
-                day.update(status="deleted", deleted_at=iso(self.daily.clock()))
+                day.update(
+                    status="deleted", deleted_at=day.get("deleted_at") or iso(self.daily.clock())
+                )
             day.update(
                 playback_state="unavailable",
                 playback_path=None,
@@ -296,20 +348,41 @@ class DailyExportService:
                 export_allowed=False,
                 size_bytes=None,
                 export_expires_at=None,
+                cleanup_state="pending",
+                cleanup_completed_at=None,
+                cleanup_error=None,
+                space_reclaimed=None,
             )
             with self.db:
                 self.daily.catalog.save_day(day)
                 self.db.execute("INSERT OR IGNORE INTO daily_cleanup VALUES(?)", (recording_id,))
-        await self._cleanup(recording_id)
+        if not await self._cleanup(recording_id):
+            raise ApiError(409, "EXPORT_IN_PROGRESS", "A media request uses this recording.")
 
-    async def _cleanup(self, recording_id: str) -> None:
+    async def _cleanup(self, recording_id: str) -> bool:
+        async with self._file_lock(recording_id):
+            return await self._cleanup_locked(recording_id)
+
+    async def _cleanup_locked(self, recording_id: str) -> bool:
         if self._has_job(recording_id):
-            return
+            return False
         async with self.lock:
             if self.db.execute(
                 "SELECT 1 FROM clip_recording_pins WHERE day_id=? LIMIT 1", (recording_id,)
             ).fetchone():
-                return
+                return False
+            day = self.daily.catalog.get_day(recording_id)
+            if day.get("cleanup_state") == "complete":
+                return True
+            day.update(
+                cleanup_state="pending",
+                cleanup_completed_at=None,
+                cleanup_error=None,
+                space_reclaimed=None,
+            )
+            with self.db:
+                self.daily.catalog.save_day(day)
+                self.db.execute("INSERT OR IGNORE INTO daily_cleanup VALUES(?)", (recording_id,))
         uuid.UUID(recording_id)
 
         def remove():
@@ -317,19 +390,41 @@ class DailyExportService:
                 folder = self.root / category / recording_id
                 if not folder.resolve().is_relative_to((self.root / category).resolve()):
                     raise OSError("Invalid cleanup path")
-                if folder.exists():
-                    shutil.rmtree(folder)
+                self._remove_folder(folder)
             for suffix in (".mp4", ".tmp.mp4", ".ffconcat"):
                 path = self.output / (recording_id + suffix)
                 if not path.resolve().is_relative_to(self.output.resolve()):
                     raise OSError("Invalid media path")
                 path.unlink(missing_ok=True)
 
-        await asyncio.to_thread(remove)
+        try:
+            await self._file_work(remove)
+        except OSError:
+            async with self.lock:
+                day = self.daily.catalog.get_day(recording_id)
+                day.update(
+                    cleanup_state="failed",
+                    cleanup_completed_at=None,
+                    cleanup_error={"code": "STORAGE_ERROR", "message": "Recording cleanup failed."},
+                    space_reclaimed=None,
+                )
+                with self.db:
+                    self.daily.catalog.save_day(day)
+            raise
         async with self.lock:
             with self.db:
+                day = self.daily.catalog.get_day(recording_id)
+                day.update(
+                    cleanup_state="complete",
+                    cleanup_completed_at=iso(self.daily.clock()),
+                    cleanup_error=None,
+                    # Open handles can retain physical blocks after path removal.
+                    space_reclaimed=None,
+                )
+                self.daily.catalog.save_day(day)
                 self.db.execute("DELETE FROM daily_cleanup WHERE day_id=?", (recording_id,))
                 self.db.execute("DELETE FROM daily_compactions WHERE day_id=?", (recording_id,))
+        return True
 
     async def refresh_retention(self, now: float) -> None:
         """Only update metadata on HTTP requests; file work belongs to the background worker."""
@@ -349,6 +444,10 @@ class DailyExportService:
                             download_path=None,
                             export_allowed=False,
                             size_bytes=None,
+                            cleanup_state="pending",
+                            cleanup_completed_at=None,
+                            cleanup_error=None,
+                            space_reclaimed=None,
                         )
                         self.daily.catalog.save_day(day)
                         self.db.execute(

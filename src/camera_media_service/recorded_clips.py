@@ -30,6 +30,8 @@ class RecordedClipService:
         self.recording, self.daily = recording, daily
         self.db, self.lock = recording.db, recording.lock
         self.jobs = {}
+        self.range_admission = asyncio.Lock()
+        self.range_tasks = set()
         self.closed = False
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS clip_sources(clip_id TEXT PRIMARY KEY,body TEXT NOT NULL);
@@ -48,19 +50,25 @@ class RecordedClipService:
             )
 
     def _select(self, camera, at, now, start, end):
+        left = min(start, at) if at is not None else start
+        right = max(min(end, now), at + 0.001) if at is not None else min(end, now)
         rows = self.db.execute(
             "SELECT s.body,s.status AS segment_status,d.body AS day FROM daily_segments s "
             "JOIN daily_recordings d ON d.id=s.day_id "
             "WHERE d.camera=? AND d.status NOT IN ('deleted','expired') "
             "AND s.start<? AND s.end>? ORDER BY s.start,s.id",
-            (camera, max(min(end, now), at + 0.001), min(start, at)),
+            (camera, right, left),
         ).fetchall()
         segments = []
         pending = False
         finalized_center = False
         for row in rows:
             item, day = json.loads(row["body"]), json.loads(row["day"])
-            if item["start_at"] <= at < item["end_at"] and row["segment_status"] != "processing":
+            if (
+                at is not None
+                and item["start_at"] <= at < item["end_at"]
+                and row["segment_status"] != "processing"
+            ):
                 finalized_center = True
             if day["expires_at"] and epoch(day["expires_at"]) <= now:
                 continue
@@ -76,22 +84,26 @@ class RecordedClipService:
                 owned = self.recording.root / ("daily-exports" if archive else "daily")
                 if path.is_relative_to(owned.resolve()) and path.is_file():
                     segments.append(item)
-            elif row["segment_status"] == "processing" and item["start_at"] <= at < item["end_at"]:
+            elif row["segment_status"] == "processing" and (
+                at is None or item["start_at"] <= at < item["end_at"]
+            ):
                 pending = True
         losses = [
             (r["start"], r["end"], r["reason"])
             for r in self.db.execute(
                 "SELECT start,end,reason FROM daily_gaps WHERE camera=? AND start<? AND end>? "
                 "ORDER BY start,end",
-                (camera, max(end, at + 0.001), min(start, at)),
+                (camera, max(end, at + 0.001) if at is not None else end, left),
             )
         ]
         losses.extend((a, b, reason) for cam, a, b, reason in self.daily.losses if cam == camera)
         offline = self.daily.offline.get(camera)
         if offline is not None and offline < now:
             losses.append((offline, now, "CAMERA_DISCONNECTED"))
-        center_lost = any(a <= at < b for a, b, _ in losses)
-        if not any(s["start_at"] <= at < s["end_at"] for s in segments) or center_lost:
+        center_lost = at is not None and any(a <= at < b for a, b, _ in losses)
+        if at is not None and (
+            not any(s["start_at"] <= at < s["end_at"] for s in segments) or center_lost
+        ):
             if not center_lost and (
                 pending or (not finalized_center and self._pending_input(camera, at))
             ):
@@ -125,12 +137,41 @@ class RecordedClipService:
                         }
                     )
         if not slices:
+            if at is None:
+                candidates = [
+                    r[0]
+                    for r in self.db.execute(
+                        "SELECT timestamp FROM frames WHERE camera=? AND timestamp>=? "
+                        "AND timestamp<? ORDER BY timestamp DESC LIMIT 1",
+                        (camera, start, min(end, now)),
+                    )
+                ]
+                if self.recording.queue is not None:
+                    candidates.extend(self.recording.queue.pending_timestamps(camera))
+                latest = self.recording.hub.latest.get(camera)
+                if latest is not None:
+                    candidates.append(latest.received_at)
+                if pending or any(
+                    start <= t < min(end, now) and self._pending_input(camera, t)
+                    for t in candidates
+                ):
+                    raise ApiError(409, "RECORDING_NOT_READY", "Recording is still being prepared.")
+                raise ApiError(
+                    404, "RECORDING_NOT_FOUND_IN_RANGE", "Requested range has no saved media."
+                )
             raise ApiError(404, "RECORDING_NOT_FOUND_AT_TIME", "Requested window has no media.")
         gaps, cursor = [], start
         for left, right in [(s["clip_start"], s["clip_end"]) for s in slices] + [(end, end)]:
             if left - cursor > 0.001:
                 # Split a missing tail at 'now' to distinguish absent media from future time.
-                edges = sorted({cursor, left, *([now] if cursor < now < left else [])})
+                edges = sorted(
+                    {
+                        cursor,
+                        left,
+                        *([now] if cursor < now < left else []),
+                        *[t for a, b, _ in losses for t in (a, b) if cursor < t < left],
+                    }
+                )
                 for a, b in zip(edges, edges[1:], strict=False):
                     reason = "FUTURE_NOT_RECORDED" if a >= now else "RECORDING_UNAVAILABLE"
                     for x, y, code in losses:
@@ -140,6 +181,19 @@ class RecordedClipService:
                     gaps.append({"start_at": iso(a), "end_at": iso(b), "reason_code": reason})
             cursor = max(cursor, right)
         return slices, gaps
+
+    async def create_range(self, camera, event, start_at, end_at, *, retry_failed=False):
+        from camera_media_service.range_clips import create_range
+
+        task = asyncio.current_task()
+        self.range_tasks.add(task)
+        try:
+            async with self.range_admission:
+                return await create_range(
+                    self, camera, event, start_at, end_at, retry_failed=retry_failed
+                )
+        finally:
+            self.range_tasks.discard(task)
 
     def _pending_input(self, camera, at):
         cursor = self.db.execute(
@@ -249,7 +303,8 @@ class RecordedClipService:
             return body, True
 
     def _done(self, key, task):
-        self.jobs.pop(key, None)
+        if self.jobs.get(key) is task:
+            self.jobs.pop(key, None)
         if not task.cancelled() and task.exception():
             LOG.error("Recorded clip failed", exc_info=task.exception())
 
@@ -292,6 +347,8 @@ class RecordedClipService:
                                 actual_start_at=iso(metadata["start_at"]),
                                 actual_end_at=iso(metadata["end_at"]),
                                 available_intervals=metadata["available_intervals"],
+                                size_bytes=metadata["size_bytes"],
+                                media_info=metadata.get("media_info"),
                             )
                         self.recording._save(body)
                         self.db.execute(
@@ -310,6 +367,10 @@ class RecordedClipService:
         if self.closed:
             return
         self.closed = True
+        admissions = [t for t in self.range_tasks if t is not asyncio.current_task()]
+        for task in admissions:
+            task.cancel()
+        await asyncio.gather(*admissions, return_exceptions=True)
         keys, tasks = list(self.jobs), list(self.jobs.values())
         for task in tasks:
             task.cancel()
