@@ -8,6 +8,8 @@
 
 ## 백엔드 담당자에게 전달할 값
 
+한국 시간2026-10-31 PR #1의 main `1bcce51`로 운영 배포를 확인했다. 검증된 PR 소스와 병합 main의 파일 트리가 동일함을 확인하고, 서버에서 테스트한 이미지를 운영 태그로 사용했다. 현재 이미지는 `ajin-camera-media-service:1bcce51`이며 기존 설정·인증 정보·네트워크·포트·볼륨·자원 한도는 유지했다. 신규 API와 실제 백엔드 접근 결과는 VALIDATION.md의 최신 운영 검증을 참조한다.
+
 | 항목 | 값 |
 | --- | --- |
 | 호스트에서 실행하는 백엔드의 API 기본 주소 | `http://127.0.0.1:8889/api/v1` |
@@ -57,7 +59,7 @@ networks:
 | 항목 | 값 |
 | --- | --- |
 | 컨테이너 | `ajin-camera-media-service` |
-| 이미지 | `ajin-camera-media-service:f4cc08f` |
+| 이미지 | `ajin-camera-media-service:1bcce51` |
 | 배포 파일 | `/srv/scrap-monitoring/development/main-refresh-20261015/compose.media.yaml` |
 | 실행 환경 파일 | `/home/kyuncho/ajin-camera-media-service/runtime.env` (비공개 파일, 이번 배포에서 내용 유지) |
 | 서버의 영구 저장 경로 | `/var/lib/ajin-camera-media` |

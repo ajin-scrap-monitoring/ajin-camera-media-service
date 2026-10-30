@@ -1,5 +1,32 @@
 # 검증 기록
 
+## 2026-10-31 main 병합 및 운영 배포 확인
+
+PR #1을 main `1bcce51d86c5ccb08b2c3cd55ef66e7f9469c49c`에 병합했다. 병합 main의 파일 트리와 검증한 PR 커밋 `81cfab0`의 파일 트리가 동일함을 서버에서 확인했다. GitHub main을 서버가 직접 fetch/fast-forward한 뒤, 전체271개 시험(335.86초)을 통과한 이미지를 운영 태그 `ajin-camera-media-service:1bcce51`로 사용했다. 이미지 ID는 `sha256:22eaaa8a108beabdb6a418119e7b97d870db89ad14f8ec1399129d79df3b91d9`다. 새 운영 컨테이너 running/healthy를 확인했다.
+
+배포 전에 Compose와 일관된 SQLite WAL 읽기 스냅샷을 백업했다. 기존 환경 파일 해시·실제 주입값·정책(이벤트 전후30초/보관30일, 날짜 녹화 활성/보관30일)·포트·네트워크·영속 마운트·CPU2/메모리3GiB·자동 재시작을 보존했다. 실패 시 기존 MP4 지원 이미지로 복구할 수 있도록 준비했으며 실제 롤백은 필요하지 않았다.
+
+실제 `scrap-monitoring-backend-check` 컨테이너에서 운영 주소로 다음을 검증했다.
+
+| 항목 | 결과 |
+|---|---|
+| 현재 카메라 상태 | 200, healthy/connected, accepted_jpeg_receipt, no-store, 수신·평가·유효 시각 |
+| 재시작 후 녹화 | 배포 시각 이후 새 완료 구간 생성 확인. 한국 자정 전환 뒤 새 날짜에서도 진행 |
+| MJPEG / HLS | 200 및 JPEG 헤더 / 조각 Range206·188바이트 |
+| 오늘 TS 요청별 구간 | 202→ready, complete,196,205바이트, 중복200/범위 충돌409 |
+| 보관 MP4 요청별 구간 | 202→ready, complete,252,834바이트, 중복200/범위 충돌409 |
+| 기존 event_at | 202→ready, 미래 꼬리를 포함한 partial,1,456,903바이트 |
+| 파일 검증 | 위3개 MP4 전체 디코딩, H.264/1920×1080/명목15fps. size_bytes와 HEAD Content-Length·ffprobe 크기 일치, Range206 |
+| 날짜 메타데이터 | 실제 측정 개수·형식 집계, 촬영 시각 미지원/null, 썸네일unsupported |
+| 기존 하루 전체 MP4 | HEAD200/7,555,827,783바이트, Range206/1,024바이트·MP4 헤더. 요청 전후 파일 크기·수정 시각 동일 |
+| 시험 클립 정리 | 생성한3개 클립 DELETE204, 이후 콘텐츠410 |
+
+날짜 메타데이터의 FPS는 파일의 명목률이다. 운영의 극히 짧은1프레임 TS에서 ffprobe r_frame_rate=30/1, avg_frame_rate=0/0이 관측되었고, 일반 조각은15/1이었다. 이를 원본 촬영률·평균 수신률 또는 설정 변경으로 해석하지 않는다. API는 측정된 명목률 차이를mixed와측정 개수로 표시한다.
+
+R-10은 실제 운영 영상과 분리된 전용 검증 카메라/UUID 날짜/표시 파일로 확인했다. 검증 폴더 권한 오류에서 DELETE503 STORAGE_UNAVAILABLE, status=deleted/cleanup_state=failed, 콘텐츠410을 확인했다. 해당 검증 폴더 권한을 복구한 뒤 동시 재삭제2개 모두204, 추가 재삭제204, cleanup_state=complete 및 폴더 부재를 확인했다. space_reclaimed는null이다. 컨테이너의 제한된 보안 권한은 유지하고 검증 폴더만 호스트 관리자가 조정했다. 실제 camera-main 날짜 영상은 삭제하지 않았다.
+
+원본 시험 로그와 배포·API·삭제·전체 다운로드 검증 JSON은 서버 `/home/kyuncho/ajin-camera-media-service/deploy-20261030-1bcce51/`에 보관한다. 이는 실제 백엔드 컨테이너의 미디어 API 접근 검증이며, 백엔드 업무 처리·대시보드 전체 흐름 또는 물리 카메라/현장 LiDAR 신원·설치 보정을 확인했다는 뜻은 아니다.
+
 ## 2026-10-30 연동 요청 수정 PR 검증
 
 R-10 날짜 삭제 경합/실패 재시도, R-07 요청별 구간/재시도, R-01 카메라 수신 상태, R-08 실제 파일 정보, R-09 촬영 시각 미지원 계약을 추가했다. 로컬 Python3.13/FFmpeg7.1 전체 **271 passed in66.37s**, Ruff 검사 및72개 Python 파일 포맷 검사를 통과했다. 기존204개 회귀 시험을 포함한다. 이번 PR은 운영 배포와 구분한다.
