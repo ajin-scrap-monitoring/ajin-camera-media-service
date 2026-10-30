@@ -8,9 +8,11 @@ import logging
 import math
 import shutil
 import sqlite3
+import stat
 import time
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 
 from camera_media_service.daily_catalog import DailyCatalog
 from camera_media_service.daily_gaps import build_gaps
@@ -54,6 +56,7 @@ class DailyRecordingService:
         self.last_error = None
         self._closed = False
         self.storage_reservations = {}
+        self.storage_reservation_outputs = {}
 
     def notify_loss(self, camera_id: str, start_at: float, end_at: float, reason_code: str) -> None:
         if end_at > start_at and camera_id in self.recording.cameras:
@@ -501,18 +504,38 @@ class DailyRecordingService:
                     self.recording.release_frames(lease_id)
 
     async def check_space(self, reserve: int = 0) -> None:
-        reserve += sum(self.storage_reservations.values())
+        # Snapshot on the event loop; file workers must not read mutable job maps.
+        reservations = dict(self.storage_reservations)
+        output_owners = {
+            Path(path): owner
+            for owner in reservations
+            for path in self.storage_reservation_outputs.get(owner, ())
+        }
 
         def usage():
-            total = sum(
-                p.stat().st_size
-                for folder in ("daily", "daily-exports", "daily-playback")
-                for p in (self.recording.root / folder).rglob("*")
-                if p.is_file()
+            total = 0
+            allocated = dict.fromkeys(reservations, 0)
+            for folder in ("daily", "daily-exports", "daily-playback"):
+                for path in (self.recording.root / folder).rglob("*"):
+                    try:
+                        info = path.stat()
+                    except FileNotFoundError:
+                        # Archive rename and retention deletion can overlap scans.
+                        continue
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    total += info.st_size
+                    owner = output_owners.get(path)
+                    if owner is not None:
+                        # Credit only bytes included above, from this same stat.
+                        allocated[owner] += info.st_size
+            remaining = sum(
+                max(0, planned - allocated[owner]) for owner, planned in reservations.items()
             )
-            return total, shutil.disk_usage(self.recording.root).free
+            return total, shutil.disk_usage(self.recording.root).free, remaining
 
-        used, free = await asyncio.to_thread(usage)
+        used, free, remaining = await asyncio.to_thread(usage)
+        reserve += remaining
         if (
             used + reserve > self.settings.max_daily_storage_bytes
             or free - reserve < self.settings.min_free_storage_bytes
