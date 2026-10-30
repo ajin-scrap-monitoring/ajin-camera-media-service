@@ -154,7 +154,12 @@ class WebSocketServer:
                 )
                 exports = DailyExportService(daily, self.settings)
             runner = web.AppRunner(
-                create_http_app(recording, daily=daily, exports=exports),
+                create_http_app(
+                    recording,
+                    daily=daily,
+                    exports=exports,
+                    status_tracker=self.ingest_service.status_tracker,
+                ),
                 shutdown_timeout=2,
                 access_log=None,
             )
@@ -189,6 +194,8 @@ class WebSocketServer:
 
 
 def create_app(settings: Settings) -> WebSocketServer:
+    from camera_media_service.camera_status import CameraStatusTracker
+
     registry = ConnectionRegistry()
     frame_store = LatestFrameStore()
     authenticator = BearerAuthenticator(settings.camera_tokens)
@@ -225,6 +232,7 @@ def create_app(settings: Settings) -> WebSocketServer:
         validator=validator,
         hub=hub,
         telemetry=telemetry,
+        status_tracker=CameraStatusTracker(settings.camera_tokens),
     )
 
     return WebSocketServer(

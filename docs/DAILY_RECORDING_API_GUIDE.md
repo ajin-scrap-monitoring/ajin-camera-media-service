@@ -1,5 +1,7 @@
 # 날짜별 상시 녹화 API 연동 가이드
 
+2026-10-30 PR에서 추가한 삭제 cleanup_state·실제 파일 정보 계약과503/재시도 규칙은 [추가 계약](INTEGRATION_HANDOFF_2026-10-30.md)을 참조한다. PR 기능과 현재 운영 배포를 구분한다.
+
 대상: 백엔드·프론트엔드 담당자. 날짜 녹화는 v2, 기존 이벤트 클립·실시간 MJPEG는 v1을 사용한다.
 
 이 문서의 요청/응답은 구현된 계약이다. 실제 서버 검증 범위와 운영 활성화 상태는 [VALIDATION.md](VALIDATION.md) 및 [SERVER_DEPLOYMENT.md](SERVER_DEPLOYMENT.md)를 참조한다.

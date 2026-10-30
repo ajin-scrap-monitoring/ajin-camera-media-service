@@ -18,8 +18,16 @@ from camera_media_service.recording import ApiError
 STATES = {"recording", "finalizing", "closed", "failed", "deleted", "expired"}
 
 
-def register_daily_routes(app, daily, exports) -> None:
+def register_daily_routes(app, daily, exports, *, media_details=None) -> None:
     key = daily.recording.cursor_key
+
+    async def media_info(request):
+        query_fields(request, ())
+        await exports.refresh_retention(daily.clock())
+        return web.json_response(
+            await media_details.day(request.match_info["recording_id"]),
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def policy(request):
         query_fields(request, ())
@@ -195,3 +203,4 @@ def register_daily_routes(app, daily, exports) -> None:
     app.router.add_get(base + "/media/{segment_id}.ts", segment)
     app.router.add_post(base + "/exports", prepare)
     app.router.add_get(base + "/content", content)
+    app.router.add_get(base + "/media-info", media_info, allow_head=False)

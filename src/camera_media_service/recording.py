@@ -434,6 +434,7 @@ class RecordingService:
                     completed_at=iso(now),
                     expires_at=iso(now + body["recording_policy"]["retention_days"] * 86400),
                     content_path=f"/api/v1/clips/{clip_id}/content",
+                    size_bytes=(self.clips / f"{clip_id}.mp4").stat().st_size,
                 )
             except asyncio.CancelledError:
                 raise

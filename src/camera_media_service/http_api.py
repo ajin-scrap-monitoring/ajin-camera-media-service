@@ -61,12 +61,19 @@ def query_fields(request, allowed):
         raise ApiError(400, "INVALID_ARGUMENT", "Unknown or duplicate query parameter.")
 
 
-def create_http_app(service: RecordingService, *, daily=None, exports=None) -> web.Application:
+def create_http_app(
+    service: RecordingService, *, daily=None, exports=None, status_tracker=None
+) -> web.Application:
     key = service.cursor_key
     viewers = 0
     from camera_media_service.recorded_clips import RecordedClipService, event_timestamp
 
     recorded_clips = RecordedClipService(service, daily) if daily is not None else None
+    from camera_media_service.camera_status import CameraStatusTracker
+    from camera_media_service.media_details import MediaDetails
+
+    tracker = status_tracker if status_tracker is not None else CameraStatusTracker(service.cameras)
+    media_details = MediaDetails(service, daily, exports)
 
     @web.middleware
     async def boundary(request, handler):
@@ -111,6 +118,19 @@ def create_http_app(service: RecordingService, *, daily=None, exports=None) -> w
             result = await service.get_policy(camera)
         return web.json_response(result)
 
+    async def camera_status(request):
+        query_fields(request, ())
+        return web.json_response(
+            tracker.snapshot(request.match_info["camera_id"]), headers={"Cache-Control": "no-store"}
+        )
+
+    async def media_info(request):
+        query_fields(request, ())
+        return web.json_response(
+            await media_details.clip(request.match_info["clip_id"]),
+            headers={"Cache-Control": "no-store"},
+        )
+
     async def create(request):
         query_fields(request, ())
         data = await body_json(request)
@@ -118,9 +138,31 @@ def create_http_app(service: RecordingService, *, daily=None, exports=None) -> w
             "camera_id",
             "event_id",
             "event_at",
+            "start_at",
+            "end_at",
+            "retry_failed",
         }:
             raise ApiError(400, "INVALID_ARGUMENT", "camera_id and event_id are required.")
-        if "event_at" in data:
+        ranged = "start_at" in data or "end_at" in data
+        if ranged:
+            if "event_at" in data or not {"start_at", "end_at"} <= set(data):
+                raise ApiError(
+                    400, "INVALID_ARGUMENT", "Use either event_at or both start_at and end_at."
+                )
+            if recorded_clips is None:
+                raise ApiError(
+                    503, "RECORDING_NOT_ENABLED", "Enable daily recording to extract clips."
+                )
+            result, created = await recorded_clips.create_range(
+                data["camera_id"],
+                data["event_id"],
+                data["start_at"],
+                data["end_at"],
+                retry_failed=data.get("retry_failed", False),
+            )
+        elif "retry_failed" in data:
+            raise ApiError(400, "INVALID_ARGUMENT", "retry_failed requires start_at and end_at.")
+        elif "event_at" in data:
             event_timestamp(data["event_at"])
             if recorded_clips is None:
                 raise ApiError(
@@ -153,6 +195,24 @@ def create_http_app(service: RecordingService, *, daily=None, exports=None) -> w
                         "gaps",
                         "extraction_mode",
                         "available_intervals",
+                    )
+                }
+            )
+        if result.get("request_mode") == "time_range":
+            response.update(
+                {
+                    k: result[k]
+                    for k in (
+                        "request_mode",
+                        "attempt_count",
+                        "attempt_started_at",
+                        "coverage",
+                        "actual_start_at",
+                        "actual_end_at",
+                        "gaps",
+                        "extraction_mode",
+                        "available_intervals",
+                        "size_bytes",
                     )
                 }
             )
@@ -296,15 +356,17 @@ def create_http_app(service: RecordingService, *, daily=None, exports=None) -> w
 
     prefix = "/api/v1"
     app.router.add_get(prefix + "/cameras/{camera_id}/recording-policy", policy, allow_head=False)
+    app.router.add_get(prefix + "/cameras/{camera_id}/status", camera_status, allow_head=False)
     app.router.add_put(prefix + "/cameras/{camera_id}/recording-policy", policy)
     app.router.add_get(prefix + "/cameras/{camera_id}/live", live, allow_head=False)
     app.router.add_post(prefix + "/clips", create)
     app.router.add_get(prefix + "/clips", listing, allow_head=False)
     app.router.add_get(prefix + "/clips/{clip_id}", detail, allow_head=False)
     app.router.add_delete(prefix + "/clips/{clip_id}", detail)
-    app.router.add_get(prefix + "/clips/{clip_id}/content", content, allow_head=False)
+    app.router.add_get(prefix + "/clips/{clip_id}/content", content)
+    app.router.add_get(prefix + "/clips/{clip_id}/media-info", media_info, allow_head=False)
     if daily is not None:
         from camera_media_service.daily_http_api import register_daily_routes
 
-        register_daily_routes(app, daily, exports)
+        register_daily_routes(app, daily, exports, media_details=media_details)
     return app
