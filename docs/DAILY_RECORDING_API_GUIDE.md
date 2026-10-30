@@ -180,6 +180,8 @@ POST /api/v2/daily-recordings/{recording_id}/exports
 
 오늘/지난 날짜 HLS 경로와 JSON 시간 매핑은 동일하다. MP4 전환 후에는 요청된 짧은 조각만 스트림 복사해 임시 TS로 제공하며 하루 전체 파일을 만들지 않는다. 임시 캐시는 최대64MiB, 미사용60초 만료, 동시 변환2개/대기 포함8개다. 한도를 넘으면503을 반환하므로 플레이어가 재시도할 수 있어야 한다. 재인코딩은 없지만 짧은 구간 읽기·구성에 따른 첫 응답 지연은 남는다.
 
+하루 MP4 인덱스는 파일 끝에 둔다. 게이트웨이는 기존 단일 Range와HEAD를 그대로 중개해야 하며, 날짜 재생은 기존 HLS 경로를 사용한다. 이 방식은 대용량 faststart 전체 재기록을 피한다. 순차 다운로드만으로 MP4를 파싱하는 소비자는 파일 끝에서 인덱스를 받는다. 이벤트 클립의 faststart는 유지한다. 저장 예약은 이미 생성돼 사용량에 포함된 바이트를 다시 차감하지 않으며, 읽기 검증 단계에는 추가 쓰기 예약을 잡지 않는다.
+
 Content-Type video/mp4, Content-Disposition attachment, 파일명 `daily_<한국날짜>_<recording_id>.mp4`. Content-Length/Accept-Ranges 및206 응답의 Content-Range를 지원한다. 파일 전체를 메모리에 모아 응답하지 않는다.
 
 ```http

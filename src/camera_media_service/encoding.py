@@ -255,6 +255,11 @@ async def encode_daily_segment(
 
 
 async def merge_daily_mp4(ffmpeg: str, segments: list[dict], temporary: Path, final: Path) -> dict:
+    """Stream-copy daily media with its index at EOF, avoiding a full-file relocation pass.
+
+    Local playback can seek to the index, and downloads support HTTP byte ranges.
+    Event clips retain faststart independently for their smaller standalone files.
+    """
     if not segments or len({json.dumps(s["profile"], sort_keys=True) for s in segments}) != 1:
         raise RuntimeError("EXPORT_INCOMPATIBLE_MEDIA")
     final.parent.mkdir(parents=True, exist_ok=True)
@@ -285,8 +290,6 @@ async def merge_daily_mp4(ffmpeg: str, segments: list[dict], temporary: Path, fi
             "copy",
             "-avoid_negative_ts",
             "make_zero",
-            "-movflags",
-            "+faststart",
             "-f",
             "mp4",
             str(temporary),

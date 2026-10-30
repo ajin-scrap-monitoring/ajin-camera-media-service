@@ -32,6 +32,7 @@ class DailyExportService:
         self.task = None
         self.closed = False
         self.reservations = daily.storage_reservations
+        self.reservation_outputs = daily.storage_reservation_outputs
         self.playback = ArchivedPlaybackService(daily)
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS daily_cleanup(day_id TEXT PRIMARY KEY);
@@ -142,6 +143,10 @@ class DailyExportService:
                 )
                 self.daily.catalog.save_day(day)
             self.reservations[recording_id] = reserve
+            self.reservation_outputs[recording_id] = (
+                self.output / (recording_id + ".tmp.mp4"),
+                self._path(recording_id),
+            )
             task = asyncio.create_task(self._export(job, segments, reuse=reuse))
             self.jobs[recording_id] = task
             task.add_done_callback(lambda done, key=recording_id: self._done(key, done))
@@ -150,6 +155,7 @@ class DailyExportService:
         if self.jobs.get(key) is task:
             self.jobs.pop(key, None)
             self.reservations.pop(key, None)
+            self.reservation_outputs.pop(key, None)
         if not task.cancelled() and task.exception():
             LOG.error("Daily archive failed", exc_info=task.exception())
 
@@ -176,6 +182,9 @@ class DailyExportService:
                         self.output / (recording_id + ".tmp.mp4"),
                         final,
                     )
+                # Verification reads the finished archive and allocates no more
+                # video output. Its existing bytes remain in disk usage.
+                self.reservations[recording_id] = 0
                 metadata = await verify_archive(self.daily.recording.ffmpeg, final, segments)
         except asyncio.CancelledError:
             error = {"code": "JOB_INTERRUPTED", "message": "Archive interrupted."}
@@ -553,4 +562,5 @@ class DailyExportService:
                                 (json.dumps(job), key),
                             )
                     self.reservations.pop(key, None)
+                    self.reservation_outputs.pop(key, None)
         await self.playback.close()
