@@ -1,5 +1,13 @@
 # 검증 기록
 
+## 2026-10-31 13:45 대용량 운영 아카이브 완료 확인
+
+앞선 기록의 전체 검증 대기 항목은 완료됐다. 운영 서버100.100.27.99에서 이미지f4019cb가 running/healthy이고10월30일 녹화(`2b873438-fb61-489f-a199-c28b685e6034`,84,782.933초)가 archive_state=mp4/export_state=ready, error=null, size_bytes=7,375,688,873으로 전환된 것을 확인했다. 해당 날짜 TS는0개로, 전체 안전 검증 후 중복 원본 정리까지 완료됐다. 아카이브 FFmpeg 작업도 남아 있지 않았다.
+
+실제 백엔드 컨테이너에서 이 날짜 MP4의 HEAD200/7,375,688,873바이트, Range206/1,024바이트, 요청 전후 파일 크기·수정 시각 불변을 확인했다. TS 정리 후 HLS200과 마지막 조각 Range206/188바이트도 통과했다. 오늘 TS·해당 보관 MP4·기존 event_at의3개 시험 클립 생성→ready→전체 디코딩, 중복200/충돌409, 메타데이터·크기·Range, 시험 클립 DELETE204/후속410을 재검증했다. 보관 MP4 구간은193,276바이트이며 source_archive_state=mp4/coverage=complete였다.
+
+카메라는 healthy/connected였다. 오늘 recorded_seconds가47,067.133→47,077.067로 증가하고 error=null임을 확인했다. 검증 기록은 기존 증거 디렉터리의 archive-completion-verification.json과 whole-download-after-compaction.json, 재실행 api-verification.json에 보관했다. 아래의 진행 중 문구는 당시 관찰 기록이며 현재 상태는 이 절을 따른다. 앞선 누락 구간 복구·현장 물리 장비 확인·대시보드 전체 흐름을 검증했다고 보고하지 않는다.
+
 ## 2026-10-31 후속 수정 main 병합·운영 재배포
 
 [PR #2](https://github.com/ajin-scrap-monitoring/ajin-camera-media-service/pull/2)를 main `f4019cb6e94a5b9663b3ae696f29cc7a1b77e2ed`에 병합했다. PR/push/main GitHub CI가 모두 성공했고, 운영 서버가 GitHub에서 직접 가져온 병합 main과 검증 PR `7ca9501`의 파일 트리가 같음을 확인했다. 운영 이미지 `ajin-camera-media-service:f4019cb`, 이미지 ID `sha256:e569b20212d9c031a76e45a5b343334a68f8915aa60d93ff3dd464928a5f0076`로 교체했다. running/healthy이며 임시 중지 override를 실행에서 제외해 자동 아카이브를 다시 활성화했다.
