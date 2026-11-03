@@ -12,6 +12,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from camera_media_service.daily_catalog import DailyCatalog
@@ -19,6 +20,7 @@ from camera_media_service.daily_gaps import build_gaps
 from camera_media_service.daily_models import DailyWindow, seoul_date
 from camera_media_service.daily_playback import build_available_intervals
 from camera_media_service.encoding import encode_daily_segment, probe_media
+from camera_media_service.media_files import storage_io
 from camera_media_service.recording import ApiError, RecordingService, epoch, iso
 
 LOG = logging.getLogger(__name__)
@@ -55,8 +57,11 @@ class DailyRecordingService:
         self.offline = {}
         self.last_error = None
         self._closed = False
-        self.storage_reservations = {}
+        self.storage_reservations = recording.capacity_reservations
         self.storage_reservation_outputs = {}
+        recording.capacity_check = self.check_space
+        recording.capacity_reservations = self.storage_reservations
+        recording.capacity_outputs = self.storage_reservation_outputs
 
     def notify_loss(self, camera_id: str, start_at: float, end_at: float, reason_code: str) -> None:
         if end_at > start_at and camera_id in self.recording.cameras:
@@ -205,10 +210,17 @@ class DailyRecordingService:
                     path=str(path.relative_to(self.recording.root)),
                     profile=segment.get("profile") or self.profile,
                 )
+                await self.check_space()
                 async with self.lock:
                     with self.db:
                         self.catalog.complete_segment(segment["segment_id"], metadata)
-            except (OSError, RuntimeError, ValueError, KeyError):
+            except (OSError, RuntimeError, ValueError, KeyError, ApiError) as exc:
+                capacity = isinstance(exc, ApiError) and exc.code == "INSUFFICIENT_STORAGE"
+                if capacity:
+                    self.last_error = {
+                        "code": exc.code,
+                        "message": "Recovered media exceeds storage budget.",
+                    }
                 async with self.lock:
                     with self.db:
                         self.db.execute(
@@ -222,7 +234,7 @@ class DailyRecordingService:
                                 day["camera_id"],
                                 segment["start_at"],
                                 segment["end_at"],
-                                "SERVICE_INTERRUPTED",
+                                "STORAGE_FULL" if capacity else "SERVICE_INTERRUPTED",
                             ),
                         )
                 path.with_suffix(".tmp.ts").unlink(missing_ok=True)
@@ -263,10 +275,49 @@ class DailyRecordingService:
             "fps": getattr(self.settings, "daily_fps", 30),
         }
 
+    def _coverage_rows(self, day, until):
+        start = epoch(day["window_start_at"])
+        until = max(epoch(day["coverage_as_of_at"]), min(epoch(day["window_end_at"]), until))
+        segments = self.db.execute(
+            "SELECT body FROM daily_segments WHERE day_id=? AND status='ready' ORDER BY start,id",
+            (day["recording_id"],),
+        ).fetchall()
+        known = [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT start,end,reason FROM daily_gaps "
+                "WHERE camera=? AND start<? AND end>? ORDER BY id",
+                (day["camera_id"], until, start),
+            )
+        ]
+        return segments, known
+
     def _refresh(self, day: dict, until: float) -> dict:
+        # Synchronous helper retained for callers already doing offline catalogue work.
+        rows, known = self._coverage_rows(day, until)
+        result = self._refresh_values(day, until, [json.loads(row[0]) for row in rows], known)
+        self.catalog.save_day(result)
+        return result
+
+    async def _refresh_async(self, day: dict, until: float) -> dict:
+        # SQLite stays on its owner thread. Decode/coverage/serialization operate
+        # on a detached snapshot while the caller retains the catalogue lock.
+        rows, known = self._coverage_rows(day, until)
+
+        def calculate():
+            result = self._refresh_values(day, until, [json.loads(row[0]) for row in rows], known)
+            return result, json.dumps(result)
+
+        result, body = await storage_io(calculate)
+        self.db.execute(
+            "UPDATE daily_recordings SET status=?,body=? WHERE id=?",
+            (result["status"], body, result["recording_id"]),
+        )
+        return result
+
+    def _refresh_values(self, day: dict, until: float, segments, known) -> dict:
         start, end = epoch(day["window_start_at"]), epoch(day["window_end_at"])
         until = max(epoch(day["coverage_as_of_at"]), min(end, until))
-        segments = self.catalog.segments(day["recording_id"], ready_only=True)
         offset = 0.0
         for segment in segments:
             offset += segment["duration"]
@@ -278,11 +329,6 @@ class DailyRecordingService:
             point = max(point, segment["end_at"])
         if point < until:
             spans.append((point, until))
-        known = self.db.execute(
-            "SELECT start,end,reason FROM daily_gaps "
-            "WHERE camera=? AND start<? AND end>? ORDER BY id",
-            (day["camera_id"], until, start),
-        ).fetchall()
         gaps = build_gaps(spans, known)
         day.update(
             coverage_as_of_at=iso(until),
@@ -305,7 +351,6 @@ class DailyRecordingService:
                 export_allowed=bool(segments),
                 playback_state="ready" if segments else "unavailable",
             )
-        self.catalog.save_day(day)
         return day
 
     async def tick(self, now: float) -> None:
@@ -336,7 +381,7 @@ class DailyRecordingService:
                                     "VALUES(?,?,?,?)",
                                     (camera, window.start_at, now, "RECORDING_NOT_STARTED"),
                                 )
-                            self._refresh(day, now)
+                            await self._refresh_async(day, now)
                             self.db.execute("INSERT INTO daily_cursors VALUES(?,?)", (camera, now))
                     else:
                         cursor = row[0]
@@ -391,7 +436,9 @@ class DailyRecordingService:
                     async with self.lock:
                         with self.db:
                             self._flush_losses(now)
-                            self._refresh(self.catalog.get_day(day["recording_id"]), cursor)
+                            await self._refresh_async(
+                                self.catalog.get_day(day["recording_id"]), cursor
+                            )
                             self.db.execute(
                                 "UPDATE daily_cursors SET cursor=? WHERE camera=?", (cursor, camera)
                             )
@@ -411,15 +458,46 @@ class DailyRecordingService:
             with self.db:
                 for a, b in self._disabled_spans(day["camera_id"], start, end):
                     self._save_loss(day["camera_id"], a, b, "RECORDING_DISABLED")
-                frames = self.recording.pin_frames(lease_id, day["camera_id"], start, end)
+                # Lease boundary neighbours too: a slot cut must preserve the same
+                # sample-and-hold interval as the original adjacent JPEG receipts.
+                nearby = self.recording.pin_frames(lease_id, day["camera_id"], start - 1, end + 1)
                 loss = self.db.execute(
                     "SELECT start,end FROM daily_gaps WHERE camera=? AND start<? AND end>?",
-                    (day["camera_id"], end, start),
+                    (day["camera_id"], end + 1, start - 1),
                 ).fetchall()
-                existing = self.catalog.segments(day["recording_id"], ready_only=True)
+                existing = [
+                    json.loads(row[0])
+                    for row in self.db.execute(
+                        "SELECT body FROM daily_segments WHERE day_id=? AND status='ready' "
+                        "AND start<? AND end>? ORDER BY start,id",
+                        (day["recording_id"], end, start),
+                    )
+                ]
+                first = self.db.execute(
+                    "SELECT body FROM daily_segments WHERE day_id=? AND status='ready' "
+                    "ORDER BY start,id LIMIT 1",
+                    (day["recording_id"],),
+                ).fetchone()
                 profile = (
-                    existing[0]["profile"] if existing else day.get("storage_profile", self.profile)
+                    json.loads(first[0])["profile"]
+                    if first
+                    else day.get("storage_profile", self.profile)
                 )
+        frames = [frame for frame in nearby if start <= frame.received_at < end]
+        before = next((frame for frame in reversed(nearby) if frame.received_at < start), None)
+        after = next((frame for frame in nearby if frame.received_at >= end), None)
+
+        def contiguous(left, right):
+            return (
+                left is not None
+                and right is not None
+                and 0 < right.received_at - left.received_at <= 1
+                and not any(a < right.received_at and b > left.received_at for a, b in loss)
+            )
+
+        if frames and contiguous(before, frames[0]):
+            frames.insert(0, replace(before, received_at=start))
+        verified_tail = bool(frames and contiguous(frames[-1], after))
         groups = []
         for frame in frames:
             if any(s["start_at"] <= frame.received_at < s["end_at"] for s in existing):
@@ -452,15 +530,31 @@ class DailyRecordingService:
                         )
                 path = self.segment_path(segment)
                 try:
-                    await self.check_space(sum(f.size_bytes for f in group))
+                    owner = segment["segment_id"]
+                    self.storage_reservations[owner] = sum(f.size_bytes for f in group)
+                    self.storage_reservation_outputs[owner] = (path, path.with_suffix(".tmp.ts"))
+                    await self.check_space(recording=True)
                     group_end = min([end, *[a for a, b in loss if a > group[-1].received_at]])
                     metadata = await encode_daily_segment(
                         self.recording.ffmpeg,
                         self.recording.buffer,
                         path,
                         group,
-                        {**profile, "end_at": group_end},
+                        {
+                            **profile,
+                            "end_at": group_end,
+                            "_storage_guard": getattr(self.recording, "storage_guard", None),
+                            **(
+                                {"verified_end_at": end}
+                                if verified_tail and group is groups[-1]
+                                else {}
+                            ),
+                        },
                     )
+                    # JPEG input size does not bound scaled H264/mux output.
+                    # Count the finished file before making it available/recoverable.
+                    self.storage_reservations[owner] = 0
+                    await self.check_space()
                     metadata["path"] = str(path.relative_to(self.recording.root))
                     async with self.lock:
                         with self.db:
@@ -471,6 +565,16 @@ class DailyRecordingService:
                     self.last_error = None
                 except (OSError, RuntimeError, TimeoutError, ApiError) as exc:
                     LOG.exception("Daily segment failed: %s", segment["segment_id"])
+
+                    def discard_new_output(path=path):
+                        self.recording.storage_guard()
+                        path.unlink(missing_ok=True)
+                        path.with_suffix(".prepared.json").unlink(missing_ok=True)
+
+                    try:
+                        await storage_io(discard_new_output)
+                    except OSError:
+                        LOG.exception("Rejected segment cleanup deferred")
                     code = (
                         exc.code
                         if isinstance(exc, ApiError)
@@ -495,6 +599,8 @@ class DailyRecordingService:
                                 (segment["segment_id"],),
                             )
                 finally:
+                    self.storage_reservations.pop(segment["segment_id"], None)
+                    self.storage_reservation_outputs.pop(segment["segment_id"], None)
                     async with self.lock:
                         with self.db:
                             self.recording.release_frames(segment["segment_id"])
@@ -503,7 +609,7 @@ class DailyRecordingService:
                 with self.db:
                     self.recording.release_frames(lease_id)
 
-    async def check_space(self, reserve: int = 0) -> None:
+    async def check_space(self, reserve: int = 0, *, recording: bool = False) -> None:
         # Snapshot on the event loop; file workers must not read mutable job maps.
         reservations = dict(self.storage_reservations)
         output_owners = {
@@ -511,12 +617,44 @@ class DailyRecordingService:
             for owner in reservations
             for path in self.storage_reservation_outputs.get(owner, ())
         }
+        total_limit = getattr(self.settings, "max_media_storage_bytes", None)
+        workspace = 0
+        workspace_floor = getattr(self.settings, "daily_archive_workspace_bytes", 0)
+        if recording and workspace_floor and getattr(self.settings, "daily_archive_enabled", True):
+            active_archives = {
+                key
+                for key, paths in self.storage_reservation_outputs.items()
+                if any(Path(p).parent.name == "daily-exports" for p in paths)
+            }
+            pending = [
+                int(row[1] * 1.2) + 1048576
+                for row in self.db.execute(
+                    "SELECT d.id,coalesce(sum(json_extract(s.body,'$.size_bytes')),0) "
+                    "FROM daily_recordings d JOIN daily_segments s ON s.day_id=d.id "
+                    "WHERE d.status IN ('recording','finalizing','closed') AND s.status='ready' "
+                    "AND json_extract(d.body,'$.archive_state')!='mp4' GROUP BY d.id"
+                )
+                if row[0] not in active_archives
+            ]
+            # One archive runs at a time. Its reservation/output already occupies
+            # the working room; do not reserve a *second* full archive during its
+            # read-only verification. Success compacts TS, failure removes MP4.
+            workspace = 0 if active_archives else max([workspace_floor, *pending])
 
         def usage():
-            total = 0
+            guard = getattr(self.recording, "storage_guard", None)
+            if guard is not None:
+                guard()
+            total = media_total = buffer_bytes = 0
             allocated = dict.fromkeys(reservations, 0)
-            for folder in ("daily", "daily-exports", "daily-playback"):
-                for path in (self.recording.root / folder).rglob("*"):
+            categories = ("daily", "daily-exports", "daily-playback")
+            roots = (
+                (self.recording.root,)
+                if total_limit
+                else tuple(self.recording.root / folder for folder in categories)
+            )
+            for root in roots:
+                for path in root.rglob("*"):
                     try:
                         info = path.stat()
                     except FileNotFoundError:
@@ -524,7 +662,12 @@ class DailyRecordingService:
                         continue
                     if not stat.S_ISREG(info.st_mode):
                         continue
-                    total += info.st_size
+                    category = path.relative_to(self.recording.root).parts[0]
+                    media_total += info.st_size
+                    if category in categories:
+                        total += info.st_size
+                    if category == "buffer":
+                        buffer_bytes += info.st_size
                     owner = output_owners.get(path)
                     if owner is not None:
                         # Credit only bytes included above, from this same stat.
@@ -532,13 +675,23 @@ class DailyRecordingService:
             remaining = sum(
                 max(0, planned - allocated[owner]) for owner, planned in reservations.items()
             )
-            return total, shutil.disk_usage(self.recording.root).free, remaining
+            buffer_headroom = (
+                max(0, self.recording.max_buffer_bytes - buffer_bytes) if total_limit else 0
+            )
+            return (
+                total,
+                media_total,
+                shutil.disk_usage(self.recording.root).free,
+                remaining,
+                buffer_headroom,
+            )
 
-        used, free, remaining = await asyncio.to_thread(usage)
+        used, media_used, free, remaining, buffer_headroom = await asyncio.to_thread(usage)
         reserve += remaining
         if (
-            used + reserve > self.settings.max_daily_storage_bytes
-            or free - reserve < self.settings.min_free_storage_bytes
+            used + reserve + workspace > self.settings.max_daily_storage_bytes
+            or (total_limit and media_used + reserve + workspace + buffer_headroom > total_limit)
+            or free - reserve - workspace - buffer_headroom < self.settings.min_free_storage_bytes
         ):
             raise ApiError(
                 503, "INSUFFICIENT_STORAGE", "Daily storage limit or free-space reserve reached."
@@ -586,7 +739,13 @@ class DailyRecordingService:
                     "DAILY_RECORDING_" + day["status"].upper(),
                     "Recording is no longer available.",
                 )
-            return day, self.catalog.segments(recording_id, ready_only=True)
+            rows = self.db.execute(
+                "SELECT body FROM daily_segments WHERE day_id=? AND status='ready' "
+                "ORDER BY start,id",
+                (recording_id,),
+            ).fetchall()
+            segments = await storage_io(lambda: [json.loads(row[0]) for row in rows])
+            return day, segments
 
     async def start(self) -> None:
         await self.tick(self.clock())
@@ -635,7 +794,9 @@ class DailyRecordingService:
                     async with self.lock:
                         with self.db:
                             self._flush_losses(now)
-                            self._refresh(self.catalog.get_day(day["recording_id"]), end)
+                            await self._refresh_async(
+                                self.catalog.get_day(day["recording_id"]), end
+                            )
                             self.db.execute(
                                 "UPDATE daily_cursors SET cursor=? WHERE camera=?", (end, camera)
                             )

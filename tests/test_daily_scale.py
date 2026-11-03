@@ -11,7 +11,7 @@ from camera_media_service.recording import iso
 
 
 def reference_gaps(spans, known):
-    """The published rule: latest overlapping reason wins; unknown loss must exceed 1s."""
+    """Latest overlapping reason wins; every representable uncovered interval stays visible."""
     result = []
     for a, b in spans:
         boundaries = sorted(
@@ -19,7 +19,7 @@ def reference_gaps(spans, known):
         )
         for left, right in zip(boundaries, boundaries[1:], strict=False):
             reasons = [r["reason"] for r in known if r["start"] < right and r["end"] > left]
-            if reasons or right - left > 1:
+            if iso(left) != iso(right):
                 reason = reasons[-1] if reasons else "UNKNOWN_CAPTURE_LOSS"
                 if (
                     result

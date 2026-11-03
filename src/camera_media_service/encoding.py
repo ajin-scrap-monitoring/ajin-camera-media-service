@@ -12,7 +12,9 @@ import uuid
 from pathlib import Path
 
 from camera_media_service.daily_models import StoredFrame
+from camera_media_service.media_files import storage_io
 from camera_media_service.media_info import MEDIA_INFO_FILTER, parse_media_info
+from camera_media_service.persisted_media_info import file_identity, publish_generated_info
 
 
 async def start_media_process(*args, **kwargs):
@@ -21,19 +23,31 @@ async def start_media_process(*args, **kwargs):
     try:
         return await asyncio.shield(creation)
     except asyncio.CancelledError:
-        child = await creation
-        if child.returncode is None:
+
+        async def reap_created_child():
+            child = await creation
+            if child.returncode is None:
+                try:
+                    child.kill()
+                except ProcessLookupError:
+                    pass
+            await child.communicate()
+
+        cleanup = asyncio.create_task(reap_created_child())
+        while True:
             try:
-                child.kill()
-            except ProcessLookupError:
-                pass
-        await child.communicate()
+                await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError:
+                # Keep both handle retrieval and pipe draining owned through
+                # repeated cancellation, until the OS child has been reaped.
+                continue
         raise
 
 
 async def encode_clip(
     ffmpeg: str, buffer: Path, output: Path, clip_id: str, frames: list[tuple[str, float]]
-) -> None:
+) -> dict:
     manifest = output / f"{clip_id}.ffconcat"
     temporary = output / f"{clip_id}.tmp.mp4"
     final = output / f"{clip_id}.mp4"
@@ -45,10 +59,10 @@ async def encode_clip(
             (f"file '../buffer/{name}'", "option framerate 1000", f"duration {duration:.6f}")
         )
     lines.extend((f"file '../buffer/{frames[-1][0]}'", "option framerate 1000"))
-    await asyncio.to_thread(manifest.write_text, "\n".join(lines) + "\n", encoding="utf-8")
     process = None
     try:
-        process = await asyncio.create_subprocess_exec(
+        await storage_io(manifest.write_text, "\n".join(lines) + "\n", encoding="utf-8")
+        process = await start_media_process(
             ffmpeg,
             "-hide_banner",
             "-loglevel",
@@ -83,7 +97,9 @@ async def encode_clip(
         _, error = await asyncio.wait_for(process.communicate(), timeout=900)
         if process.returncode != 0:
             raise RuntimeError(f"FFmpeg encoding failed: {error[-2000:].decode(errors='replace')}")
-        await asyncio.to_thread(os.replace, temporary, final)
+        metadata = await probe_media(ffmpeg, temporary, full_decode=False)
+        await publish_generated_info(metadata, temporary, final)
+        return metadata
     finally:
         if process is not None and process.returncode is None:
             process.kill()
@@ -94,6 +110,7 @@ async def encode_clip(
 
 async def probe_media(ffmpeg: str, path: Path, *, full_decode: bool = True) -> dict:
     """Read actual container duration and validate every video packet by decoding."""
+    initial = file_identity(await asyncio.to_thread(path.stat))
     process = await start_media_process(
         ffmpeg,
         "-hide_banner",
@@ -134,11 +151,15 @@ async def probe_media(ffmpeg: str, path: Path, *, full_decode: bool = True) -> d
     )
     if duration <= 0:
         raise RuntimeError("Empty video")
-    size_bytes = path.stat().st_size
+    final = file_identity(await asyncio.to_thread(path.stat))
+    if initial != final:
+        raise RuntimeError("Media changed during verification")
+    size_bytes = final[2]
     return {
         "duration": duration,
         "size_bytes": size_bytes,
         "media_info": parse_media_info(text, size_bytes),
+        "_file_identity": final,
     }
 
 
@@ -147,6 +168,9 @@ async def encode_daily_segment(
 ) -> dict:
     if not frames:
         raise ValueError("No frames to encode")
+    guard = profile.get("_storage_guard")
+    if guard is not None:
+        await storage_io(guard)
     fps = profile["fps"]
     deltas = [
         b.received_at - a.received_at
@@ -154,10 +178,15 @@ async def encode_daily_segment(
         if 0 < b.received_at - a.received_at <= 1
     ]
     tail = statistics.median(deltas) if deltas else 1 / fps
-    end_at = min(frames[-1].received_at + tail, profile.get("end_at", float("inf")))
+    # A real successor receipt across the slot cut proves the final JPEG's
+    # display interval. Without that evidence retain the bounded cadence tail.
+    end_at = min(
+        profile.get("verified_end_at", frames[-1].received_at + tail),
+        profile.get("end_at", float("inf")),
+    )
     duration = max(0.001, end_at - frames[0].received_at)
     manifest = buffer / f"{uuid.uuid4()}.ffconcat"
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    await storage_io(destination.parent.mkdir, parents=True, exist_ok=True)
     temporary = destination.with_suffix(".tmp.ts")
     lines = ["ffconcat version 1.0"]
     for i, frame in enumerate(frames):
@@ -170,7 +199,6 @@ async def encode_daily_segment(
             (f"file '{frame.path}'", "option framerate 1000", f"duration {max(0.001, delta):.6f}")
         )
     lines.extend((f"file '{frames[-1].path}'", "option framerate 1000"))
-    await asyncio.to_thread(manifest.write_text, "\n".join(lines) + "\n", encoding="utf-8")
     width, height = profile["width"], profile["height"]
     filters = (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
@@ -178,7 +206,8 @@ async def encode_daily_segment(
     )
     process = None
     try:
-        process = await asyncio.create_subprocess_exec(
+        await storage_io(manifest.write_text, "\n".join(lines) + "\n", encoding="utf-8")
+        process = await start_media_process(
             ffmpeg,
             "-hide_banner",
             "-loglevel",
@@ -243,15 +272,26 @@ async def encode_daily_segment(
                 file.flush()
                 os.fsync(file.fileno())
 
-        await asyncio.to_thread(prepare)
-        await asyncio.to_thread(os.replace, temporary, destination)
+        if guard is not None:
+            await storage_io(guard)
+        await storage_io(prepare)
+        await publish_generated_info(metadata, temporary, destination)
         return metadata
     finally:
         if process is not None and process.returncode is None:
             process.kill()
             await process.communicate()
-        manifest.unlink(missing_ok=True)
-        temporary.unlink(missing_ok=True)
+
+        def cleanup():
+            if guard is not None:
+                try:
+                    guard()
+                except OSError:
+                    return  # Never clean up a fallback filesystem after mount loss.
+            manifest.unlink(missing_ok=True)
+            temporary.unlink(missing_ok=True)
+
+        await storage_io(cleanup)
 
 
 async def merge_daily_mp4(ffmpeg: str, segments: list[dict], temporary: Path, final: Path) -> dict:
@@ -268,9 +308,9 @@ async def merge_daily_mp4(ffmpeg: str, segments: list[dict], temporary: Path, fi
     for segment in segments:
         path = Path(segment["path"]).as_posix()
         lines.extend((f"file '../{path}'", f"duration {segment['duration']:.6f}"))
-    await asyncio.to_thread(manifest.write_text, "\n".join(lines) + "\n", encoding="utf-8")
     process = None
     try:
+        await storage_io(manifest.write_text, "\n".join(lines) + "\n", encoding="utf-8")
         process = await start_media_process(
             ffmpeg,
             "-hide_banner",
@@ -304,7 +344,7 @@ async def merge_daily_mp4(ffmpeg: str, segments: list[dict], temporary: Path, fi
             0.1, len(segments) / 90000
         ):
             raise RuntimeError("Export duration differs from saved media")
-        await asyncio.to_thread(os.replace, temporary, final)
+        await publish_generated_info(metadata, temporary, final)
         return metadata
     finally:
         if process is not None and process.returncode is None:
@@ -316,6 +356,7 @@ async def merge_daily_mp4(ffmpeg: str, segments: list[dict], temporary: Path, fi
 
 async def verify_archive(ffmpeg: str, path: Path, segments: list[dict]) -> dict:
     """Decode every frame once before discarding TS; never encode another video."""
+    initial = file_identity(await asyncio.to_thread(path.stat))
     if not segments or len({json.dumps(s["profile"], sort_keys=True) for s in segments}) != 1:
         raise RuntimeError("EXPORT_INCOMPATIBLE_MEDIA")
     process = await start_media_process(
@@ -373,10 +414,14 @@ async def verify_archive(ffmpeg: str, path: Path, segments: list[dict]) -> dict:
                 os.close(directory)
 
     await asyncio.to_thread(durable)
-    size_bytes = path.stat().st_size
+    final = file_identity(await asyncio.to_thread(path.stat))
+    if initial != final:
+        raise RuntimeError("Media changed during verification")
+    size_bytes = final[2]
     return {
         "duration": duration,
         "size_bytes": size_bytes,
         "packet_count": packet_count,
         "media_info": parse_media_info(text, size_bytes),
+        "_file_identity": final,
     }

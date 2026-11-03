@@ -9,7 +9,11 @@ services:
       - "127.0.0.1:8889:8889"
       - "127.0.0.1:18443:8443"
     volumes:
-      - "${MEDIA_DATA_DIR:-/var/lib/ajin-camera-media}:/var/lib/camera-media"
+      - type: bind
+        source: ${MEDIA_DATA_DIR:-/var/lib/ajin-camera-media}
+        target: /var/lib/camera-media
+        bind:
+          create_host_path: false
     networks:
       media:
         aliases:

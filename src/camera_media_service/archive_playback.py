@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from camera_media_service.media_files import open_media_file, storage_io
 from camera_media_service.recording import ApiError, epoch
 
 
@@ -25,6 +26,9 @@ class ArchivedPlaybackService:
         if min(max_bytes, ttl_seconds, max_jobs, concurrency) <= 0:
             raise ValueError("Playback limits must be positive")
         self.daily = daily
+        guard = getattr(daily.recording, "storage_guard", None)
+        if guard is not None:
+            guard()
         self.root = daily.recording.root / "daily-playback"
         self.root.mkdir(exist_ok=True)
         if not self.root.resolve().is_relative_to(daily.recording.root.resolve()):
@@ -51,13 +55,16 @@ class ArchivedPlaybackService:
 
     def _unlink(self, path):
         try:
+            guard = getattr(self.daily.recording, "storage_guard", None)
+            if guard is not None:
+                guard()
             path.unlink(missing_ok=True)
             return True
         except OSError:
             # In particular, Windows does not unlink a response's open handle.
             return False
 
-    def _snapshot(self, recording_id, segment_id):
+    async def _snapshot(self, recording_id, segment_id):
         day = self.daily.catalog.get_day(recording_id)
         if day["status"] in ("deleted", "expired"):
             raise ApiError(
@@ -78,6 +85,12 @@ class ArchivedPlaybackService:
             or day["export_state"] != "ready"
         ):
             raise ApiError(409, "PLAYBACK_NOT_READY", "Archived media is not ready.")
+        return await storage_io(self._mapping, item)
+
+    def _mapping(self, item):
+        guard = getattr(self.daily.recording, "storage_guard", None)
+        if guard is not None:
+            guard()
         try:
             relative = Path(item["archive_path"])
             source = (self.daily.recording.root / relative).resolve()
@@ -134,6 +147,9 @@ class ArchivedPlaybackService:
         return total
 
     def _evict(self, now, reserve=0):
+        guard = getattr(self.daily.recording, "storage_guard", None)
+        if guard is not None:
+            guard()
         self._prune_orphans()
         for key, entry in sorted(self.entries.items(), key=lambda pair: pair[1][1]):
             total = self._disk_bytes()
@@ -154,9 +170,9 @@ class ArchivedPlaybackService:
         async with self.daily.lock:
             if self.closed:
                 raise ApiError(503, "PLAYBACK_UNAVAILABLE", "Playback service is stopping.")
-            item, source, offset, duration = self._snapshot(*key)
-            self._evict(self.daily.clock())
-            cached = self._open_cached(key)
+            item, source, offset, duration = await self._snapshot(*key)
+            await storage_io(self._evict, self.daily.clock())
+            cached = await self._cached(key)
             if cached:
                 return cached
             job = self.jobs.get(key)
@@ -164,14 +180,19 @@ class ArchivedPlaybackService:
                 if len(self.jobs) >= self.max_jobs:
                     raise ApiError(503, "PLAYBACK_CAPACITY_EXCEEDED", "Playback queue is full.")
                 reserve = min(self.max_bytes, max(65536, int(item["size_bytes"] * 1.2) + 4096))
-                if not self._evict(self.daily.clock(), reserve):
+                if not await storage_io(self._evict, self.daily.clock(), reserve):
                     raise self._storage_error()
+                cache = await storage_io(self._cache_path, key)
                 job = _Job("hls:" + str(uuid.uuid4()), reserve)
                 with self.daily.db:
                     self.daily.db.execute(
                         "INSERT INTO clip_recording_pins VALUES(?,?)", (job.owner, recording_id)
                     )
                 self.daily.storage_reservations[job.owner] = reserve
+                self.daily.storage_reservation_outputs[job.owner] = (
+                    cache,
+                    cache.with_suffix(".tmp"),
+                )
                 self.jobs[key] = job
                 job.task = asyncio.create_task(self._prepare(key, job, source, offset, duration))
             job.waiters += 1
@@ -180,8 +201,8 @@ class ArchivedPlaybackService:
             async with self.daily.lock:
                 # Retention may have changed state after preparation released its
                 # source lease. Open the response handle in the same critical section.
-                self._snapshot(*key)
-                cached = self._open_cached(key)
+                await self._snapshot(*key)
+                cached = await self._cached(key)
                 if not cached:
                     raise self._storage_error()
                 return cached
@@ -198,13 +219,15 @@ class ArchivedPlaybackService:
                     if self.jobs.get(key) is job:
                         self.jobs.pop(key, None)
 
-    def _open_cached(self, key):
+    async def _cached(self, key):
         if key not in self.entries:
             return None
         try:
-            file = self._cache_path(key).open("rb")
-            size = file.seek(0, 2)
-            file.seek(0)
+            file, size = await open_media_file(
+                self.root / key[0] / (key[1] + ".ts"),
+                root=self.root,
+                guard=getattr(self.daily.recording, "storage_guard", None),
+            )
         except OSError:
             self.entries.pop(key, None)
             return None
@@ -215,16 +238,21 @@ class ArchivedPlaybackService:
         with self.daily.db:
             self.daily.db.execute("DELETE FROM clip_recording_pins WHERE clip_id=?", (job.owner,))
         self.daily.storage_reservations.pop(job.owner, None)
+        self.daily.storage_reservation_outputs.pop(job.owner, None)
         job.reserve = 0
 
     async def _prepare(self, key, job, source, offset, duration):
-        temporary = self._cache_path(key).with_suffix(".tmp")
+        temporary = self.root / key[0] / (key[1] + ".tmp")
         process = None
         try:
+            await storage_io(self._cache_path, key)
             async with self.slot:
                 # check_space may acquire the daily lock in future implementations.
                 await self.daily.check_space()
-                temporary.parent.mkdir(parents=True, exist_ok=True)
+                guard = getattr(self.daily.recording, "storage_guard", None)
+                if guard is not None:
+                    await storage_io(guard)
+                await storage_io(temporary.parent.mkdir, parents=True, exist_ok=True)
                 creation = asyncio.create_task(
                     asyncio.create_subprocess_exec(
                         self.daily.recording.ffmpeg,
@@ -265,12 +293,19 @@ class ArchivedPlaybackService:
 
                 async def copy():
                     size = 0
-                    with temporary.open("xb") as file:
+                    file, _ = await open_media_file(
+                        temporary, root=self.root, guard=guard, mode="xb"
+                    )
+                    try:
                         while chunk := await process.stdout.read(65536):
                             size += len(chunk)
                             if size > job.reserve:
                                 raise self._storage_error()
-                            file.write(chunk)
+                            if guard is not None:
+                                await storage_io(guard)
+                            await storage_io(file.write, chunk)
+                    finally:
+                        await storage_io(file.close)
                     await process.wait()
                     if process.returncode or not size:
                         raise self._storage_error()
@@ -278,8 +313,9 @@ class ArchivedPlaybackService:
 
                 size = await asyncio.wait_for(copy(), timeout=120)
                 async with self.daily.lock:
-                    self._snapshot(*key)
-                    temporary.replace(self._cache_path(key))
+                    await self._snapshot(*key)
+                    destination = await storage_io(self._cache_path, key)
+                    await storage_io(temporary.replace, destination)
                     self.entries[key] = size, self.daily.clock()
         except (OSError, RuntimeError, TimeoutError) as exc:
             raise self._storage_error() from exc
@@ -295,13 +331,13 @@ class ArchivedPlaybackService:
                 while await process.stdout.read(65536):
                     pass
                 await process.wait()
-            self._unlink(temporary)
+            await storage_io(self._unlink, temporary)
             async with self.daily.lock:
                 self._release(job)
 
     async def maintenance(self, now: float):
         async with self.daily.lock:
-            self._evict(now)
+            await storage_io(self._evict, now)
 
     async def close(self):
         async with self.daily.lock:
@@ -314,4 +350,4 @@ class ArchivedPlaybackService:
             for job in jobs:
                 self._release(job)
             self.jobs.clear()
-            self._evict(float("inf"))
+            await storage_io(self._evict, float("inf"))

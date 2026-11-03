@@ -21,7 +21,7 @@ def build_available_intervals(segments: list[dict], gaps: list[dict] = ()) -> li
             and loss_cursor < len(losses)
             and losses[loss_cursor][0] < segment["start_at"]
         )
-        if intervals and 0 <= segment["start_at"] - previous_end <= 1 and not known_loss:
+        if intervals and iso(segment["start_at"]) == intervals[-1]["end_at"] and not known_loss:
             intervals[-1].update(end_at=iso(segment["end_at"]), playback_end_seconds=round(end, 3))
         else:
             intervals.append(

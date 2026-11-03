@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import uuid
 from collections import OrderedDict
 
 from camera_media_service.media_info import inspect_media_info, unknown_media_info
+from camera_media_service.persisted_media_info import (
+    file_identity,
+    load_measured_info,
+    load_verified_archive,
+    record_generated_info,
+)
 from camera_media_service.recording import ApiError
 
 
@@ -30,30 +37,118 @@ class MediaDetails:
         self.slot = asyncio.Semaphore(2)
         self.active = 0
         self.cache = OrderedDict()
+        self.flights = {}
+        self.db = getattr(recording, "db", None)
+
+    async def _identity(self, path):
+        return file_identity(await asyncio.to_thread(path.stat))
+
+    def _remember(self, fingerprint, result):
+        self.cache[fingerprint] = dict(result)
+        self.cache.move_to_end(fingerprint)
+        while len(self.cache) > 128:
+            self.cache.popitem(last=False)
 
     async def inspect(self, path):
         try:
-            stat = await asyncio.to_thread(path.stat)
+            identity = await self._identity(path)
         except OSError:
             return unknown_media_info("file_unavailable")
-        fingerprint = (str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-        if fingerprint in self.cache:
-            self.cache.move_to_end(fingerprint)
-            return dict(self.cache[fingerprint])
-        if self.active >= 8:
-            raise ApiError(503, "METADATA_CAPACITY_EXCEEDED", "Media inspection queue is full.")
-        self.active += 1
+        fingerprint = (str(path), *identity)
+        result = self.cache.get(fingerprint)
+        persisted = (
+            load_measured_info(self.db, self.recording.root, path, identity) if self.db else None
+        )
+        if result is None:
+            result = persisted
+        if result is not None:
+            try:
+                if await self._identity(path) != identity:
+                    return unknown_media_info("file_changed")
+            except OSError:
+                return unknown_media_info("file_unavailable")
+            if self.db is not None and persisted is None:
+                await self._persist(path, identity, result)
+                try:
+                    if await self._identity(path) != identity:
+                        return unknown_media_info("file_changed")
+                except OSError:
+                    return unknown_media_info("file_unavailable")
+            self._remember(fingerprint, result)
+            return dict(result)
+        flight = self.flights.get(fingerprint)
+        if flight is None:
+            if self.active >= 8:
+                raise ApiError(503, "METADATA_CAPACITY_EXCEEDED", "Media inspection queue is full.")
+            self.active += 1
+            flight = {
+                "task": asyncio.create_task(self._probe(path, identity, fingerprint)),
+                "waiters": 0,
+            }
+            self.flights[fingerprint] = flight
+        flight["waiters"] += 1
+        try:
+            return dict(await asyncio.shield(flight["task"]))
+        finally:
+            flight["waiters"] -= 1
+            if not flight["waiters"]:
+                if not flight["task"].done():
+                    flight["task"].cancel()
+                    cleanup = asyncio.gather(flight["task"], return_exceptions=True)
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            # Repeated shutdown cancellation cannot detach the
+                            # probe while its child process is being reaped.
+                            continue
+                if self.flights.get(fingerprint) is flight:
+                    self.flights.pop(fingerprint, None)
+
+    async def _probe(self, path, identity, fingerprint):
         try:
             async with self.slot:
+                # Queueing can outlive the original file; never probe its replacement
+                # under the previous identity.
+                try:
+                    if await self._identity(path) != identity:
+                        return unknown_media_info("file_changed")
+                except OSError:
+                    return unknown_media_info("file_unavailable")
                 result = await inspect_media_info(self.recording.ffmpeg, path)
+            try:
+                if await self._identity(path) != identity:
+                    return unknown_media_info("file_changed")
+            except OSError:
+                return unknown_media_info("file_unavailable")
             if result["status"] == "ready":
-                self.cache[fingerprint] = dict(result)
-                self.cache.move_to_end(fingerprint)
-                while len(self.cache) > 128:
-                    self.cache.popitem(last=False)
+                if self.db is not None:
+                    await self._persist(path, identity, result)
+                    try:
+                        if await self._identity(path) != identity:
+                            return unknown_media_info("file_changed")
+                    except OSError:
+                        return unknown_media_info("file_unavailable")
+                self._remember(fingerprint, result)
             return result
         finally:
             self.active -= 1
+
+    async def _persist(self, path, identity, result):
+        async with self.recording.lock:
+            try:
+                if await self._identity(path) != identity:
+                    return
+                record_generated_info(
+                    self.db,
+                    self.recording.root,
+                    path,
+                    {"media_info": result, "_file_identity": identity},
+                )
+            except (sqlite3.Error, OSError):
+                # Metadata is optional; primary ready state and measured values
+                # remain usable, and a later cache hit retries the missing save.
+                pass
 
     async def clip(self, clip_id):
         async with self.recording.lock:
@@ -76,40 +171,66 @@ class MediaDetails:
             "thumbnail": thumbnail_info(),
         }
 
-    @staticmethod
-    def _clip_access(body):
+    def _clip_access(self, body):
+        self.recording._camera(body["camera_id"])
         if body["status"] in ("deleted", "expired"):
             raise ApiError(410, "CLIP_" + body["status"].upper(), "Clip is no longer available.")
         if body["status"] != "ready":
             raise ApiError(409, "CLIP_NOT_READY", "Clip is not ready.")
 
+    async def _stored_segment_info(self, path):
+        try:
+            identity = await self._identity(path)
+            result = load_measured_info(self.db, self.recording.root, path, identity)
+            if result is not None and await self._identity(path) == identity:
+                return result
+        except OSError:
+            pass
+        return None
+
     async def day(self, recording_id):
         owner = "info:" + str(uuid.uuid4())
         async with self.recording.lock:
             day = self.daily.catalog.get_day(recording_id)
+            self.recording._camera(day["camera_id"])
             self.exports._accessible(day)
             parts = self.daily.catalog.segments(recording_id, ready_only=True)
             master = self.exports._path(recording_id) if day["export_state"] == "ready" else None
-            sample = next(
-                (
-                    p
-                    for p in parts
-                    if not p.get("media_info") or p["media_info"]["status"] != "ready"
-                ),
-                None,
-            )
-            sample_path = None
-            if sample and day.get("archive_state") != "mp4":
-                sample_path = (self.recording.root / sample["path"]).resolve()
-                if not sample_path.is_relative_to((self.recording.root / "daily").resolve()):
-                    raise ApiError(503, "STORAGE_UNAVAILABLE", "Media path is unavailable.")
             with self.recording.db:
                 self.recording.db.execute(
                     "INSERT INTO clip_recording_pins VALUES(?,?)", (owner, recording_id)
                 )
         try:
             file_info = await self.inspect(master) if master else None
-            sample_info = await self.inspect(sample_path) if sample_path else None
+            sample, sample_info = None, None
+            if day.get("archive_state") != "mp4":
+                # A day-info demand validates only that day's files. Startup and
+                # day listing never scan historical media or start probe work.
+                for part in parts:
+                    path = (self.recording.root / part["path"]).resolve()
+                    if not path.is_relative_to((self.recording.root / "daily").resolve()):
+                        raise ApiError(503, "STORAGE_UNAVAILABLE", "Media path is unavailable.")
+                    part["media_info"] = await self._stored_segment_info(path)
+                    if sample is None and part["media_info"] is None:
+                        sample, sample_path = part, path
+                if sample is not None:
+                    sample_info = await self.inspect(sample_path)
+            else:
+                association = None
+                if master:
+                    try:
+                        identity = await self._identity(master)
+                        association = load_verified_archive(
+                            self.db, self.recording.root, master, identity
+                        )
+                        if await self._identity(master) != identity:
+                            association = None
+                    except OSError:
+                        pass
+                # A header re-probe cannot attest historical per-segment formats.
+                # Only a full archive generation/verification can establish this link.
+                for part in parts:
+                    part["media_info"] = (association or {}).get(part["segment_id"])
             formats = {}
             measured = 0
             for part in parts:

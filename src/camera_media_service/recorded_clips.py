@@ -9,6 +9,7 @@ import re
 import sqlite3
 import uuid
 
+from camera_media_service.persisted_media_info import record_generated_info
 from camera_media_service.recording import ACTIVE, ApiError, epoch, iso
 
 LOG = logging.getLogger(__name__)
@@ -298,6 +299,10 @@ class RecordedClipService:
                 )
             task = asyncio.create_task(self._process(clip_id, slices))
             self.daily.storage_reservations[clip_id] = reserve
+            self.daily.storage_reservation_outputs[clip_id] = (
+                self.recording.clips / f"{clip_id}.tmp.mp4",
+                self.recording.clips / f"{clip_id}.mp4",
+            )
             self.jobs[clip_id] = task
             task.add_done_callback(lambda done, key=clip_id: self._done(key, done))
             return body, True
@@ -305,6 +310,8 @@ class RecordedClipService:
     def _done(self, key, task):
         if self.jobs.get(key) is task:
             self.jobs.pop(key, None)
+            self.daily.storage_reservations.pop(key, None)
+            self.daily.storage_reservation_outputs.pop(key, None)
         if not task.cancelled() and task.exception():
             LOG.error("Recorded clip failed", exc_info=task.exception())
 
@@ -314,12 +321,15 @@ class RecordedClipService:
             async with self.recording.encoding_slot:
                 from camera_media_service.clip_media import remux_clip
 
+                await asyncio.to_thread(self.recording.storage_guard)
                 metadata = await remux_clip(
                     self.recording.ffmpeg,
                     self.recording.root,
                     slices,
                     self.recording.clips / f"{clip_id}.mp4",
                 )
+                self.daily.storage_reservations[clip_id] = 0
+                await self.daily.check_space()
         except asyncio.CancelledError:
             error = {"code": "JOB_INTERRUPTED", "message": "Clip preparation interrupted."}
         except (OSError, RuntimeError, TimeoutError, ApiError) as exc:
@@ -336,6 +346,12 @@ class RecordedClipService:
                         if error:
                             body.update(status="failed", error=error)
                         else:
+                            record_generated_info(
+                                self.db,
+                                self.recording.root,
+                                self.recording.clips / f"{clip_id}.mp4",
+                                metadata,
+                            )
                             now = self.daily.clock()
                             body.update(
                                 status="ready",
@@ -356,6 +372,7 @@ class RecordedClipService:
                         )
                         self.db.execute("DELETE FROM clip_sources WHERE clip_id=?", (clip_id,))
                 self.daily.storage_reservations.pop(clip_id, None)
+                self.daily.storage_reservation_outputs.pop(clip_id, None)
                 break
             except sqlite3.Error:
                 LOG.exception("Retrying recorded clip result persistence: %s", clip_id)
@@ -392,3 +409,4 @@ class RecordedClipService:
                     self.db.execute("DELETE FROM clip_recording_pins WHERE clip_id=?", (key,))
                     self.db.execute("DELETE FROM clip_sources WHERE clip_id=?", (key,))
                     self.daily.storage_reservations.pop(key, None)
+                    self.daily.storage_reservation_outputs.pop(key, None)

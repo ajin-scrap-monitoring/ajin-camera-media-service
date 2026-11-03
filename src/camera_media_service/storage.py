@@ -53,10 +53,12 @@ class RingBufferIndex:
 
 
 class LocalStorageBackend:
-    def __init__(self, media_root: str) -> None:
+    def __init__(self, media_root: str, *, storage_guard=None) -> None:
         self.media_root = Path(media_root)
+        self.storage_guard = storage_guard or (lambda: None)
 
     def _sync_write(self, envelope: FrameEnvelope) -> str:
+        self.storage_guard()
         dt = datetime.datetime.fromtimestamp(envelope.received_at, tz=datetime.UTC)
         date_str = dt.strftime("%Y%m%d")
         hour_str = dt.strftime("%H")

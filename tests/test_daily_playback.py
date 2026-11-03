@@ -9,14 +9,14 @@ def playback():
     return importlib.import_module("camera_media_service.daily_playback")
 
 
-def test_normal_frame_jitter_merges_but_confirmed_short_loss_does_not():
+def test_unrepresented_frame_jitter_and_confirmed_short_loss_stay_separate():
     from camera_media_service.recording import iso
 
     segments = [
         {"start_at": 100.0, "end_at": 110.0, "duration": 10.0},
         {"start_at": 110.02, "end_at": 120.0, "duration": 9.98},
     ]
-    assert len(playback().build_available_intervals(segments)) == 1
+    assert len(playback().build_available_intervals(segments)) == 2
     assert (
         len(
             playback().build_available_intervals(

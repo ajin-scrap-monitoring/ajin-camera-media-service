@@ -3,13 +3,67 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 
 from aiohttp import web
 
 
+async def _settle_worker(task):
+    # A second cancellation must not cancel the worker's asyncio wrapper while
+    # its OS operation still owns a handle, lease, or catalogue lock.
+    completion = asyncio.gather(task, return_exceptions=True)
+    while True:
+        try:
+            return (await asyncio.shield(completion))[0]
+        except asyncio.CancelledError:
+            continue
+
+
+async def storage_io(function, /, *args, **kwargs):
+    """Keep a lease/lock until the file worker finishes, including cancellation."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await _settle_worker(task)
+        raise
+
+
+async def open_media_file(path, *, root=None, guard=None, mode="rb"):
+    """Open and inspect the same handle off-loop while the caller retains its lock."""
+
+    def opened():
+        if guard is not None:
+            guard()
+        if root is not None and not path.resolve().is_relative_to(root.resolve()):
+            raise OSError("Invalid media path")
+        file = path.open(mode)
+        try:
+            return file, os.fstat(file.fileno()).st_size
+        except BaseException:
+            file.close()
+            raise
+
+    task = asyncio.create_task(asyncio.to_thread(opened))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        result = await _settle_worker(task)
+        if isinstance(result, tuple):
+            await storage_io(result[0].close)
+        raise
+
+
 async def stream_file(
-    request, file, *, size: int, filename: str, content_type: str, cache_control: str = "no-store"
+    request,
+    file,
+    *,
+    size: int,
+    filename: str,
+    content_type: str,
+    cache_control: str = "no-store",
+    guard=None,
 ) -> web.StreamResponse:
     try:
         start, end, status = 0, size - 1, 200
@@ -51,11 +105,17 @@ async def stream_file(
         await response.prepare(request)
         if request.method == "HEAD":
             return response
-        file.seek(start)
+        await storage_io(file.seek, start)
         remaining = end - start + 1
+
+        def read_chunk(length):
+            if guard is not None:
+                guard()
+            return file.read(length)
+
         try:
             while remaining:
-                data = await asyncio.to_thread(file.read, min(65536, remaining))
+                data = await storage_io(read_chunk, min(65536, remaining))
                 if not data:
                     break
                 await asyncio.wait_for(response.write(data), 30)
@@ -65,4 +125,4 @@ async def stream_file(
                 request.transport.close()
         return response
     finally:
-        file.close()
+        await storage_io(file.close)
