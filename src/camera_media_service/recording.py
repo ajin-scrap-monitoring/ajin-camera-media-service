@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
 import shutil
 import sqlite3
@@ -204,19 +205,26 @@ class RecordingService:
             def scan():
                 self.storage_guard()
                 non_buffer, allocated = 0, dict.fromkeys(reservations, 0)
-                for path in self.root.rglob("*"):
-                    try:
-                        info = path.stat()
-                    except FileNotFoundError:
-                        continue
-                    if not stat.S_ISREG(info.st_mode):
-                        continue
-                    parts = path.relative_to(self.root).parts
-                    if len(parts) > 1 and parts[0] != "buffer":
-                        non_buffer += info.st_size
-                    key = owners.get(path)
-                    if key in allocated:
-                        allocated[key] += info.st_size
+                # JPEG bytes are already maintained in the frame catalogue.
+                # Do not walk/stat that hot directory again on every reservation
+                # change; only non-buffer files need a physical snapshot.
+                for directory, children, filenames in os.walk(self.root):
+                    folder = Path(directory)
+                    if folder == self.root:
+                        children[:] = [name for name in children if name != "buffer"]
+                    for name in filenames:
+                        path = folder / name
+                        try:
+                            info = path.stat()
+                        except FileNotFoundError:
+                            continue
+                        if not stat.S_ISREG(info.st_mode):
+                            continue
+                        if folder != self.root:
+                            non_buffer += info.st_size
+                        key = owners.get(path)
+                        if key in allocated:
+                            allocated[key] += info.st_size
                 return non_buffer, allocated
 
             non_buffer, allocated = await asyncio.to_thread(scan)

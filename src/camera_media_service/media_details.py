@@ -7,6 +7,7 @@ import sqlite3
 import uuid
 from collections import OrderedDict
 
+from camera_media_service.media_files import storage_io
 from camera_media_service.media_info import inspect_media_info, unknown_media_info
 from camera_media_service.persisted_media_info import (
     file_identity,
@@ -206,9 +207,10 @@ class MediaDetails:
             if day.get("archive_state") != "mp4":
                 # A day-info demand validates only that day's files. Startup and
                 # day listing never scan historical media or start probe work.
+                directory = await storage_io((self.recording.root / "daily").resolve)
                 for part in parts:
-                    path = (self.recording.root / part["path"]).resolve()
-                    if not path.is_relative_to((self.recording.root / "daily").resolve()):
+                    path = await storage_io((self.recording.root / part["path"]).resolve)
+                    if not path.is_relative_to(directory):
                         raise ApiError(503, "STORAGE_UNAVAILABLE", "Media path is unavailable.")
                     part["media_info"] = await self._stored_segment_info(path)
                     if sample is None and part["media_info"] is None:

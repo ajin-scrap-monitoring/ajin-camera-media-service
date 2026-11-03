@@ -30,6 +30,8 @@ class DailyCatalog:
                 id INTEGER PRIMARY KEY, camera TEXT NOT NULL, start REAL NOT NULL,
                 end REAL NOT NULL, reason TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS daily_gap_time ON daily_gaps(camera,start,end);
+            CREATE INDEX IF NOT EXISTS daily_gap_recent ON daily_gaps(camera,reason,end,start);
+            CREATE INDEX IF NOT EXISTS daily_gap_end ON daily_gaps(camera,end,start);
             CREATE TABLE IF NOT EXISTS daily_exports(
                 day_id TEXT PRIMARY KEY, status TEXT NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS clip_recording_pins(
