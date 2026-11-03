@@ -109,3 +109,180 @@ async def test_buffer_budget_does_not_restat_every_catalogued_jpeg(tmp_path, mon
             await recording._check_buffer_capacity(0)
     finally:
         await recording.close()
+
+
+class SlowCatalog:
+    def __init__(self, connection):
+        self.connection = connection
+        self.slow_threads = []
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    def execute(self, sql, *args):
+        if sql.endswith("status='ready' ORDER BY start,id"):
+            self.slow_threads.append(threading.get_ident())
+            time.sleep(0.04)
+        return self.connection.execute(sql, *args)
+
+    def commit(self):
+        if self.connection.in_transaction:
+            self.slow_threads.append(threading.get_ident())
+            time.sleep(0.04)
+        return self.connection.commit()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        if kind is None:
+            self.commit()
+        else:
+            self.connection.rollback()
+
+
+@pytest.mark.asyncio
+async def test_daily_snapshot_and_full_commit_do_not_block_live_event_loop(tmp_path, monkeypatch):
+    from test_daily_export import recorded_day
+
+    recording, daily, clock, day = await recorded_day(tmp_path, monkeypatch)
+    original = recording.db
+    proxy = SlowCatalog(original)
+    recording.db = daily.db = daily.catalog.db = proxy
+    owner = threading.get_ident()
+    try:
+        clock[0] += 10
+        await daily.tick(clock[0])
+        assert proxy.slow_threads and owner not in proxy.slow_threads
+        assert original.execute("PRAGMA synchronous").fetchone()[0] == 2
+        assert original.execute("SELECT cursor FROM daily_cursors").fetchone()[0] == clock[0]
+    finally:
+        recording.db = daily.db = daily.catalog.db = original
+        await daily.close()
+        await recording.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_full_commit_retains_lock_and_drains_before_reuse(tmp_path):
+    import asyncio
+    import sqlite3
+
+    from camera_media_service.pipeline import LiveFrameHub
+    from camera_media_service.recording import RecordingService
+    from camera_media_service.store import LatestFrameStore
+
+    recording = RecordingService(tmp_path, {"cam"}, LiveFrameHub(LatestFrameStore()))
+    original = recording.db
+    original.execute("CREATE TABLE transaction_probe(value INTEGER)")
+    original.commit()
+    entered, release = threading.Event(), threading.Event()
+
+    class GateCatalog(SlowCatalog):
+        def commit(self):
+            entered.set()
+            assert release.wait(5)
+            return self.connection.commit()
+
+    recording.db = GateCatalog(original)
+
+    async def writer():
+        async with recording.lock:
+            async with recording.transaction():
+                recording.db.execute("INSERT INTO transaction_probe VALUES(1)")
+
+    task = asyncio.create_task(writer())
+    waiter = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        with sqlite3.connect(tmp_path / "catalog.sqlite3") as observer:
+            assert observer.execute("SELECT count(*) FROM transaction_probe").fetchone()[0] == 0
+        waiter = asyncio.create_task(recording.get_policy("cam"))
+        task.cancel()
+        await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert recording.lock.locked() and not task.done() and not waiter.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await waiter
+        with sqlite3.connect(tmp_path / "catalog.sqlite3") as observer:
+            assert observer.execute("SELECT count(*) FROM transaction_probe").fetchone()[0] == 1
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if waiter is not None:
+            await asyncio.gather(waiter, return_exceptions=True)
+        recording.db = original
+        await recording.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_full_commit_rolls_back_before_catalogue_unlock(tmp_path):
+    import sqlite3
+
+    from camera_media_service.pipeline import LiveFrameHub
+    from camera_media_service.recording import RecordingService
+    from camera_media_service.store import LatestFrameStore
+
+    recording = RecordingService(tmp_path, {"cam"}, LiveFrameHub(LatestFrameStore()))
+    original = recording.db
+    original.execute("CREATE TABLE transaction_probe(value INTEGER)")
+    original.commit()
+
+    class FailedCatalog(SlowCatalog):
+        def commit(self):
+            raise sqlite3.OperationalError("SD sync failed")
+
+    recording.db = FailedCatalog(original)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="SD sync failed"):
+            async with recording.lock:
+                async with recording.transaction():
+                    recording.db.execute("INSERT INTO transaction_probe VALUES(1)")
+        assert not original.in_transaction
+        assert original.execute("SELECT count(*) FROM transaction_probe").fetchone()[0] == 0
+        assert not recording.lock.locked()
+    finally:
+        recording.db = original
+        await recording.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_metadata_read_does_not_share_writer_connection(tmp_path):
+    import json
+
+    from camera_media_service.persisted_media_info import (
+        close_probe_database,
+        ensure_probe_table,
+        file_identity,
+        load_measured_info,
+    )
+    from camera_media_service.pipeline import LiveFrameHub
+    from camera_media_service.recording import RecordingService
+    from camera_media_service.store import LatestFrameStore
+
+    recording = RecordingService(tmp_path, {"cam"}, LiveFrameHub(LatestFrameStore()))
+    path = recording.clips / "probe.mp4"
+    path.write_bytes(b"file")
+    identity = file_identity(path.stat())
+    info = {"status": "ready", "size_bytes": 4}
+    with recording.db:
+        ensure_probe_table(recording.db)
+        recording.db.execute(
+            "INSERT INTO measured_media_files VALUES(?,?,?)",
+            ("clips/probe.mp4", json.dumps(identity), json.dumps(info)),
+        )
+
+    class Writer(SlowCatalog):
+        def execute(self, sql, *args):
+            if sql.startswith("SELECT identity,media_info"):
+                raise AssertionError("Legacy read waited on writer connection mutex")
+            return super().execute(sql, *args)
+
+    owner = Writer(recording.db)
+    try:
+        assert load_measured_info(owner, tmp_path, path, identity) == info
+    finally:
+        close_probe_database(owner)
+        await recording.close()

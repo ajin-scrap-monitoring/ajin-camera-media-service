@@ -15,13 +15,15 @@ from camera_media_service.media_files import storage_io
 LOG = logging.getLogger(__name__)
 METADATA_DATABASE_NAME = "media-info.sqlite3"
 _CONNECTIONS = OrderedDict()
+_LEGACY_CONNECTIONS = OrderedDict()
 
 
 def close_probe_database(db):
     """Release the owner's private connection before its main catalog closes."""
-    connection = _CONNECTIONS.pop(db, None)
-    if connection is not None:
-        connection.close()
+    for cache in (_CONNECTIONS, _LEGACY_CONNECTIONS):
+        connection = cache.pop(db, None)
+        if connection is not None:
+            connection.close()
 
 
 def _metadata_connection(db, root, *, create=False):
@@ -44,6 +46,22 @@ def _metadata_connection(db, root, *, create=False):
     return connection
 
 
+def _legacy_connection(db, root):
+    # A FULL commit may own the writer connection's mutex on a disk worker.
+    # Metadata must never wait on that mutex from the event loop. WAL readers
+    # use their own read-only connection and cannot commit pending frame writes.
+    connection = _LEGACY_CONNECTIONS.get(db)
+    if connection is None:
+        path = Path(root) / "catalog.sqlite3"
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.05)
+        _LEGACY_CONNECTIONS[db] = connection
+        while len(_LEGACY_CONNECTIONS) > 16:
+            _, unused = _LEGACY_CONNECTIONS.popitem(last=False)
+            unused.close()
+    _LEGACY_CONNECTIONS.move_to_end(db)
+    return connection
+
+
 def _lookup(db, root, query, key, identity):
     try:
         connection = _metadata_connection(db, root)
@@ -55,7 +73,7 @@ def _lookup(db, root, query, key, identity):
     # Earlier releases kept measurements in the primary catalog. Reuse them
     # lazily only when their identity still agrees, without migrating/scanning.
     try:
-        row = db.execute(query, (key,)).fetchone()
+        row = _legacy_connection(db, root).execute(query, (key,)).fetchone()
         if row and tuple(json.loads(row[0])) == tuple(identity):
             return json.loads(row[1])
     except (sqlite3.Error, ValueError, TypeError):

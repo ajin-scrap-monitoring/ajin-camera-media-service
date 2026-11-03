@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -93,7 +94,9 @@ class RecordingService:
         self._budget_generation = 0
         self.capacity_reservations = StorageReservations(self._invalidate_budget_snapshot)
         self.capacity_outputs = {}
-        self.db = sqlite3.connect(self.root / "catalog.sqlite3")
+        # Catalogue users serialize through lock. Large daily reads and FULL
+        # commits may run in a drained worker while retaining that same lock.
+        self.db = sqlite3.connect(self.root / "catalog.sqlite3", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
@@ -148,6 +151,20 @@ class RecordingService:
         for path in self.buffer.glob("*.jpg"):
             if path.name not in referenced:
                 path.unlink(missing_ok=True)
+
+    @asynccontextmanager
+    async def transaction(self):
+        """Keep the catalogue lock until FULL commit/rollback finishes on disk."""
+        from camera_media_service.media_files import storage_io
+
+        if not self.lock.locked():
+            raise RuntimeError("Catalogue transaction requires the recording lock")
+        try:
+            yield self.db
+            await storage_io(self.db.commit)
+        except BaseException:
+            await storage_io(self.db.rollback)
+            raise
 
     def _camera(self, camera: str) -> None:
         if camera not in self.cameras:
