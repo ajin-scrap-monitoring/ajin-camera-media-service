@@ -6,14 +6,18 @@ import asyncio
 import json
 import logging
 import secrets
+import shutil
 import sqlite3
+import stat
 import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
 from camera_media_service.daily_models import StoredFrame
+from camera_media_service.persisted_media_info import close_probe_database, record_generated_info
 from camera_media_service.pipeline import FrameEnvelope, LiveFrameHub, RecordingQueue
+from camera_media_service.storage_reservations import StorageReservations
 
 LOG = logging.getLogger(__name__)
 DEFAULT_POLICY = {"pre_roll_seconds": 30, "post_roll_seconds": 30, "retention_days": 30}
@@ -24,6 +28,10 @@ class ApiError(Exception):
     def __init__(self, status: int, code: str, message: str):
         super().__init__(message)
         self.status, self.code, self.message = status, code, message
+
+
+class StorageCapacityError(OSError):
+    code = "INSUFFICIENT_STORAGE"
 
 
 def iso(value: float) -> str:
@@ -62,7 +70,12 @@ class RecordingService:
         ffmpeg: str = "ffmpeg",
         max_buffer_bytes: int = 2 * 1024**3,
         max_jobs: int = 32,
+        storage_guard=None,
+        max_storage_bytes: int | None = None,
+        min_free_storage_bytes: int = 0,
     ):
+        self.storage_guard = storage_guard or (lambda: None)
+        self.storage_guard()
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.buffer = self.root / "buffer"
@@ -72,6 +85,13 @@ class RecordingService:
         self.cameras, self.hub = cameras, hub
         self.ffmpeg = ffmpeg
         self.max_buffer_bytes, self.max_jobs = max_buffer_bytes, max_jobs
+        self.max_storage_bytes = max_storage_bytes
+        self.min_free_storage_bytes = min_free_storage_bytes
+        self.capacity_check = None
+        self._buffer_budget_snapshot = None
+        self._budget_generation = 0
+        self.capacity_reservations = StorageReservations(self._invalidate_budget_snapshot)
+        self.capacity_outputs = {}
         self.db = sqlite3.connect(self.root / "catalog.sqlite3")
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -131,6 +151,102 @@ class RecordingService:
     def _camera(self, camera: str) -> None:
         if camera not in self.cameras:
             raise ApiError(404, "CAMERA_NOT_FOUND", "Camera is not registered.")
+
+    async def check_media_space(self, reserve: int = 0) -> None:
+        """One admission path for legacy clips with or without daily recording."""
+        if self.capacity_check is not None:
+            await self.capacity_check(reserve)
+            return
+        reservations = dict(self.capacity_reservations)
+        outputs = dict(self.capacity_outputs)
+
+        def inspect():
+            self.storage_guard()
+            allocated = dict.fromkeys(reservations, 0)
+            owners = {p: key for key, paths in outputs.items() for p in paths}
+            used = 0
+            for path in self.root.rglob("*"):
+                try:
+                    info = path.stat()
+                except FileNotFoundError:
+                    continue
+                if not path.is_file():
+                    continue
+                used += info.st_size
+                if path in owners and owners[path] in allocated:
+                    allocated[owners[path]] += info.st_size
+            future = reserve + sum(max(0, n - allocated[k]) for k, n in reservations.items())
+            if (
+                self.max_storage_bytes is not None and used + future > self.max_storage_bytes
+            ) or shutil.disk_usage(self.root).free - future < self.min_free_storage_bytes:
+                raise ApiError(503, "INSUFFICIENT_STORAGE", "Media storage budget reached.")
+
+        await asyncio.to_thread(inspect)
+
+    def _invalidate_budget_snapshot(self):
+        self._buffer_budget_snapshot = None
+        self._budget_generation += 1
+
+    async def _check_buffer_capacity(self, reserve: int) -> None:
+        if self.max_storage_bytes is None:
+            return
+        generation = self._budget_generation
+        # Encoders reserve before creating outputs and invalidate on completion.
+        # Between scans, retain their *unallocated* promised bytes from the same
+        # file observations. Check DB/WAL growth on every write, not on a TTL.
+        if (
+            self._buffer_budget_snapshot is None
+            or time.monotonic() - self._buffer_budget_snapshot[0] > 5
+        ):
+            reservations = dict(self.capacity_reservations)
+            owners = {path: key for key, paths in self.capacity_outputs.items() for path in paths}
+
+            def scan():
+                self.storage_guard()
+                non_buffer, allocated = 0, dict.fromkeys(reservations, 0)
+                for path in self.root.rglob("*"):
+                    try:
+                        info = path.stat()
+                    except FileNotFoundError:
+                        continue
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    parts = path.relative_to(self.root).parts
+                    if len(parts) > 1 and parts[0] != "buffer":
+                        non_buffer += info.st_size
+                    key = owners.get(path)
+                    if key in allocated:
+                        allocated[key] += info.st_size
+                return non_buffer, allocated
+
+            non_buffer, allocated = await asyncio.to_thread(scan)
+            # Reservations may change while the worker runs; only publish a
+            # coherent snapshot. A retry sees the fresh producer promises.
+            if generation != self._budget_generation:
+                return await self._check_buffer_capacity(reserve)
+            self._buffer_budget_snapshot = (time.monotonic(), non_buffer, allocated)
+        _, non_buffer, allocated = self._buffer_budget_snapshot
+
+        def database_bytes():
+            total = 0
+            for path in self.root.iterdir():
+                try:
+                    info = path.stat()
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    total += info.st_size
+            return total
+
+        database = await asyncio.to_thread(database_bytes)
+        if generation != self._budget_generation:
+            return await self._check_buffer_capacity(reserve)
+        promised = sum(
+            max(0, size - allocated.get(key, 0)) for key, size in self.capacity_reservations.items()
+        )
+        buffered = self.db.execute("SELECT coalesce(sum(size),0) FROM frames").fetchone()[0]
+        if non_buffer + database + promised + buffered + reserve + 65536 > self.max_storage_bytes:
+            raise StorageCapacityError("Media total storage budget reached")
 
     def _save(self, body: dict) -> None:
         self.db.execute(
@@ -264,6 +380,7 @@ class RecordingService:
     async def _remove_files(self, clip_id: str) -> None:
         # clip_id comes from the catalog, never directly from a supplied filesystem path.
         def remove():
+            self.storage_guard()
             for suffix in (".mp4", ".tmp.mp4", ".ffconcat"):
                 (self.clips / f"{clip_id}{suffix}").unlink(missing_ok=True)
 
@@ -306,9 +423,15 @@ class RecordingService:
     async def store_frames(self, frames: list[FrameEnvelope]) -> None:
         if not frames:
             return
+        await asyncio.to_thread(self.storage_guard)
         reserve = sum(len(frame.jpeg) for frame in frames)
+        if self.min_free_storage_bytes:
+            free = (await asyncio.to_thread(shutil.disk_usage, self.root)).free
+            if free - reserve < self.min_free_storage_bytes:
+                raise OSError("Media free-space reserve reached")
         async with self.lock:
             await self._prune(time.time(), reserve=reserve)
+            await self._check_buffer_capacity(reserve)
             size = self.db.execute("SELECT coalesce(sum(size),0) FROM frames").fetchone()[0]
             if size + reserve > self.max_buffer_bytes:
                 raise OSError("Pinned frames exhausted the buffer budget")
@@ -347,6 +470,7 @@ class RecordingService:
         self.db.execute("DELETE FROM frame_pins WHERE owner=?", (owner_id,))
 
     async def _prune(self, now: float, reserve: int = 0) -> None:
+        await asyncio.to_thread(self.storage_guard)
         total = self.db.execute("SELECT coalesce(sum(size),0) FROM frames").fetchone()[0]
         cutoff = now - 300 if total + reserve <= self.max_buffer_bytes else float("inf")
         rows = self.db.execute(
@@ -421,13 +545,23 @@ class RecordingService:
                 if not frames:
                     return
             try:
-                await encode_clip(
+                self.capacity_reservations[clip_id] = (
+                    int(sum(r["size"] for r in frames) * 1.2) + 1048576
+                )
+                self.capacity_outputs[clip_id] = (
+                    self.clips / f"{clip_id}.tmp.mp4",
+                    self.clips / f"{clip_id}.mp4",
+                )
+                await self.check_media_space()
+                metadata = await encode_clip(
                     self.ffmpeg,
                     self.buffer,
                     self.clips,
                     clip_id,
                     [(r["path"], r["timestamp"]) for r in frames],
                 )
+                self.capacity_reservations[clip_id] = 0
+                await self.check_media_space()
                 now = time.time()
                 body.update(
                     status="ready",
@@ -443,16 +577,26 @@ class RecordingService:
                 body.update(
                     status="failed",
                     error={
-                        "code": "STORAGE_UNAVAILABLE"
+                        "code": exc.code
+                        if isinstance(exc, ApiError)
+                        else "STORAGE_UNAVAILABLE"
                         if isinstance(exc, OSError)
                         else "ENCODING_FAILED",
                         "message": "Clip creation failed.",
                     },
                 )
+                await self._remove_files(clip_id)
+            finally:
+                self.capacity_reservations.pop(clip_id, None)
+                self.capacity_outputs.pop(clip_id, None)
             while True:
                 try:
                     async with self.lock:
                         with self.db:
+                            if body["status"] == "ready" and metadata:
+                                record_generated_info(
+                                    self.db, self.root, self.clips / f"{clip_id}.mp4", metadata
+                                )
                             self._save(body)
                     break
                 except sqlite3.Error:
@@ -481,7 +625,7 @@ class RecordingService:
                         break
                 await self.store_frames(frames)
                 self.storage_error = False
-            except (OSError, sqlite3.Error):
+            except (OSError, sqlite3.Error) as exc:
                 self.storage_error = True
                 LOG.exception("Recording frame storage failed")
                 if self.hub.loss_observer is not None:
@@ -490,7 +634,9 @@ class RecordingService:
                             frame.camera_id,
                             frame.received_at,
                             frame.received_at + 1 / 30,
-                            "STORAGE_ERROR",
+                            "STORAGE_FULL"
+                            if isinstance(exc, StorageCapacityError)
+                            else "STORAGE_ERROR",
                         )
             finally:
                 for frame in frames:
@@ -533,4 +679,5 @@ class RecordingService:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        close_probe_database(self.db)
         self.db.close()

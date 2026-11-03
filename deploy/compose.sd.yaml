@@ -1,0 +1,22 @@
+# Combine with compose.server.yaml after the host preflight in docs/SD_STORAGE.md.
+# The child directory keeps unrelated SD files and ext4 lost+found outside the service.
+services:
+  camera-media:
+    environment:
+      MEDIA_STORAGE_PATH: /var/lib/camera-media
+      MEDIA_EXPECTED_FS_UUID: ${MEDIA_EXPECTED_FS_UUID:?Set the verified SD filesystem UUID}
+      MEDIA_EXPECTED_DEVICE: ${MEDIA_EXPECTED_DEVICE:?Set the verified SD major:minor}
+      MEDIA_MOUNT_WITNESS_PATH: /run/media-host/sd
+    volumes:
+      - type: bind
+        source: ${MEDIA_DATA_DIR:?Set the verified SD camera-media directory}
+        target: /var/lib/camera-media
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${MEDIA_WITNESS_PARENT:?Set the dedicated media-only shared parent}
+        target: /run/media-host
+        read_only: true
+        bind:
+          create_host_path: false
+          propagation: rslave

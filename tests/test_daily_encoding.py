@@ -35,3 +35,31 @@ async def test_daily_ts_decodes_and_preserves_real_duration_without_long_freeze(
     assert header["size"] == (320, 240)
     assert sum(1 for _ in reader) >= 10
     assert not list(buffer.glob("*.ffconcat"))
+
+
+@pytest.mark.asyncio
+async def test_daily_encoder_rechecks_storage_before_publishing_segment(tmp_path):
+    buffer = tmp_path / "buffer"
+    buffer.mkdir()
+    raw = io.BytesIO()
+    Image.new("RGB", (32, 32), "blue").save(raw, format="JPEG")
+    (buffer / "one.jpg").write_bytes(raw.getvalue())
+    frames = [StoredFrame("one.jpg", 1000, len(raw.getvalue()))]
+    checks = 0
+
+    def guard():
+        nonlocal checks
+        checks += 1
+        if checks > 1:
+            raise OSError("Media mount changed")
+
+    destination = tmp_path / "daily" / "part.ts"
+    with pytest.raises(OSError, match="mount changed"):
+        await encoding.encode_daily_segment(
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            buffer,
+            destination,
+            frames,
+            {"width": 32, "height": 32, "fps": 30, "_storage_guard": guard},
+        )
+    assert not destination.exists()

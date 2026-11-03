@@ -87,6 +87,10 @@ async def create_range(service, camera, event, start_at, end_at, *, retry_failed
                 )
             pinned = True
             daily.storage_reservations[key] = reserve
+            daily.storage_reservation_outputs[key] = (
+                recording.clips / f"{key}.tmp.mp4",
+                recording.clips / f"{key}.mp4",
+            )
         # This scans files; it must not hold the ingest/catalog lock.
         await daily.check_space()
         async with service.lock:
@@ -162,3 +166,4 @@ async def create_range(service, camera, event, start_at, end_at, *, retry_failed
                 with service.db:
                     service.db.execute("DELETE FROM clip_recording_pins WHERE clip_id=?", (key,))
                 daily.storage_reservations.pop(key, None)
+                daily.storage_reservation_outputs.pop(key, None)

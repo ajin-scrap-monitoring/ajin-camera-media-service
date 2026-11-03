@@ -5,14 +5,18 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from pathlib import Path
 
 from camera_media_service.daily_models import DailyWindow
+from camera_media_service.persisted_media_info import record_generated_info
 from camera_media_service.recording import ApiError, iso
 
 
 class DailyCatalog:
     def __init__(self, db: sqlite3.Connection):
         self.db = db
+        database_path = db.execute("PRAGMA database_list").fetchone()[2]
+        self.root = Path(database_path).parent if database_path else None
         db.executescript("""
             CREATE TABLE IF NOT EXISTS daily_recordings(
                 id TEXT PRIMARY KEY, camera TEXT NOT NULL, date TEXT NOT NULL,
@@ -118,7 +122,9 @@ class DailyCatalog:
             "SELECT body FROM daily_segments WHERE id=?", (segment_id,)
         ).fetchone()
         body = json.loads(row[0])
-        body.update(metadata, status="ready")
+        if self.root is not None and metadata.get("path"):
+            record_generated_info(self.db, self.root, self.root / metadata["path"], metadata)
+        body.update({k: v for k, v in metadata.items() if not k.startswith("_")}, status="ready")
         self.db.execute(
             "UPDATE daily_segments SET start=?,end=?,status=?,body=? WHERE id=?",
             (body["start_at"], body["end_at"], "ready", json.dumps(body), segment_id),

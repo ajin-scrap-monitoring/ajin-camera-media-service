@@ -14,6 +14,10 @@ class Settings:
     port: int = 8443
     route_path: str = "/api/v1/cameras/{camera_id}/stream"
     media_root: str = "/var/lib/camera-media"
+    media_expected_fs_uuid: str = ""
+    media_expected_device: str = ""
+    media_identity_path: str = ""
+    media_mount_witness_path: str = ""
     max_frame_bytes: int = 4 * 1024 * 1024
     stats_interval_seconds: int = 60
     log_format: str = "json"
@@ -25,6 +29,8 @@ class Settings:
     api_port: int = 8889
     ffmpeg_path: str = "ffmpeg"
     max_buffer_bytes: int = 2 * 1024**3
+    max_media_storage_bytes: int | None = None
+    daily_archive_workspace_bytes: int = 0
     max_clip_jobs: int = 32
     daily_recording_enabled: bool = False
     daily_archive_enabled: bool = True
@@ -55,6 +61,16 @@ class Settings:
         media_root = _read_required_text(
             environ, "MEDIA_STORAGE_PATH", default="/var/lib/camera-media"
         )
+        expected_uuid = _read_optional_text(environ, "MEDIA_EXPECTED_FS_UUID")
+        expected_device = _read_optional_text(environ, "MEDIA_EXPECTED_DEVICE")
+        identity_path = _read_optional_text(environ, "MEDIA_IDENTITY_PATH")
+        witness_path = _read_optional_text(environ, "MEDIA_MOUNT_WITNESS_PATH")
+        if bool(expected_uuid) != bool(expected_device):
+            raise SettingsError(
+                "MEDIA_EXPECTED_FS_UUID and MEDIA_EXPECTED_DEVICE are required together"
+            )
+        if (identity_path or witness_path) and not expected_uuid:
+            raise SettingsError("Media mount paths require MEDIA_EXPECTED_FS_UUID")
         max_frame_bytes = _read_int(
             environ,
             "MAX_FRAME_BYTES",
@@ -84,10 +100,16 @@ class Settings:
 
         daily_enabled = _read_bool(environ, "DAILY_RECORDING_ENABLED", False)
         daily_budget = _read_int(environ, "MAX_DAILY_STORAGE_BYTES", 0, 0)
+        media_budget = _read_int(environ, "MAX_MEDIA_STORAGE_BYTES", 0, 0)
+        archive_workspace = _read_int(environ, "DAILY_ARCHIVE_WORKSPACE_BYTES", 0, 0)
         if daily_enabled and not daily_budget:
             raise SettingsError(
                 "MAX_DAILY_STORAGE_BYTES must be explicitly set when daily recording is enabled"
             )
+        if daily_enabled and archive_workspace >= daily_budget:
+            raise SettingsError("DAILY_ARCHIVE_WORKSPACE_BYTES must be smaller than daily budget")
+        if media_budget and daily_budget > media_budget:
+            raise SettingsError("MAX_MEDIA_STORAGE_BYTES cannot be smaller than daily budget")
         daily_width = _read_int(environ, "DAILY_WIDTH", 1920, 2, 3840)
         daily_height = _read_int(environ, "DAILY_HEIGHT", 1080, 2, 2160)
         if daily_width % 2 or daily_height % 2:
@@ -99,6 +121,10 @@ class Settings:
             port=port,
             route_path=route_path,
             media_root=media_root,
+            media_expected_fs_uuid=expected_uuid,
+            media_expected_device=expected_device,
+            media_identity_path=identity_path,
+            media_mount_witness_path=witness_path,
             max_frame_bytes=max_frame_bytes,
             stats_interval_seconds=stats_interval_seconds,
             log_format=log_format,
@@ -110,6 +136,8 @@ class Settings:
             api_port=_read_int(environ, "MEDIA_API_PORT", 8889, 1, 65535),
             ffmpeg_path=_read_required_text(environ, "FFMPEG_PATH", "ffmpeg"),
             max_buffer_bytes=_read_int(environ, "MAX_BUFFER_BYTES", 2 * 1024**3, 1),
+            max_media_storage_bytes=media_budget or None,
+            daily_archive_workspace_bytes=archive_workspace,
             max_clip_jobs=_read_int(environ, "MAX_CLIP_JOBS", 32, 1),
             daily_recording_enabled=daily_enabled,
             daily_archive_enabled=_read_bool(environ, "DAILY_ARCHIVE_ENABLED", True),

@@ -39,6 +39,8 @@ def build_gaps(spans, known):
 
     def append(start, end, reason):
         left, right = iso(start), iso(end)
+        if left == right:
+            return
         if gaps and gaps[-1]["reason_code"] == reason and gaps[-1]["end_at"] == left:
             gaps[-1]["end_at"] = right
         else:
@@ -53,12 +55,12 @@ def build_gaps(spans, known):
         while index < len(effective) and effective[index][0] < b:
             left, right, reason = effective[index]
             left, right = max(a, left), min(b, right)
-            if left - point > 1:
+            if left > point:
                 append(point, left, "UNKNOWN_CAPTURE_LOSS")
             if right > left:
                 append(left, right, reason)
                 point = right
             index += 1
-        if b - point > 1:
+        if b > point:
             append(point, b, "UNKNOWN_CAPTURE_LOSS")
     return gaps

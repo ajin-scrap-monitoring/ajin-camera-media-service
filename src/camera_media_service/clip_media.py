@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import os
 import re
 from pathlib import Path
 
 from camera_media_service.encoding import probe_media, start_media_process
+from camera_media_service.persisted_media_info import publish_generated_info
 from camera_media_service.recording import ApiError, epoch, iso
 
 
@@ -167,7 +167,7 @@ async def remux_clip(ffmpeg: str, root: Path, slices: list[dict], output: Path) 
             end_at=epoch(intervals[-1]["end_at"]),
             available_intervals=intervals,
         )
-        await asyncio.to_thread(os.replace, temporary, output)
+        await publish_generated_info(metadata, temporary, output)
         return metadata
     finally:
         if process is not None and process.returncode is None:

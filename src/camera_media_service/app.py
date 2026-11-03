@@ -24,6 +24,7 @@ from camera_media_service.pipeline import FrameValidator, LiveFrameHub
 from camera_media_service.registry import ConnectionRegistry
 from camera_media_service.settings import Settings
 from camera_media_service.storage import LocalStorageBackend, RingBufferIndex, SegmentWriter
+from camera_media_service.storage_mount import StorageMountGuard
 from camera_media_service.store import LatestFrameStore
 from camera_media_service.telemetry import IngestTelemetryTracker, StatsLoggerTask
 
@@ -49,6 +50,7 @@ class WebSocketServer:
         live_delivery: LiveDeliveryEndpoint | None = None,
         telemetry: IngestTelemetryTracker | None = None,
         stats_task: StatsLoggerTask | None = None,
+        storage_guard: StorageMountGuard | None = None,
     ) -> None:
         self.settings = settings
         self.authenticator = authenticator
@@ -62,6 +64,7 @@ class WebSocketServer:
         self.live_delivery = live_delivery
         self.telemetry = telemetry
         self.stats_task = stats_task
+        self.storage_guard = storage_guard or StorageMountGuard.from_settings(settings)
 
         route_pattern = re.escape(settings.route_path).replace(
             re.escape("{camera_id}"),
@@ -133,6 +136,7 @@ class WebSocketServer:
             from camera_media_service.recording import RecordingService
 
             assert self.hub is not None
+            self.storage_guard.check()
             if self.settings.daily_recording_enabled and not self.settings.max_daily_storage_bytes:
                 raise ValueError("Daily recording requires MAX_DAILY_STORAGE_BYTES")
             recording = RecordingService(
@@ -142,6 +146,9 @@ class WebSocketServer:
                 ffmpeg=self.settings.ffmpeg_path,
                 max_buffer_bytes=self.settings.max_buffer_bytes,
                 max_jobs=self.settings.max_clip_jobs,
+                storage_guard=self.storage_guard.check,
+                max_storage_bytes=self.settings.max_media_storage_bytes,
+                min_free_storage_bytes=self.settings.min_free_storage_bytes,
             )
             daily, exports = None, None
             if self.settings.daily_recording_enabled:
@@ -196,6 +203,8 @@ class WebSocketServer:
 def create_app(settings: Settings) -> WebSocketServer:
     from camera_media_service.camera_status import CameraStatusTracker
 
+    storage_guard = StorageMountGuard.from_settings(settings)
+    storage_guard.check()
     registry = ConnectionRegistry()
     frame_store = LatestFrameStore()
     authenticator = BearerAuthenticator(settings.camera_tokens)
@@ -203,7 +212,10 @@ def create_app(settings: Settings) -> WebSocketServer:
     validator = FrameValidator(max_frame_bytes=settings.max_frame_bytes)
     hub = LiveFrameHub(frame_store=frame_store)
 
-    storage_backend = LocalStorageBackend(media_root=settings.media_root)
+    storage_backend = LocalStorageBackend(
+        media_root=settings.media_root,
+        storage_guard=storage_guard.check,
+    )
     ring_buffer_index = RingBufferIndex()
     segment_writer = SegmentWriter(
         hub=hub,
@@ -248,4 +260,5 @@ def create_app(settings: Settings) -> WebSocketServer:
         live_delivery=live_delivery,
         telemetry=telemetry,
         stats_task=stats_task,
+        storage_guard=storage_guard,
     )

@@ -13,6 +13,12 @@ from pathlib import Path
 from camera_media_service.archive_playback import ArchivedPlaybackService
 from camera_media_service.daily_recording import DailyRecordingService
 from camera_media_service.encoding import merge_daily_mp4, verify_archive
+from camera_media_service.persisted_media_info import (
+    load_verified_archive,
+    record_generated_info,
+    record_verified_archive,
+    source_measurements,
+)
 from camera_media_service.recording import ApiError, epoch, iso
 
 LOG = logging.getLogger(__name__)
@@ -172,8 +178,12 @@ class DailyExportService:
         recording_id = job["recording_id"]
         final = self._path(recording_id)
         error, metadata = None, None
+        association = {}
         try:
             async with self.slot:
+                sources_before = (
+                    await source_measurements(self.daily.recording, segments) if not reuse else {}
+                )
                 if not reuse:
                     await self.daily.check_space()
                     await merge_daily_mp4(
@@ -185,7 +195,22 @@ class DailyExportService:
                 # Verification reads the finished archive and allocates no more
                 # video output. Its existing bytes remain in disk usage.
                 self.reservations[recording_id] = 0
+                await self.daily.check_space()
                 metadata = await verify_archive(self.daily.recording.ffmpeg, final, segments)
+                if reuse:
+                    identity = metadata.get("_file_identity")
+                    association = (
+                        load_verified_archive(self.db, self.root, final, identity) or {}
+                        if identity
+                        else {}
+                    )
+                else:
+                    sources_after = await source_measurements(self.daily.recording, segments)
+                    association = {
+                        key: item["media_info"]
+                        for key, item in sources_before.items()
+                        if sources_after.get(key) == item
+                    }
         except asyncio.CancelledError:
             error = {"code": "JOB_INTERRUPTED", "message": "Archive interrupted."}
         except (OSError, RuntimeError, ApiError, TimeoutError) as exc:
@@ -222,6 +247,8 @@ class DailyExportService:
                         error=error,
                     )
                 else:
+                    record_generated_info(self.db, self.root, final, metadata)
+                    record_verified_archive(self.db, self.root, final, metadata, association)
                     offset_us = 0
                     for segment in segments:
                         segment.update(
@@ -464,6 +491,9 @@ class DailyExportService:
                         )
 
     async def maintenance(self, now: float) -> None:
+        guard = getattr(self.daily.recording, "storage_guard", None)
+        if guard is not None:
+            await asyncio.to_thread(guard)
         async with self.maintenance_lock:
             await self.refresh_retention(now)
             await self.playback.maintenance(now)

@@ -13,7 +13,7 @@ import time
 
 from aiohttp import web
 
-from camera_media_service.media_files import stream_file
+from camera_media_service.media_files import open_media_file, storage_io, stream_file
 from camera_media_service.recording import ACTIVE, ApiError, RecordingService, epoch
 
 LOG = logging.getLogger(__name__)
@@ -78,6 +78,11 @@ def create_http_app(
     @web.middleware
     async def boundary(request, handler):
         try:
+            # Receipt status/live remain useful when recording storage is unavailable.
+            if not request.path.endswith(("/status", "/live")):
+                guard = getattr(service, "storage_guard", None)
+                if guard is not None:
+                    await asyncio.to_thread(guard)
             return await handler(request)
         except ApiError as exc:
             return error_response(exc)
@@ -228,7 +233,7 @@ def create_http_app(
         if request.method == "DELETE":
             await service.delete_clip(clip_id)
             return web.Response(status=204)
-        return web.json_response(await service.get_clip(clip_id))
+        return await storage_io(web.json_response, await service.get_clip(clip_id))
 
     def encode_cursor(payload):
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -280,7 +285,7 @@ def create_http_app(
                     "after": [epoch(items[-1]["accepted_at"]), items[-1]["clip_id"]],
                 }
             )
-        return web.json_response({"items": items, "next_cursor": cursor})
+        return await storage_io(web.json_response, {"items": items, "next_cursor": cursor})
 
     async def live(request):
         nonlocal viewers
@@ -340,19 +345,19 @@ def create_http_app(
             if status != "ready":
                 raise ApiError(409, "CLIP_NOT_READY", "Clip is not ready.")
             # Open under the catalog lock: a concurrent deletion cannot win between check/open.
-            file = (service.clips / f"{body['clip_id']}.mp4").open("rb")
-        try:
-            file.seek(0, 2)
-            size = file.tell()
-            return await stream_file(
-                request,
-                file,
-                size=size,
-                filename=body["clip_id"] + ".mp4",
-                content_type="video/mp4",
+            file, size = await open_media_file(
+                service.clips / f"{body['clip_id']}.mp4",
+                root=service.clips,
+                guard=getattr(service, "storage_guard", None),
             )
-        finally:
-            file.close()
+        return await stream_file(
+            request,
+            file,
+            size=size,
+            filename=body["clip_id"] + ".mp4",
+            content_type="video/mp4",
+            guard=getattr(service, "storage_guard", None),
+        )
 
     prefix = "/api/v1"
     app.router.add_get(prefix + "/cameras/{camera_id}/recording-policy", policy, allow_head=False)

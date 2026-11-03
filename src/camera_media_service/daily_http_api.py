@@ -12,7 +12,7 @@ from aiohttp import web
 
 from camera_media_service.daily_playback import build_daily_playlist
 from camera_media_service.http_api import body_json, query_fields
-from camera_media_service.media_files import stream_file
+from camera_media_service.media_files import open_media_file, storage_io, stream_file
 from camera_media_service.recording import ApiError
 
 STATES = {"recording", "finalizing", "closed", "failed", "deleted", "expired"}
@@ -24,7 +24,8 @@ def register_daily_routes(app, daily, exports, *, media_details=None) -> None:
     async def media_info(request):
         query_fields(request, ())
         await exports.refresh_retention(daily.clock())
-        return web.json_response(
+        return await storage_io(
+            web.json_response,
             await media_details.day(request.match_info["recording_id"]),
             headers={"Cache-Control": "no-store"},
         )
@@ -37,7 +38,7 @@ def register_daily_routes(app, daily, exports, *, media_details=None) -> None:
             if request.method == "PUT"
             else await daily.get_policy(camera)
         )
-        return web.json_response(result)
+        return await storage_io(web.json_response, result)
 
     async def listing(request):
         query_fields(request, ("from_date", "to_date", "status", "limit", "cursor"))
@@ -94,7 +95,7 @@ def register_daily_routes(app, daily, exports, *, media_details=None) -> None:
                 separators=(",", ":"),
             ).encode()
             cursor = base64.urlsafe_b64encode(hmac.digest(key, raw, "sha256") + raw).decode()
-        return web.json_response({"items": items, "next_cursor": cursor})
+        return await storage_io(web.json_response, {"items": items, "next_cursor": cursor})
 
     async def detail(request):
         query_fields(request, ())
@@ -103,7 +104,7 @@ def register_daily_routes(app, daily, exports, *, media_details=None) -> None:
         if request.method == "DELETE":
             await exports.delete_day(recording_id)
             return web.Response(status=204)
-        return web.json_response(await daily.get_day(recording_id))
+        return await storage_io(web.json_response, await daily.get_day(recording_id))
 
     async def playlist(request):
         query_fields(request, ())
@@ -112,7 +113,7 @@ def register_daily_routes(app, daily, exports, *, media_details=None) -> None:
         if not segments:
             raise ApiError(409, "PLAYBACK_NOT_READY", "No completed media segments.")
         return web.Response(
-            text=build_daily_playlist(day, segments),
+            text=await storage_io(build_daily_playlist, day, segments),
             content_type="application/vnd.apple.mpegurl",
             headers={"Cache-Control": "no-store"},
         )
@@ -122,7 +123,8 @@ def register_daily_routes(app, daily, exports, *, media_details=None) -> None:
         if request.can_read_body and await body_json(request):
             raise ApiError(400, "INVALID_ARGUMENT", "Export request takes an empty object.")
         body, _ = await exports.request_export(request.match_info["recording_id"])
-        return web.json_response(
+        return await storage_io(
+            web.json_response,
             body,
             status=200 if body["export_state"] == "ready" else 202,
             headers={"Location": f"/api/v2/daily-recordings/{body['recording_id']}"},
@@ -146,20 +148,25 @@ def register_daily_routes(app, daily, exports, *, media_details=None) -> None:
             archived = day.get("archive_state") == "mp4"
             if not archived:
                 path = daily.segment_path(item)
-                if not path.resolve().is_relative_to((daily.recording.root / "daily").resolve()):
-                    raise OSError("Invalid media path")
                 try:
-                    file = path.open("rb")
+                    file, size = await open_media_file(
+                        path,
+                        root=daily.recording.root / "daily",
+                        guard=getattr(daily.recording, "storage_guard", None),
+                    )
                 except OSError as exc:
                     raise ApiError(
                         503, "RECORDING_STORAGE_ERROR", "Saved media unavailable."
                     ) from exc
-                file.seek(0, 2)
-                size = file.tell()
         if archived:
             file, size = await exports.playback.open_segment(recording_id, segment_id)
         return await stream_file(
-            request, file, size=size, filename=segment_id + ".ts", content_type="video/mp2t"
+            request,
+            file,
+            size=size,
+            filename=segment_id + ".ts",
+            content_type="video/mp2t",
+            guard=getattr(daily.recording, "storage_guard", None),
         )
 
     async def content(request):
@@ -174,20 +181,21 @@ def register_daily_routes(app, daily, exports, *, media_details=None) -> None:
             if day["export_state"] != "ready":
                 raise ApiError(409, "EXPORT_NOT_READY", "Prepare the daily MP4 first.")
             path = exports.output / (day["recording_id"] + ".mp4")
-            if not path.resolve().is_relative_to(exports.output.resolve()):
-                raise OSError("Invalid media path")
             try:
-                file = path.open("rb")
+                file, size = await open_media_file(
+                    path,
+                    root=exports.output,
+                    guard=getattr(daily.recording, "storage_guard", None),
+                )
             except OSError as exc:
                 raise ApiError(503, "RECORDING_STORAGE_ERROR", "Prepared MP4 unavailable.") from exc
-            file.seek(0, 2)
-            size = file.tell()
         return await stream_file(
             request,
             file,
             size=size,
             filename=f"daily_{day['recording_date']}_{day['recording_id']}.mp4",
             content_type="video/mp4",
+            guard=getattr(daily.recording, "storage_guard", None),
         )
 
     prefix = "/api/v2"
