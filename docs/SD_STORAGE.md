@@ -19,9 +19,7 @@ number or a marker copied without verification. The Linux host preflight calls
 capacity and write permissions. Run it again before every container creation or
 restart after reboot; install it as the deployment unit's `ExecStartPre` with the
 verified UUID and exact target path. Persist the existing SD mount by UUID in the
-host mount configuration before enabling the deployment unit. Order the unit
-after `RequiresMountsFor=/srv/ajin-camera-storage/sd`. A missing SD must fail that
-unit, rather than create a root-filesystem directory.
+host mount configuration before enabling the deployment unit. The operating preflight depends on the existing stable-UUID mount and establishes the dedicated second mount itself. Order storage preparation before `docker.service` and the media unit; do not require the card globally for unrelated Docker services. A missing SD must fail media startup rather than create a root-filesystem directory.
 
 The runtime checks the UUID marker together with `/proc/self/mountinfo`, kernel
 device identity, ext4, read-only flags and process write permissions before root
@@ -52,7 +50,7 @@ host-directory creation.
 
 ## Copy and verification
 
-Run the repository's Python 3.13 environment on the Linux Docker host as root,
+Run Python 3.13 or newer on the Linux Docker host as root (the standard-library migration tool was also verified with host Python 3.14),
 with `PYTHONPATH=src`. These examples use placeholders; substitute the inspected
 UUID. Keep runtime env files and tokens private. The tool prints aggregate counts,
 capacity and identity only, and never prints Docker inspection or DB values.
@@ -120,3 +118,23 @@ discard the new catalog. Stop writers, preserve both trees and SQLite snapshots,
 compare manifests/IDs and reconcile additions in a separate reviewed copy before
 switching. This tool intentionally refuses conflicting destination files. There
 is no automatic deletion, move, fallback to SSD, or destructive rollback command.
+
+
+## Operating deployment — 2026-11-03
+
+Current image: `ajin-camera-media-service:8d5d584`. The application image remains Python3.13. Host preflight/migration runs with the standard-library Python3.14 installation. The verified card is ext4 `/dev/mmcblk0p1`, kernel179:1, UUID `1e54ae89-0a90-479f-a47d-59e64d223b29`, capacity62,522,208,256bytes. Its reported product name is SR64G; a continuous-write endurance grade was not established.
+
+| Data | Physical SD location under `/srv/ajin-camera-storage/sd/camera-media` |
+|---|---|
+| Received JPEG buffer | `buffer/` |
+| Daily TS / verified whole MP4 | `daily/` / `daily-exports/` |
+| Independent event/range MP4 | `clips/` |
+| HLS playback cache | `daily-playback/` |
+| In-progress output/concat manifests | Beside the owned output in those same directories; included in budgets and cleaned on completion/failure/recovery |
+| Catalogue and measured information | `catalog.sqlite3` with WAL/SHM and private `media-info.sqlite3` |
+
+Final frozen migration verified43,861files/29,911,141,866bytes and SQLite integrity. Old SSD `/var/lib/ajin-camera-media` is retained. Application path `/var/lib/camera-media`, IDs, existing deleted/expired states and policies were preserved. The RO rslave witness is `/run/media-host/sd` from the dedicated shared parent. Real service UID10002, root10002:10002/mode0750, new file device179:1 and service restart were verified. Host reboot/power-loss/endurance tests were not performed.
+
+Managed units are `/etc/systemd/system/ajin-camera-media-storage.service` and `/etc/systemd/system/ajin-camera-media.service`; both enabled/active. The media unit always combines the original `/srv/scrap-monitoring/development/main-refresh-20261015/compose.media.yaml` and private `/home/kyuncho/ajin-camera-media-service/deploy-20261103-sd/compose.sd.runtime.yaml`, and waits for healthy. Use `sudo systemctl restart ajin-camera-media.service`; using the old base file alone would select the preserved SSD configuration. Preflight is `/usr/local/libexec/ajin-camera-media-storage-preflight` and uses the pinned1923d83 tools checkout. Do not remove that checkout without updating the managed dependency.
+
+Current application budgets: total48GiB, daily42GiB, archive workspace10GiB, minimum filesystem free5GiB, JPEG2GiB. Workspace is reserved within admission accounting, not an extra promise beyond device capacity. The existing30-day retention setting is an age limit, not30days of guaranteed storage. Download completion does not delete or extend a file. API expiry and physical cleanup remain distinct. See the Nov03 integration contract for file-specific rules and VALIDATION.md for actual operating proofs, maintenance gaps and performance limits.

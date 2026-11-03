@@ -2,7 +2,7 @@
 
 2026-11-03 카메라 미디어 후속 항목은 [추가 계약](docs/INTEGRATION_HANDOFF_2026-11-03.md), [회신 문서](docs/INTEGRATION_REPLY_2026-11-03.md), [SD 이전 절차](docs/SD_STORAGE.md)를 참조하세요. LC-5 라이다 배치는 제외합니다. 실제 적용 버전·전후 측정·남은 제한은 [검증 기록](docs/VALIDATION.md)을 따릅니다.
 
-연동 PR #1과 아카이브 운영 후속 PR #2를 main에 병합하고, 운영 서버에 `ajin-camera-media-service:f4019cb`로 배포했습니다(한국 시간2026-10-31). 자동 MP4 보관을 다시 활성화했고 실제 백엔드 API와 새 녹화 증가를 확인했습니다. 대용량 기존 날짜의 전체 안전 검증과 중복 TS 정리를 완료했고, 보관 MP4의 HLS·구간 추출·다운로드도 확인했습니다. 상세 결과는 [검증 기록](docs/VALIDATION.md)을 참조하세요. 요청별 구간 추출·카메라 상태·실제 파일 정보·삭제 수정은 [추가 계약](docs/INTEGRATION_HANDOFF_2026-10-30.md), 담당자 회신은 [회신 문서](docs/INTEGRATION_REPLY_2026-10-30.md)를 참조하세요.
+2026-11-03 PR #3·#4·#5를 main에 병합하고 운영 서버에 `ajin-camera-media-service:8d5d584`로 배포했습니다. 영상 저장소는 실제 SD로 전환했으며 SSD 원본을 보존했습니다. 서버 전체398개 및 최종 후속83개, CI 전체402개 시험, 실제 백엔드의 미디어 API 접근·다운로드, 재시작 후 파일 정보 재사용을 확인했습니다. LC-4에는 드문2초대 공백과 보관 HLS 최초3~5.5초 지연이 남아 추가 확인이 필요합니다. 측정 기간과 남은 제한은 [검증 기록](docs/VALIDATION.md)을 참조하세요.
 
 카메라 엣지의 JPEG/WSS 수신, HTTP MJPEG 실시간 전달, 이벤트 전후 MP4와 한국 날짜별 상시 녹화/HLS/하루 MP4 다운로드 API를 제공하는 Python 서비스입니다.
 

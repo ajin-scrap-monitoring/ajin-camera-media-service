@@ -1,14 +1,16 @@
 # 서버 A 상시 배포 및 백엔드 연결 안내
 
+2026-11-03 현재 운영 이미지는 `ajin-camera-media-service:8d5d584`이며 영상 저장소는 실제 SD `/srv/ajin-camera-storage/sd/camera-media`다. PR #3·#4·#5의 구현·성능 후속 수정을 포함한다. 현재 재시작은 아래 systemd 단위를 사용한다. 원래 Compose 파일과 SD override를 함께 적용해야 한다. 이전 날짜의 배포 설명은 당시 이력이며 현재 설정은 이 절과 아래 표를 따른다.
+
 2026-10-04 서버 A `100.100.27.99`의 기존 운영 배포를 시작했다. 2026-10-15에는 GitHub main에서 날짜별 상시 녹화 버전을 가져와 같은 운영 컨테이너에 적용했다. 실행 상태와 배포 검증 결과는 VALIDATION.md를 참조한다.
 
 2026-10-26 이벤트 시각 기반 구간 추출 버전 `a0e470f`로 운영 컨테이너를 교체했다. 기존 배포 관리 경로 `/srv/scrap-monitoring/development/main-refresh-20261015/compose.media.yaml`에서 이미지 참조만 바꿨다. 프로젝트 이름 `scrap-media-dev-daf293e`는 배포 관리용 기존 이름으로 유지했으며 실행 코드 버전은 이미지로 확인한다. 환경 파일·포트·네트워크·영구 저장소·자원 한도는 그대로다.
 
-2026-10-27 자동 보관 MP4 버전 `f4cc08f`로 갱신했다. GitHub에서 가져온 소스로 빌드한 이미지의 전체204개 시험을 통과한 뒤, `DAILY_ARCHIVE_ENABLED=false`인 일시적 Compose override로 먼저 배포·백엔드 연결을 점검했다. 기존 환경 파일·인증 정보·포트·네트워크·자원 한도를 보존했다. 자동 전환을 켠 뒤에는 원래 Compose 파일만 사용한다. 검증된 MP4로 TS를 정리한 후에는 TS 전용 이전 이미지로 되돌리지 않는다. MP4를 지원하는 이미지를 유지한 상태에서 자동 정리를 일시 중지해야 한다.
+2026-10-27 자동 보관 MP4 버전 `f4cc08f`로 갱신했다. GitHub에서 가져온 소스로 빌드한 이미지의 전체204개 시험을 통과한 뒤, `DAILY_ARCHIVE_ENABLED=false`인 일시적 Compose override로 먼저 배포·백엔드 연결을 점검했다. 기존 환경 파일·인증 정보·포트·네트워크·자원 한도를 보존했다. 당시에는 자동 전환을 켠 뒤 원래 Compose 파일만 사용했다. 현재 SD 전환 후에는 반드시 SD override도 함께 사용한다. 검증된 MP4로 TS를 정리한 후에는 TS 전용 이전 이미지로 되돌리지 않는다. MP4를 지원하는 이미지를 유지한 상태에서 자동 정리를 일시 중지해야 한다.
 
 ## 백엔드 담당자에게 전달할 값
 
-한국 시간2026-10-31 연동 PR #1에 이어 아카이브 공간 예약/디스크 I/O 후속 PR #2를 main `f4019cb6e94a5b9663b3ae696f29cc7a1b77e2ed`에 병합해 배포했다. 검증한 PR `7ca9501`과 병합 main의 파일 트리가 동일함을 서버에서 확인했다. 현재 이미지는 `ajin-camera-media-service:f4019cb`이며 기존 설정·인증 정보·네트워크·포트·볼륨·CPU2/메모리3GiB·저장 예산32GiB/최소 여유5GiB를 유지했다. 임시 아카이브 중지 override는 실행에서 제외했고 원래 Compose 파일만 사용해 자동 보관을 재개했다. 신규 API와 실제 백엔드 접근 결과는 VALIDATION.md의 최신 운영 검증을 참조한다.
+2026-11-03 main의 `ajin-camera-media-service:8d5d584`를 운영 배포했다. 실제 SD 신규 녹화·기존 ID·재시작·메타데이터 영속 조회, 실제 백엔드 컨테이너의 미디어 API와 전체 MP4/구간 다운로드를 확인했다. 현재 설정·성능 관찰·남은 제한은 [VALIDATION.md](VALIDATION.md)의 최신 절을 따른다. 기존 이벤트/날짜 보관30일은 현재 적용값이며 새 보관 기간 합의가 아니다.
 
 | 항목 | 값 |
 | --- | --- |
@@ -27,7 +29,7 @@
 | API 인증 | 별도 토큰 없음. 호스트 공개 포트는 loopback에 제한 |
 | 초기 녹화 설정 | 이벤트 전 30초 / 후 30초, 보관 30일 |
 
-이벤트 요청·응답 JSON, 오류 코드와 중복 처리는 [BACKEND_API_CONTRACT.md](BACKEND_API_CONTRACT.md), 날짜별 조회·HLS·MP4·삭제는 [DAILY_RECORDING_API_GUIDE.md](DAILY_RECORDING_API_GUIDE.md)를 따른다. 실시간 영상은 MJPEG다. 브라우저는 백엔드의 영상 중개 경로를 사용한다.
+이벤트 요청·응답 JSON, 오류 코드와 중복 처리는 [BACKEND_API_CONTRACT.md](BACKEND_API_CONTRACT.md), 날짜별 조회·HLS·MP4·삭제는 [DAILY_RECORDING_API_GUIDE.md](DAILY_RECORDING_API_GUIDE.md)를 따른다. 실시간 영상은 MJPEG다. 브라우저에는 백엔드/프록시가 인증된 미디어 접근 경로를 제공한다. 백엔드가 영상 바이트를 직접 중계해야 한다는 뜻은 아니다.
 
 백엔드가 컨테이너 안에서 실행되면 `127.0.0.1`은 그 컨테이너 자체다. 백엔드 담당자는 자신의 Compose 서비스에 외부 네트워크 `ajin-media`를 연결하고 `camera-media-service:8889`로 요청해야 한다. 이미 실행 중인 다른 서비스의 네트워크는 이번 배포에서 변경하지 않았다.
 
@@ -59,17 +61,17 @@ networks:
 | 항목 | 값 |
 | --- | --- |
 | 컨테이너 | `ajin-camera-media-service` |
-| 이미지 | `ajin-camera-media-service:f4019cb` |
-| 배포 파일 | `/srv/scrap-monitoring/development/main-refresh-20261015/compose.media.yaml` |
+| 이미지 | `ajin-camera-media-service:8d5d584` |
+| 배포 파일 | `/srv/scrap-monitoring/development/main-refresh-20261015/compose.media.yaml` + `/home/kyuncho/ajin-camera-media-service/deploy-20261103-sd/compose.sd.runtime.yaml` |
 | 실행 환경 파일 | `/home/kyuncho/ajin-camera-media-service/runtime.env` (비공개 파일, 이번 배포에서 내용 유지) |
-| 서버의 영구 저장 경로 | `/var/lib/ajin-camera-media` |
+| 서버의 영구 저장 경로 | SD `/srv/ajin-camera-storage/sd/camera-media` → 컨테이너 `/var/lib/camera-media`. 이전 SSD `/var/lib/ajin-camera-media`는 보존본 |
 | 저장 경로 소유자 | UID/GID `10002:10002`, 디렉터리 권한 `0750` |
 | 저장 내용 | `buffer/` JPEG, `clips/` 이벤트 MP4, 오늘 TS/보관 원본 MP4/제한된 HLS 임시 캐시, SQLite |
-| 자동 재시작 | Docker `unless-stopped`, Docker 서비스 자동 시작 활성화 |
+| 자동 재시작 | SD 사전 확인/미디어 systemd 단위 enabled·active, Docker `unless-stopped`. healthy까지 시작 검증 |
 | 자원 제한 | CPU 2개, 메모리 3 GiB |
 | 버퍼·작업 한도 | JPEG 버퍼 2 GiB, 미완료 녹화 작업 최대 32개 |
 | 날짜 녹화 | 활성, 한국 자정 전환, H.264 1920×1080/15fps, 10초 조각, 새 녹화의 키프레임 간격 1초 |
-| 날짜 저장 예산 | TS·MP4·변환 임시 파일·HLS 캐시 합산32 GiB, 최소 디스크 여유5 GiB |
+| 저장 예산 | 전체48GiB·날짜42GiB·MP4 작업 공간10GiB·최소 여유5GiB. JPEG·클립·임시 파일·DB도 전체 합계에 포함 |
 | 날짜 보관·다운로드 | 정책30일, 마감 후 자동 MP4 준비·검증 후 중복 TS 정리. MP4는 날짜 만료까지 유지. 실제30일 분량 용량 보장 아님 |
 | 로그 | 파일당 10 MiB, 최대 3개 순환 |
 | 상태 검사 | 30초마다 클립 목록 API 호출 |
@@ -85,13 +87,17 @@ sudo docker logs --tail 100 ajin-camera-media-service
 curl http://127.0.0.1:8889/api/v1/cameras/camera-main/recording-policy
 
 # 미디어서버만 재시작
-sudo docker compose \
-  -f /srv/scrap-monitoring/development/main-refresh-20261015/compose.media.yaml restart camera-media
+sudo systemctl restart ajin-camera-media.service
 
 # 디스크 사용량
-sudo du -sh /var/lib/ajin-camera-media
-df -h /var/lib/ajin-camera-media
+sudo du -sh /srv/ajin-camera-storage/sd/camera-media
+df -h /srv/ajin-camera-storage/sd/camera-media
 ```
+
+
+`ajin-camera-media-storage.service`의 preflight는 실제 UUID/장치/권한과 전용 공유 부모·SD 하위 마운트를 확인하며 Docker보다 먼저 실행된다. `ajin-camera-media.service`의 ExecStartPre에서도 재확인한다. SD 단위 실패가 다른 애플리케이션의 Docker 전체를 중지하도록 구성하지 않았다. 시작은 두 Compose 파일의 `up -d --no-deps --wait --wait-timeout 120 camera-media`이며 서비스 단위 active는 healthy 확인 이후다.
+
+preflight는 `/usr/local/libexec/ajin-camera-media-storage-preflight`, 고정 검증 도구는 `/home/kyuncho/ajin-camera-media-service/pr-media-sd-20261103-1923d83/tools/media_storage_migrate.py`를 사용한다. 이 체크아웃을 운영 의존성 확인 없이 삭제하지 않는다. 설정 파일·환경 파일은 비공개이며 토큰을 문서/Git에 넣지 않는다. 서버 전체 재부팅은 미실시다. SSD 보존본의 오래된 DB를 현재 SD 위에 덮어쓰지 않는다.
 
 Docker 상태 검사 실패는 상태 표시이며, 그 자체로 컨테이너를 재시작하지 않는다. `unless-stopped`는 프로세스 종료와 Docker 재시작에 적용된다. 서버 전체 재부팅 시험은 기존 서비스에 영향이 있어 이번 배포 검증에 포함하지 않았다.
 
