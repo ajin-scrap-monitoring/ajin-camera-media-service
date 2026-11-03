@@ -104,7 +104,7 @@ class DailyRecordingService:
                 400, "INVALID_ARGUMENT", "enabled and retention_days (1..365) are required."
             )
         async with self.lock:
-            with self.db:
+            async with self.recording.transaction():
                 self.db.execute(
                     "INSERT OR REPLACE INTO daily_policies VALUES(?,?)",
                     (camera_id, json.dumps(body)),
@@ -212,7 +212,7 @@ class DailyRecordingService:
                 )
                 await self.check_space()
                 async with self.lock:
-                    with self.db:
+                    async with self.recording.transaction():
                         self.catalog.complete_segment(segment["segment_id"], metadata)
             except (OSError, RuntimeError, ValueError, KeyError, ApiError) as exc:
                 capacity = isinstance(exc, ApiError) and exc.code == "INSUFFICIENT_STORAGE"
@@ -222,7 +222,7 @@ class DailyRecordingService:
                         "message": "Recovered media exceeds storage budget.",
                     }
                 async with self.lock:
-                    with self.db:
+                    async with self.recording.transaction():
                         self.db.execute(
                             "UPDATE daily_segments SET status='failed' WHERE id=?",
                             (segment["segment_id"],),
@@ -239,13 +239,14 @@ class DailyRecordingService:
                         )
                 path.with_suffix(".tmp.ts").unlink(missing_ok=True)
             finally:
-                with self.db:
-                    self.recording.release_frames(segment["segment_id"])
+                async with self.lock:
+                    async with self.recording.transaction():
+                        self.recording.release_frames(segment["segment_id"])
 
     async def _recover(self, now: float) -> None:
         await self._recover_segments()
         async with self.lock:
-            with self.db:
+            async with self.recording.transaction():
                 # This singleton recorder owns every daily pin. Old outer leases have no
                 # coroutine after restart, so reclaim them once segment recovery is finished.
                 self.db.execute(
@@ -300,19 +301,23 @@ class DailyRecordingService:
         return result
 
     async def _refresh_async(self, day: dict, until: float) -> dict:
-        # SQLite stays on its owner thread. Decode/coverage/serialization operate
-        # on a detached snapshot while the caller retains the catalogue lock.
-        rows, known = self._coverage_rows(day, until)
+        # The caller retains the catalogue lock across drained DB workers.
+        # Slow SD reads and FULL commits must not stop JPEG/network receipt.
+        rows, known = await storage_io(self._coverage_rows, day, until)
 
         def calculate():
             result = self._refresh_values(day, until, [json.loads(row[0]) for row in rows], known)
             return result, json.dumps(result)
 
         result, body = await storage_io(calculate)
-        self.db.execute(
-            "UPDATE daily_recordings SET status=?,body=? WHERE id=?",
-            (result["status"], body, result["recording_id"]),
-        )
+
+        def save():
+            self.db.execute(
+                "UPDATE daily_recordings SET status=?,body=? WHERE id=?",
+                (result["status"], body, result["recording_id"]),
+            )
+
+        await storage_io(save)
         return result
 
     def _refresh_values(self, day: dict, until: float, segments, known) -> dict:
@@ -360,7 +365,7 @@ class DailyRecordingService:
             if self.recording.queue is not None:
                 await self.recording.queue.wait_received()
             async with self.lock:
-                with self.db:
+                async with self.recording.transaction():
                     self._flush_losses(now)
             for camera in sorted(self.recording.cameras):
                 async with self.lock:
@@ -373,7 +378,7 @@ class DailyRecordingService:
                             continue
                         cursor = now
                         window = DailyWindow.from_date(seoul_date(now))
-                        with self.db:
+                        async with self.recording.transaction():
                             day = self._ensure_day(camera, window, policy["retention_days"])
                             if now > window.start_at:
                                 self.db.execute(
@@ -391,7 +396,7 @@ class DailyRecordingService:
                         "message": "Wall clock moved backwards; recording pauses until safe time.",
                     }
                     async with self.lock:
-                        with self.db:
+                        async with self.recording.transaction():
                             for item in self.db.execute(
                                 "SELECT body FROM daily_recordings WHERE camera=? "
                                 "AND status IN ('recording','finalizing')",
@@ -404,7 +409,7 @@ class DailyRecordingService:
                 while cursor < now:
                     window = DailyWindow.from_date(seoul_date(cursor))
                     async with self.lock:
-                        with self.db:
+                        async with self.recording.transaction():
                             day = self._ensure_day(camera, window, policy["retention_days"])
                             if now >= window.end_at and day["status"] == "recording":
                                 day["status"] = "finalizing"
@@ -434,7 +439,7 @@ class DailyRecordingService:
                         await self._record_slot(day, cursor, slot_end)
                     cursor = slot_end
                     async with self.lock:
-                        with self.db:
+                        async with self.recording.transaction():
                             self._flush_losses(now)
                             await self._refresh_async(
                                 self.catalog.get_day(day["recording_id"]), cursor
@@ -445,7 +450,7 @@ class DailyRecordingService:
                 # Even an empty next day exists immediately at midnight.
                 if seoul_date(cursor) == seoul_date(now):
                     async with self.lock:
-                        with self.db:
+                        async with self.recording.transaction():
                             self._ensure_day(
                                 camera,
                                 DailyWindow.from_date(seoul_date(now)),
@@ -455,7 +460,7 @@ class DailyRecordingService:
     async def _record_slot(self, day: dict, start: float, end: float) -> None:
         lease_id = str(uuid.uuid4())
         async with self.lock:
-            with self.db:
+            async with self.recording.transaction():
                 for a, b in self._disabled_spans(day["camera_id"], start, end):
                     self._save_loss(day["camera_id"], a, b, "RECORDING_DISABLED")
                 # Lease boundary neighbours too: a slot cut must preserve the same
@@ -515,7 +520,7 @@ class DailyRecordingService:
         try:
             for group in groups:
                 async with self.lock:
-                    with self.db:
+                    async with self.recording.transaction():
                         segment = self.catalog.begin_segment(
                             day["recording_id"], group[0].received_at, end
                         )
@@ -557,7 +562,7 @@ class DailyRecordingService:
                     await self.check_space()
                     metadata["path"] = str(path.relative_to(self.recording.root))
                     async with self.lock:
-                        with self.db:
+                        async with self.recording.transaction():
                             self.catalog.complete_segment(segment["segment_id"], metadata)
                             current = self.catalog.get_day(day["recording_id"])
                             current["revision"] += 1
@@ -593,7 +598,7 @@ class DailyRecordingService:
                         "message": "Daily recording segment could not be saved.",
                     }
                     async with self.lock:
-                        with self.db:
+                        async with self.recording.transaction():
                             self.db.execute(
                                 "UPDATE daily_segments SET status='failed' WHERE id=?",
                                 (segment["segment_id"],),
@@ -602,11 +607,11 @@ class DailyRecordingService:
                     self.storage_reservations.pop(segment["segment_id"], None)
                     self.storage_reservation_outputs.pop(segment["segment_id"], None)
                     async with self.lock:
-                        with self.db:
+                        async with self.recording.transaction():
                             self.recording.release_frames(segment["segment_id"])
         finally:
             async with self.lock:
-                with self.db:
+                async with self.recording.transaction():
                     self.recording.release_frames(lease_id)
 
     async def check_space(self, reserve: int = 0, *, recording: bool = False) -> None:
@@ -792,7 +797,7 @@ class DailyRecordingService:
                     )
                     await self._record_slot(day, cursor, end)
                     async with self.lock:
-                        with self.db:
+                        async with self.recording.transaction():
                             self._flush_losses(now)
                             await self._refresh_async(
                                 self.catalog.get_day(day["recording_id"]), end
