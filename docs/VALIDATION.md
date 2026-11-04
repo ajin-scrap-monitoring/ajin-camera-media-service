@@ -395,3 +395,12 @@ Linux 개발용 imageio-ffmpeg7.0.2는 유효 TS 읽기에서 종료 코드-11�
 Ubuntu 시스템 FFmpeg6.1.1로 바꾼 첫 수정은132개 통과/4개 실패였다. 영상 길이와 손상 JPEG 처리 동작이 운영7.1 환경과 달랐다. 최종 워크플로는 실제 Dockerfile로 이미지를 빌드하고 그 이미지의 시스템 FFmpeg에서 전체 Pytest를 실행한다. 개발 의존성은 일회용 시험 컨테이너에만 설치하고 `IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg`를 지정한다. 이미지의 기본 운영 설치에는 개발 의존성을 추가하지 않는다.
 
 테스트 경로 설정에 프로젝트 루트와 src를 포함해 `pytest`와 `python -m pytest`에서 동일하게 도구를 찾도록 했다. 테스트를 생략하거나 영상 길이/손상 검증 조건을 완화하지 않았다. 콘솔 실행으로 import 실패를 재현한 뒤 수정 후 전체136개 시험(33.55초), Ruff check/format 통과를 확인했다. GitHub 측 최종 판정에는 최신 main 실행의 Pytest와 Container build까지 성공했는지 확인해야 한다. 과거 실패 실행 이력은 수정 후에도 남는다.
+
+
+## 2026-11-05 썸네일 선택 기능
+
+2026-11-04 요청에 맞춰 기존 media-info 호환 응답과 분리한 전용 thumbnail-info/준비/JPEG GET·HEAD를 검증했다. 최종 코드22b5d9f 서버 Linux 전체430passed(432.48초), [GitHub CI 성공](https://github.com/ajin-scrap-monitoring/ajin-camera-media-service/actions/runs/41855392861), Ruff check/format 통과. 직전 Windows 전체427passed/2skipped 후 마지막 예외 보완은 관련22개와 서버 전체에서 확인했다. skip은 기존 symlink 권한·Linux ctime 시험이다. 삭제/재준비 ABA 경합, stale GET의 새 이미지 삭제, 취소 시 예약 누수, 선택 DB 오류의 원본 삭제 차단을 실패 재현 후 수정·통과했다.
+
+서버에서 별도 합성 MP4 서비스와 실제 백엔드 컨테이너 사이의 준비202→ready, 실제 JPEG10621bytes와 HEAD, 재시작 재사용, 재삭제204, 삭제 후410 및 실제 파일 정리를 검증했다. 운영 원본을 삭제하지 않았다. 운영 이미지22b5d9f 배포 후 healthy/systemd active/enabled, SD·환경·자원·네트워크·기존 ID 보존, 새 카메라/날짜 조각 수신, MJPEG/HLS200, 신규 조회/예외와 GET 무변환을 확인했다. 인증 게이트웨이·프론트엔드 통합은 별도다.
+
+GitHub CLI 인증 복구 후 [PR #6](https://github.com/ajin-scrap-monitoring/ajin-camera-media-service/pull/6)을 생성했다. main 통합 상태와 병합 커밋은 해당 PR을 기준으로 확인한다. 운영 실행 코드는22b5d9f이며 후속 문서 갱신은 실행 코드에 영향을 주지 않는다. 실제 계약·응답·배포 상태는 [회신](INTEGRATION_REPLY_2026-11-04.md)과 [계약](THUMBNAIL_API_CONTRACT_2026-11-04.md)을 참조한다.

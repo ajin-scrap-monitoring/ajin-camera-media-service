@@ -277,6 +277,8 @@ class DailyExportService:
                 self.daily.catalog.save_day(day)
         if error:
             final.unlink(missing_ok=True)
+        else:
+            self.daily.recording.notify_thumbnail_ready("day", recording_id, metadata)
 
     def _file_lock(self, recording_id: str) -> asyncio.Lock:
         return self.file_locks.setdefault(recording_id, asyncio.Lock())
@@ -361,39 +363,45 @@ class DailyExportService:
                 self.db.execute("DELETE FROM daily_compactions WHERE day_id=?", (recording_id,))
 
     async def delete_day(self, recording_id: str) -> None:
-        async with self.lock:
-            day = self.daily.catalog.get_day(recording_id)
-            if day["status"] in ("recording", "finalizing"):
-                raise ApiError(409, "RECORDING_ACTIVE", "Current day cannot be deleted.")
-            if self._has_job(recording_id):
-                raise ApiError(409, "EXPORT_IN_PROGRESS", "Archive is in progress.")
-            if self.db.execute(
-                "SELECT 1 FROM clip_recording_pins WHERE day_id=? LIMIT 1", (recording_id,)
-            ).fetchone():
-                raise ApiError(409, "EXPORT_IN_PROGRESS", "A media request uses this recording.")
-            if day.get("cleanup_state") == "complete":
-                return
-            if day["status"] != "expired":
+        async with self.daily.recording.thumbnail_deletion("day", recording_id):
+            async with self.lock:
+                day = self.daily.catalog.get_day(recording_id)
+                if day["status"] in ("recording", "finalizing"):
+                    raise ApiError(409, "RECORDING_ACTIVE", "Current day cannot be deleted.")
+                if self._has_job(recording_id):
+                    raise ApiError(409, "EXPORT_IN_PROGRESS", "Archive is in progress.")
+                if self.db.execute(
+                    "SELECT 1 FROM clip_recording_pins WHERE day_id=? LIMIT 1", (recording_id,)
+                ).fetchone():
+                    raise ApiError(
+                        409, "EXPORT_IN_PROGRESS", "A media request uses this recording."
+                    )
+                if day.get("cleanup_state") == "complete":
+                    return
+                if day["status"] != "expired":
+                    day.update(
+                        status="deleted",
+                        deleted_at=day.get("deleted_at") or iso(self.daily.clock()),
+                    )
                 day.update(
-                    status="deleted", deleted_at=day.get("deleted_at") or iso(self.daily.clock())
+                    playback_state="unavailable",
+                    playback_path=None,
+                    download_path=None,
+                    export_allowed=False,
+                    size_bytes=None,
+                    export_expires_at=None,
+                    cleanup_state="pending",
+                    cleanup_completed_at=None,
+                    cleanup_error=None,
+                    space_reclaimed=None,
                 )
-            day.update(
-                playback_state="unavailable",
-                playback_path=None,
-                download_path=None,
-                export_allowed=False,
-                size_bytes=None,
-                export_expires_at=None,
-                cleanup_state="pending",
-                cleanup_completed_at=None,
-                cleanup_error=None,
-                space_reclaimed=None,
-            )
-            with self.db:
-                self.daily.catalog.save_day(day)
-                self.db.execute("INSERT OR IGNORE INTO daily_cleanup VALUES(?)", (recording_id,))
-        if not await self._cleanup(recording_id):
-            raise ApiError(409, "EXPORT_IN_PROGRESS", "A media request uses this recording.")
+                with self.db:
+                    self.daily.catalog.save_day(day)
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO daily_cleanup VALUES(?)", (recording_id,)
+                    )
+            if not await self._cleanup(recording_id):
+                raise ApiError(409, "EXPORT_IN_PROGRESS", "A media request uses this recording.")
 
     async def _cleanup(self, recording_id: str) -> bool:
         async with self._file_lock(recording_id):
@@ -432,6 +440,11 @@ class DailyExportService:
                 if not path.resolve().is_relative_to(self.output.resolve()):
                     raise OSError("Invalid media path")
                 path.unlink(missing_ok=True)
+
+            thumbnail = self.root / "daily-thumbnails" / (recording_id + ".jpg")
+            if thumbnail.parent.resolve() != thumbnail.parent:
+                raise OSError("Invalid thumbnail cleanup root")
+            thumbnail.unlink(missing_ok=True)
 
         try:
             await self._file_work(remove)

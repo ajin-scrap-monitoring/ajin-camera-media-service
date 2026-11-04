@@ -104,3 +104,27 @@ def test_settings_rejects_duplicate_camera_id_placeholders() -> None:
 def test_settings_from_env_rejects_invalid_values(environ: dict[str, str]) -> None:
     with pytest.raises(SettingsError):
         Settings.from_env(environ)
+
+
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {"MAX_THUMBNAIL_JOBS": "0"},
+        {"MAX_THUMBNAIL_JOBS": "17"},
+        {"THUMBNAIL_TIMEOUT_SECONDS": "31"},
+        {"MAX_THUMBNAIL_BYTES": "524289"},
+        {"THUMBNAILS_ENABLED": "maybe"},
+    ],
+)
+def test_thumbnail_resource_limits_are_bounded(environ):
+    with pytest.raises(SettingsError):
+        Settings.from_env({"EDGE_AUTH_SECRET": '{"cam-1":"test-token"}', **environ})
+
+
+def test_thumbnail_defaults_and_disable():
+    settings = Settings.from_env({"EDGE_AUTH_SECRET": '{"cam-1":"test-token"}'})
+    assert settings.thumbnails_enabled and settings.max_thumbnail_jobs == 4
+    assert settings.thumbnail_timeout_seconds == 15 and settings.max_thumbnail_bytes == 524288
+    assert not Settings.from_env(
+        {"EDGE_AUTH_SECRET": '{"cam-1":"test-token"}', "THUMBNAILS_ENABLED": "false"}
+    ).thumbnails_enabled

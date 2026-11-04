@@ -652,7 +652,7 @@ class DailyRecordingService:
                 guard()
             total = media_total = buffer_bytes = 0
             allocated = dict.fromkeys(reservations, 0)
-            categories = ("daily", "daily-exports", "daily-playback")
+            categories = ("daily", "daily-exports", "daily-playback", "daily-thumbnails")
             roots = (
                 (self.recording.root,)
                 if total_limit
