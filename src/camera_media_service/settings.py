@@ -32,6 +32,10 @@ class Settings:
     max_media_storage_bytes: int | None = None
     daily_archive_workspace_bytes: int = 0
     max_clip_jobs: int = 32
+    thumbnails_enabled: bool = True
+    max_thumbnail_jobs: int = 4
+    thumbnail_timeout_seconds: int = 15
+    max_thumbnail_bytes: int = 512 * 1024
     daily_recording_enabled: bool = False
     daily_archive_enabled: bool = True
     daily_segment_seconds: int = 10
@@ -139,6 +143,12 @@ class Settings:
             max_media_storage_bytes=media_budget or None,
             daily_archive_workspace_bytes=archive_workspace,
             max_clip_jobs=_read_int(environ, "MAX_CLIP_JOBS", 32, 1),
+            thumbnails_enabled=_read_bool(environ, "THUMBNAILS_ENABLED", True),
+            max_thumbnail_jobs=_read_int(environ, "MAX_THUMBNAIL_JOBS", 4, 1, 16),
+            thumbnail_timeout_seconds=_read_int(environ, "THUMBNAIL_TIMEOUT_SECONDS", 15, 1, 30),
+            max_thumbnail_bytes=_read_int(
+                environ, "MAX_THUMBNAIL_BYTES", 512 * 1024, 16384, 512 * 1024
+            ),
             daily_recording_enabled=daily_enabled,
             daily_archive_enabled=_read_bool(environ, "DAILY_ARCHIVE_ENABLED", True),
             daily_segment_seconds=_read_int(environ, "DAILY_SEGMENT_SECONDS", 10, 2, 60),

@@ -90,6 +90,9 @@ class RecordingService:
         self.max_storage_bytes = max_storage_bytes
         self.min_free_storage_bytes = min_free_storage_bytes
         self.capacity_check = None
+        self.thumbnail_observer = None
+        self.thumbnail_change_observer = None
+        self.thumbnail_pins = set()
         self._buffer_budget_snapshot = None
         self._budget_generation = 0
         self.capacity_reservations = StorageReservations(self._invalidate_budget_snapshot)
@@ -279,6 +282,19 @@ class RecordingService:
             (body["status"], json.dumps(body), body["clip_id"]),
         )
 
+        if self.thumbnail_change_observer:
+            try:
+                self.thumbnail_change_observer("clip", body["clip_id"], body["status"])
+            except Exception:
+                LOG.exception("Optional thumbnail notification failed")
+
+    def notify_thumbnail_ready(self, kind, key, metadata):
+        if self.thumbnail_observer:
+            try:
+                self.thumbnail_observer(kind, key, metadata.get("_file_identity"))
+            except Exception:
+                LOG.exception("Optional thumbnail notification failed")
+
     def _get(self, clip_id: str) -> dict:
         row = self.db.execute("SELECT body FROM jobs WHERE id=?", (clip_id,)).fetchone()
         if row is None:
@@ -389,18 +405,28 @@ class RecordingService:
             sql += " ORDER BY accepted DESC,id DESC LIMIT ?"
             return [json.loads(r[0]) for r in self.db.execute(sql, (*args, limit))]
 
+    @asynccontextmanager
+    async def thumbnail_deletion(self, kind, key):
+        manager = getattr(self, "thumbnail_manager", None)
+        if manager:
+            async with manager.deletion(kind, key):
+                yield
+        else:
+            yield
+
     async def delete_clip(self, clip_id: str) -> None:
-        async with self.lock:
-            body = self._get(clip_id)
-            await self._expire(body)
-            if body["status"] in ACTIVE:
-                raise ApiError(409, "CLIP_IN_PROGRESS", "Recording is still in progress.")
-            if body["status"] in ("deleted", "expired"):
-                return
-            await self._remove_files(clip_id)
-            body.update(status="deleted", deleted_at=iso(time.time()), content_path=None)
-            with self.db:
-                self._save(body)
+        async with self.thumbnail_deletion("clip", clip_id):
+            async with self.lock:
+                body = self._get(clip_id)
+                await self._expire(body)
+                if body["status"] in ACTIVE or clip_id in self.thumbnail_pins:
+                    raise ApiError(409, "CLIP_IN_PROGRESS", "Recording is still in progress.")
+                if body["status"] in ("deleted", "expired"):
+                    return
+                await self._remove_files(clip_id)
+                body.update(status="deleted", deleted_at=iso(time.time()), content_path=None)
+                with self.db:
+                    self._save(body)
 
     async def _remove_files(self, clip_id: str) -> None:
         # clip_id comes from the catalog, never directly from a supplied filesystem path.
@@ -408,6 +434,13 @@ class RecordingService:
             self.storage_guard()
             for suffix in (".mp4", ".tmp.mp4", ".ffconcat"):
                 (self.clips / f"{clip_id}{suffix}").unlink(missing_ok=True)
+            try:
+                thumbnail = self.root / "clip-thumbnails" / (clip_id + ".jpg")
+                if thumbnail.parent.resolve() != thumbnail.parent:
+                    raise OSError("Invalid thumbnail cleanup root")
+                thumbnail.unlink(missing_ok=True)
+            except OSError:
+                LOG.warning("Optional clip thumbnail cleanup deferred")
 
         await asyncio.to_thread(remove)
 
@@ -424,6 +457,8 @@ class RecordingService:
             await self._cleanup_pending(body["clip_id"])
 
     async def _cleanup_pending(self, clip_id: str) -> None:
+        if clip_id in self.thumbnail_pins:
+            return
         if self.db.execute("SELECT 1 FROM pending_cleanup WHERE id=?", (clip_id,)).fetchone():
             try:
                 await self._remove_files(clip_id)
@@ -627,6 +662,8 @@ class RecordingService:
                 except sqlite3.Error:
                     LOG.exception("Retrying clip result persistence: %s", clip_id)
                     await asyncio.sleep(1)
+            if body["status"] == "ready" and metadata:
+                self.notify_thumbnail_ready("clip", clip_id, metadata)
 
     async def start(self) -> None:
         self.queue = self.hub.subscribe(maxsize=100, recording=True)
