@@ -379,6 +379,8 @@ class RecordedClipService:
                 await asyncio.sleep(1)
         if error:
             (self.recording.clips / f"{clip_id}.mp4").unlink(missing_ok=True)
+        elif metadata:
+            self.recording.notify_thumbnail_ready("clip", clip_id, metadata)
 
     async def close(self):
         if self.closed:

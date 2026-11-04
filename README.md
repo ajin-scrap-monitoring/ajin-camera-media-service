@@ -67,7 +67,7 @@ HTTP API와 이벤트 녹화는 서비스 시작 시 항상 활성화됩니다. 
 | --- | --- |
 | `DAILY_RECORDING_ENABLED` | `false`, v2 서비스 활성화 |
 | `DAILY_ARCHIVE_ENABLED` | `true`, 종료 날짜 자동 MP4 준비·중복 TS 정리. `false`는 배포 점검용 일시 중지 |
-| `MAX_DAILY_STORAGE_BYTES` | 기본 미지정, 활성화 시 필수. 날짜 조각+MP4+재생 캐시+임시 파일 예산 |
+| `MAX_DAILY_STORAGE_BYTES` | 기본 미지정, 활성화 시 필수. 날짜 조각+MP4+재생 캐시+날짜 썸네일+임시 파일 예산 |
 | `MIN_FREE_STORAGE_BYTES` | `5368709120`, 최소 남겨 둘 공간(5GiB) |
 | `DAILY_WIDTH`, `DAILY_HEIGHT`, `DAILY_FPS` | `1920`, `1080`, `30` |
 | `DAILY_SEGMENT_SECONDS` | `10`, 조각 길이 목표(2..60초) |
@@ -76,6 +76,12 @@ HTTP API와 이벤트 녹화는 서비스 시작 시 항상 활성화됩니다. 
 | `MAX_DAILY_EXPORT_JOBS` | 이전 환경 호환용. 자동 MP4 준비는 한 번에1개 |
 
 보관 기간 기본30일은 카메라별 v2 정책으로 정합니다. MP4 준비 중 TS와 MP4가 함께 존재할 추가 공간이 필요하며, 부족하면 TS를 유지하고 자동 재시도합니다. 검증은 백그라운드에서 디코더2스레드로 수행하므로 CPU·디스크 읽기 부하는 남습니다. 버퍼·이벤트·DB는 날짜 예산에 포함하지 않습니다. 날짜 예산 도달 시 기존 자료를 임의로 조기 삭제하지 않고 새 저장 누락을 보고합니다. 새 프로파일로 기존 날짜 MP4를 재인코딩하지 않습니다.
+
+## 녹화 썸네일
+
+ready 클립·완료 날짜의 기존 MP4에서 실제 첫 프레임 JPEG를 준비합니다. 최대640×360, 종횡비 유지·확대 금지, 512KiB이며 생성은 한 번에1개/대기 포함4개로 제한합니다. 신규 파일 완료 후 선택 기능으로 준비하며, 과거 파일은 명시적 POST로만 준비합니다. 목록·GET·재시작에서 전체 과거 파일을 변환하지 않습니다.
+
+기존 `media-info.thumbnail`은 백엔드 호환을 위해 unsupported/null을 유지합니다. 별도 JSON·POST·GET/HEAD 경로와 시각의 null 규칙, 브라우저 인증 게이트웨이 작업은 [썸네일 계약](docs/THUMBNAIL_API_CONTRACT_2026-11-04.md)을 참조하세요. 썸네일 오류는 영상 상태를 실패로 바꾸지 않습니다.
 
 ## 주요 환경 변수
 
@@ -129,6 +135,7 @@ uv run ruff format --check .
 
 ## 문서
 
+- [썸네일 연동 계약](docs/THUMBNAIL_API_CONTRACT_2026-11-04.md)
 - [백엔드 통신 규격](docs/BACKEND_API_CONTRACT.md)
 - [아키텍처](docs/ARCHITECTURE.md)
 - [검증 기록](docs/VALIDATION.md)

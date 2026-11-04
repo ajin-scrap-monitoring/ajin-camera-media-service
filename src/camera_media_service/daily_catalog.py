@@ -101,6 +101,10 @@ class DailyCatalog:
             (body["status"], json.dumps(body), body["recording_id"]),
         )
 
+        observer = getattr(self, "thumbnail_change_observer", None)
+        if observer:
+            observer("day", body["recording_id"], body["status"])
+
     def begin_segment(self, recording_id: str, start_at: float, end_at: float) -> dict:
         body = {
             "segment_id": str(uuid.uuid4()),

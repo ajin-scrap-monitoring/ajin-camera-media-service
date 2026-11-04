@@ -166,6 +166,12 @@ class WebSocketServer:
                     daily=daily,
                     exports=exports,
                     status_tracker=self.ingest_service.status_tracker,
+                    thumbnail_options={
+                        "enabled": self.settings.thumbnails_enabled,
+                        "max_jobs": self.settings.max_thumbnail_jobs,
+                        "timeout": self.settings.thumbnail_timeout_seconds,
+                        "max_bytes": self.settings.max_thumbnail_bytes,
+                    },
                 ),
                 shutdown_timeout=2,
                 access_log=None,
