@@ -395,3 +395,10 @@ Linux 개발용 imageio-ffmpeg7.0.2는 유효 TS 읽기에서 종료 코드-11�
 Ubuntu 시스템 FFmpeg6.1.1로 바꾼 첫 수정은132개 통과/4개 실패였다. 영상 길이와 손상 JPEG 처리 동작이 운영7.1 환경과 달랐다. 최종 워크플로는 실제 Dockerfile로 이미지를 빌드하고 그 이미지의 시스템 FFmpeg에서 전체 Pytest를 실행한다. 개발 의존성은 일회용 시험 컨테이너에만 설치하고 `IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg`를 지정한다. 이미지의 기본 운영 설치에는 개발 의존성을 추가하지 않는다.
 
 테스트 경로 설정에 프로젝트 루트와 src를 포함해 `pytest`와 `python -m pytest`에서 동일하게 도구를 찾도록 했다. 테스트를 생략하거나 영상 길이/손상 검증 조건을 완화하지 않았다. 콘솔 실행으로 import 실패를 재현한 뒤 수정 후 전체136개 시험(33.55초), Ruff check/format 통과를 확인했다. GitHub 측 최종 판정에는 최신 main 실행의 Pytest와 Container build까지 성공했는지 확인해야 한다. 과거 실패 실행 이력은 수정 후에도 남는다.
+
+
+## 2026-11-05 썸네일 선택 기능
+
+2026-11-04 요청에 맞춰 기존 media-info 호환 응답과 분리한 전용 thumbnail-info/준비/JPEG GET·HEAD를 검증했다. Windows 전체427passed/2skipped(58.53초), Ruff check/format 통과. skip은 기존 symlink 권한·Linux ctime 시험이다. 관련53개 회귀 시험과 합성 MP4의 실제 HTTP/JPEG10650bytes, HEAD, 삭제 후410도 확인했다. 삭제/재준비 ABA 경합, stale GET의 새 이미지 삭제, 취소 시 예약 누수는 실패 재현 후 수정·통과했다.
+
+검증은 격리된 합성 파일에서 수행했다. 현재 실행 환경에 승인된 SSH 키가 없어 운영 서버 배포·현 상태 확인은 실행하지 못했다. GitHub connector branch 쓰기도403으로 거부됐다. 실제 반영 결과는 후속 회신에서 구분한다. 상세는 [회신](INTEGRATION_REPLY_2026-11-04.md)과 [계약](THUMBNAIL_API_CONTRACT_2026-11-04.md)을 참조한다.

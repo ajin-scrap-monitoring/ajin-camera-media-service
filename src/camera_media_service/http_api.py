@@ -62,7 +62,12 @@ def query_fields(request, allowed):
 
 
 def create_http_app(
-    service: RecordingService, *, daily=None, exports=None, status_tracker=None
+    service: RecordingService,
+    *,
+    daily=None,
+    exports=None,
+    status_tracker=None,
+    thumbnail_options=None,
 ) -> web.Application:
     key = service.cursor_key
     viewers = 0
@@ -95,16 +100,23 @@ def create_http_app(
             LOG.exception("Media API request failed")
             return error_response(ApiError(500, "INTERNAL_ERROR", "Internal service error."))
 
-    app = web.Application(middlewares=[boundary], client_max_size=16384)
+    from camera_media_service.thumbnail_http_api import register_thumbnail_routes, thumbnail_headers
+    from camera_media_service.thumbnails import ThumbnailService
+
+    thumbnails = ThumbnailService(service, daily, exports, **(thumbnail_options or {}))
+    app = web.Application(middlewares=[thumbnail_headers, boundary], client_max_size=16384)
+    register_thumbnail_routes(app, thumbnails)
 
     async def lifecycle(app):
         try:
+            await thumbnails.start()
             await service.start()
             if daily is not None:
                 await daily.start()
                 await exports.start()
             yield
         finally:
+            await thumbnails.close()
             if recorded_clips is not None:
                 await recorded_clips.close()
             if daily is not None:
