@@ -426,11 +426,14 @@ class ThumbnailService:
             task.cancel()
         await settle(asyncio.gather(task, return_exceptions=True))
         await settle(self._release(kind, key, "thumbnail:" + kind + ":" + key))
-        row = await self.store.get(kind, key)
-        if row and row["status"] == "pending":
-            await self.store.put(
-                kind, key, self._base(kind, key, row["camera_id"], "failed", "JOB_INTERRUPTED")
-            )
+        try:
+            row = await self.store.get(kind, key)
+            if row and row["status"] == "pending":
+                await self.store.put(
+                    kind, key, self._base(kind, key, row["camera_id"], "failed", "JOB_INTERRUPTED")
+                )
+        except (OSError, sqlite3.Error):
+            LOG.exception("Optional thumbnail state recovery deferred after source reader drained")
 
     async def _run(self, kind, key, source, identity, temporary, owner, pending):
         error = None
