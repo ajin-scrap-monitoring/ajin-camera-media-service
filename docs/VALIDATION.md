@@ -403,4 +403,4 @@ Ubuntu 시스템 FFmpeg6.1.1로 바꾼 첫 수정은132개 통과/4개 실패였
 
 서버에서 별도 합성 MP4 서비스와 실제 백엔드 컨테이너 사이의 준비202→ready, 실제 JPEG10621bytes와 HEAD, 재시작 재사용, 재삭제204, 삭제 후410 및 실제 파일 정리를 검증했다. 운영 원본을 삭제하지 않았다. 운영 이미지22b5d9f 배포 후 healthy/systemd active/enabled, SD·환경·자원·네트워크·기존 ID 보존, 새 카메라/날짜 조각 수신, MJPEG/HLS200, 신규 조회/예외와 GET 무변환을 확인했다. 인증 게이트웨이·프론트엔드 통합은 별도다.
 
-브랜치 업로드는 완료했지만 GitHub connector의 PR 생성403으로 PR/main 병합은 미완료다. 실제 계약·응답·배포 상태는 [회신](INTEGRATION_REPLY_2026-11-04.md)과 [계약](THUMBNAIL_API_CONTRACT_2026-11-04.md)을 참조한다.
+GitHub CLI 인증 복구 후 [PR #6](https://github.com/ajin-scrap-monitoring/ajin-camera-media-service/pull/6)을 생성했다. main 통합 상태와 병합 커밋은 해당 PR을 기준으로 확인한다. 운영 실행 코드는22b5d9f이며 후속 문서 갱신은 실행 코드에 영향을 주지 않는다. 실제 계약·응답·배포 상태는 [회신](INTEGRATION_REPLY_2026-11-04.md)과 [계약](THUMBNAIL_API_CONTRACT_2026-11-04.md)을 참조한다.
