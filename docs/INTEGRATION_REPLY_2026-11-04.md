@@ -66,7 +66,7 @@
 - 기존 SD 마운트·환경값·포트·CPU/메모리 제한·네트워크·기존 카탈로그 ID를 보존했다. SQLite 온라인 백업 후 미디어 서비스만 재시작했고 데이터베이스를 이전 백업으로 되돌리지 않았다.
 - 실제 백엔드 컨테이너의 운영 조회에서 카메라 healthy, MJPEG200, 현재 날짜 HLS200, 기존 media-info.thumbnail unsupported/null, 새 정보 API200, 잘못된 UUID400, 미준비 이미지404/no-store를 확인했다. 배포 이후 새 날짜 조각이 저장됐다.
 - 과거 클립/완료 날짜 조회 뒤 thumbnail DB행0을 확인했다. GET이나 시작 과정이 과거 영상 변환을 유발하지 않았다. 진행 날짜는 DAILY_MP4_REQUIRED로 반환했다.
-- GitHub 플러그인은 PR 생성 요청에403 Resource not accessible by integration을 반환한다. SSH로 브랜치 업로드는 완료했으며 **PR 생성과 main 병합은 아직 미완료**다. 운영에는 위 검증된 브랜치 코드를 배포했다. [PR 생성 비교 화면](https://github.com/ajin-scrap-monitoring/ajin-camera-media-service/compare/main...codex/recording-thumbnails-impl?expand=1)에서 실제 변경을 확인할 수 있다.
+- GitHub CLI 인증을 복구해 [PR #6](https://github.com/ajin-scrap-monitoring/ajin-camera-media-service/pull/6)을 생성했다. 브랜치는 `codex/recording-thumbnails-impl`이며 main 통합 상태·병합 커밋은 해당 PR에서 확인한다. 운영 실행 코드는 위22b5d9f와 동일하며 이번 후속 갱신은 전달 문서만 수정한다. GitHub 플러그인의403과 CLI 인증은 별도다.
 
 실제 백엔드 컨테이너→서버의 별도 합성 영상 서비스 HTTP 시험도 통과했다. 원본은 별도 임시 볼륨의 합성320×240 MP4이며 운영 자료가 아니다. POST202→ready, JPEG GET/HEAD200·10621bytes/no-store/nosniff, 재시작 뒤 동일 generated_at/저장값 재사용, 최초/재삭제204, 이후 JSON·직접 이미지410과 원본/JPEG 실제 파일 제거를 확인했다. 실제 ready 응답:
 
