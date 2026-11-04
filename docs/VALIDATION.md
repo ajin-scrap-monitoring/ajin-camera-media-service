@@ -399,6 +399,8 @@ Ubuntu 시스템 FFmpeg6.1.1로 바꾼 첫 수정은132개 통과/4개 실패였
 
 ## 2026-11-05 썸네일 선택 기능
 
-2026-11-04 요청에 맞춰 기존 media-info 호환 응답과 분리한 전용 thumbnail-info/준비/JPEG GET·HEAD를 검증했다. Windows 전체427passed/2skipped(58.53초), Ruff check/format 통과. skip은 기존 symlink 권한·Linux ctime 시험이다. 관련53개 회귀 시험과 합성 MP4의 실제 HTTP/JPEG10650bytes, HEAD, 삭제 후410도 확인했다. 삭제/재준비 ABA 경합, stale GET의 새 이미지 삭제, 취소 시 예약 누수는 실패 재현 후 수정·통과했다.
+2026-11-04 요청에 맞춰 기존 media-info 호환 응답과 분리한 전용 thumbnail-info/준비/JPEG GET·HEAD를 검증했다. 최종 코드22b5d9f 서버 Linux 전체430passed(432.48초), [GitHub CI 성공](https://github.com/ajin-scrap-monitoring/ajin-camera-media-service/actions/runs/41855392861), Ruff check/format 통과. 직전 Windows 전체427passed/2skipped 후 마지막 예외 보완은 관련22개와 서버 전체에서 확인했다. skip은 기존 symlink 권한·Linux ctime 시험이다. 삭제/재준비 ABA 경합, stale GET의 새 이미지 삭제, 취소 시 예약 누수, 선택 DB 오류의 원본 삭제 차단을 실패 재현 후 수정·통과했다.
 
-검증은 격리된 합성 파일에서 수행했다. 승인된 SSH 키를 재확인해 운영 서버 healthy·SD 유지·카메라 수신 정상 상태를 확인했다. 새 버전의 서버 격리 시험과 배포 결과는 후속 회신에서 구분한다. GitHub connector 쓰기403은 기존 GitHub SSH 인증을 통해 우회한다. 상세는 [회신](INTEGRATION_REPLY_2026-11-04.md)과 [계약](THUMBNAIL_API_CONTRACT_2026-11-04.md)을 참조한다.
+서버에서 별도 합성 MP4 서비스와 실제 백엔드 컨테이너 사이의 준비202→ready, 실제 JPEG10621bytes와 HEAD, 재시작 재사용, 재삭제204, 삭제 후410 및 실제 파일 정리를 검증했다. 운영 원본을 삭제하지 않았다. 운영 이미지22b5d9f 배포 후 healthy/systemd active/enabled, SD·환경·자원·네트워크·기존 ID 보존, 새 카메라/날짜 조각 수신, MJPEG/HLS200, 신규 조회/예외와 GET 무변환을 확인했다. 인증 게이트웨이·프론트엔드 통합은 별도다.
+
+브랜치 업로드는 완료했지만 GitHub connector의 PR 생성403으로 PR/main 병합은 미완료다. 실제 계약·응답·배포 상태는 [회신](INTEGRATION_REPLY_2026-11-04.md)과 [계약](THUMBNAIL_API_CONTRACT_2026-11-04.md)을 참조한다.
