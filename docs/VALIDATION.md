@@ -401,4 +401,4 @@ Ubuntu 시스템 FFmpeg6.1.1로 바꾼 첫 수정은132개 통과/4개 실패였
 
 2026-11-04 요청에 맞춰 기존 media-info 호환 응답과 분리한 전용 thumbnail-info/준비/JPEG GET·HEAD를 검증했다. Windows 전체427passed/2skipped(58.53초), Ruff check/format 통과. skip은 기존 symlink 권한·Linux ctime 시험이다. 관련53개 회귀 시험과 합성 MP4의 실제 HTTP/JPEG10650bytes, HEAD, 삭제 후410도 확인했다. 삭제/재준비 ABA 경합, stale GET의 새 이미지 삭제, 취소 시 예약 누수는 실패 재현 후 수정·통과했다.
 
-검증은 격리된 합성 파일에서 수행했다. 현재 실행 환경에 승인된 SSH 키가 없어 운영 서버 배포·현 상태 확인은 실행하지 못했다. GitHub connector branch 쓰기도403으로 거부됐다. 실제 반영 결과는 후속 회신에서 구분한다. 상세는 [회신](INTEGRATION_REPLY_2026-11-04.md)과 [계약](THUMBNAIL_API_CONTRACT_2026-11-04.md)을 참조한다.
+검증은 격리된 합성 파일에서 수행했다. 승인된 SSH 키를 재확인해 운영 서버 healthy·SD 유지·카메라 수신 정상 상태를 확인했다. 새 버전의 서버 격리 시험과 배포 결과는 후속 회신에서 구분한다. GitHub connector 쓰기403은 기존 GitHub SSH 인증을 통해 우회한다. 상세는 [회신](INTEGRATION_REPLY_2026-11-04.md)과 [계약](THUMBNAIL_API_CONTRACT_2026-11-04.md)을 참조한다.

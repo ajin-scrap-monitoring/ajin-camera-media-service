@@ -699,3 +699,44 @@ async def test_delete_excludes_reprepare_until_parent_is_deleted(tmp_path, monke
             await asyncio.gather(retry, return_exceptions=True)
         await service.close()
         await recording.close()
+
+
+@pytest.mark.asyncio
+async def test_optional_store_failure_after_decoder_drain_cannot_block_source_delete(
+    tmp_path, monkeypatch
+):
+    import sqlite3
+
+    from camera_media_service import thumbnails
+
+    recording, body = await ready_clip(tmp_path)
+    service = thumbnails.ThumbnailService(recording)
+    await service.start()
+    key = body["clip_id"]
+    entered = asyncio.Event()
+    original = service.store.get
+    deletion = None
+
+    async def blocked(*args, **kwargs):
+        entered.set()
+        await asyncio.Future()
+
+    async def failed(*args):
+        if asyncio.current_task() is deletion:
+            raise sqlite3.OperationalError("optional catalogue unavailable")
+        return await original(*args)
+
+    monkeypatch.setattr(thumbnails, "generate_thumbnail", blocked)
+    try:
+        await service.prepare("clip", key)
+        await entered.wait()
+        monkeypatch.setattr(service.store, "get", failed)
+        deletion = asyncio.create_task(recording.delete_clip(key))
+        await deletion
+        assert (await recording.get_clip(key))["status"] == "deleted"
+        assert not recording.thumbnail_pins and not recording.capacity_reservations
+    finally:
+        if deletion:
+            await asyncio.gather(deletion, return_exceptions=True)
+        await service.close()
+        await recording.close()
