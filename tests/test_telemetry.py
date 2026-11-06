@@ -10,7 +10,22 @@ from camera_media_service.telemetry import (
     IngestTelemetryTracker,
     JsonLogFormatter,
     StatsLoggerTask,
+    configure_logging,
 )
+
+
+def test_configure_logging_emits_operational_info_from_default_root(monkeypatch):
+    import io
+    import sys
+
+    stream = io.StringIO()
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    monkeypatch.setattr(root, "level", logging.WARNING)
+    monkeypatch.setattr(sys, "stderr", stream)
+    configure_logging()
+    logging.getLogger("camera_media_service.recording_diagnostics").info("Diagnostic probe")
+    assert '"message": "Diagnostic probe"' in stream.getvalue()
 
 
 def test_json_log_formatter_masks_secrets() -> None:
