@@ -8,19 +8,21 @@ import logging
 import math
 import shutil
 import sqlite3
-import stat
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 from camera_media_service.daily_catalog import DailyCatalog
+from camera_media_service.daily_coverage_tracking import install_coverage_tracking
 from camera_media_service.daily_gaps import build_gaps
 from camera_media_service.daily_models import DailyWindow, seoul_date
 from camera_media_service.daily_playback import build_available_intervals
 from camera_media_service.encoding import encode_daily_segment, probe_media
 from camera_media_service.media_files import storage_io
+from camera_media_service.media_usage import iter_regular_files
 from camera_media_service.recording import ApiError, RecordingService, epoch, iso
 
 LOG = logging.getLogger(__name__)
@@ -43,6 +45,7 @@ class DailyRecordingService:
             clock or time.time,
         )
         self.db, self.lock = recording.db, recording.lock
+        install_coverage_tracking(self.db)
         self.db.executescript(
             "CREATE TABLE IF NOT EXISTS daily_cursors("
             "camera TEXT PRIMARY KEY,cursor REAL NOT NULL);"
@@ -50,6 +53,12 @@ class DailyRecordingService:
             "camera TEXT NOT NULL,at REAL NOT NULL,enabled INTEGER NOT NULL,"
             "PRIMARY KEY(camera,at));"
         )
+        recording.daily_frame_watermarks = {
+            row["camera"]: row["cursor"]
+            for row in self.db.execute("SELECT camera,cursor FROM daily_cursors")
+            if row["camera"] in recording.cameras
+        }
+        self._slot_sizes = {}
         self.initialized = False
         self.task = None
         self.tick_lock = asyncio.Lock()
@@ -141,6 +150,9 @@ class DailyRecordingService:
                 storage_profile=self.profile,
             )
             self.catalog.save_day(day)
+        self._slot_sizes[camera, window.recording_date.isoformat()] = day["segment_seconds"]
+        if len(self._slot_sizes) > 128:
+            self._slot_sizes.pop(next(iter(self._slot_sizes)))
         return day
 
     def _flush_losses(self, now: float) -> None:
@@ -171,12 +183,17 @@ class DailyRecordingService:
             )
 
     def segment_path(self, segment: dict):
-        day = self.catalog.get_day(segment["recording_id"])
-        block = max(0, int((segment["start_at"] - epoch(day["window_start_at"])) // 600))
+        row = self.db.execute(
+            "SELECT date FROM daily_recordings WHERE id=?", (segment["recording_id"],)
+        ).fetchone()
+        if row is None:
+            raise ApiError(404, "DAILY_RECORDING_NOT_FOUND", "Daily recording does not exist.")
+        window = DailyWindow.from_date(date.fromisoformat(row[0]))
+        block = max(0, int((segment["start_at"] - window.start_at) // 600))
         return (
             self.recording.root
             / "daily"
-            / day["recording_id"]
+            / segment["recording_id"]
             / f"{block:04d}"
             / (segment["segment_id"] + ".ts")
         )
@@ -228,15 +245,23 @@ class DailyRecordingService:
                             (segment["segment_id"],),
                         )
                         day = self.catalog.get_day(segment["recording_id"])
-                        self.db.execute(
-                            "INSERT INTO daily_gaps(camera,start,end,reason) VALUES(?,?,?,?)",
-                            (
-                                day["camera_id"],
-                                segment["start_at"],
-                                segment["end_at"],
-                                "STORAGE_FULL" if capacity else "SERVICE_INTERRUPTED",
-                            ),
-                        )
+                        buffered = self.db.execute(
+                            "SELECT 1 FROM frames WHERE camera=? AND timestamp>=? "
+                            "AND timestamp<? LIMIT 1",
+                            (day["camera_id"], segment["start_at"], segment["end_at"]),
+                        ).fetchone()
+                        if buffered:
+                            self.recording.diagnostics.count("interrupted_segment_buffered")
+                        else:
+                            self.db.execute(
+                                "INSERT INTO daily_gaps(camera,start,end,reason) VALUES(?,?,?,?)",
+                                (
+                                    day["camera_id"],
+                                    segment["start_at"],
+                                    segment["end_at"],
+                                    "STORAGE_FULL" if capacity else "SERVICE_INTERRUPTED",
+                                ),
+                            )
                 path.with_suffix(".tmp.ts").unlink(missing_ok=True)
             finally:
                 async with self.lock:
@@ -262,10 +287,26 @@ class DailyRecordingService:
                         )
                 for row in self.db.execute("SELECT camera,cursor FROM daily_cursors").fetchall():
                     if row["cursor"] < now:
-                        self.db.execute(
-                            "INSERT INTO daily_gaps(camera,start,end,reason) VALUES(?,?,?,?)",
-                            (row["camera"], row["cursor"], now, "SERVICE_INTERRUPTED"),
-                        )
+                        # Durable JPEGs preceding the interruption remain candidates.
+                        # Only the tail after the last observed cadence is absent.
+                        recent = self.db.execute(
+                            "SELECT timestamp FROM frames WHERE camera=? AND timestamp>=? "
+                            "AND timestamp<=? ORDER BY timestamp DESC LIMIT 2",
+                            (row["camera"], row["cursor"], now),
+                        ).fetchall()
+                        missing_start = row["cursor"]
+                        if recent:
+                            cadence = (
+                                recent[0][0] - recent[1][0]
+                                if len(recent) > 1 and 0 < recent[0][0] - recent[1][0] <= 1
+                                else 1 / self.profile["fps"]
+                            )
+                            missing_start = min(now, recent[0][0] + cadence)
+                        if missing_start < now:
+                            self.db.execute(
+                                "INSERT INTO daily_gaps(camera,start,end,reason) VALUES(?,?,?,?)",
+                                (row["camera"], missing_start, now, "SERVICE_INTERRUPTED"),
+                            )
         self.initialized = True
 
     @property
@@ -295,30 +336,134 @@ class DailyRecordingService:
 
     def _refresh(self, day: dict, until: float) -> dict:
         # Synchronous helper retained for callers already doing offline catalogue work.
+        until = max(epoch(day["coverage_as_of_at"]), min(epoch(day["window_end_at"]), until))
         rows, known = self._coverage_rows(day, until)
-        result = self._refresh_values(day, until, [json.loads(row[0]) for row in rows], known)
+        segments = [json.loads(row[0]) for row in rows]
+        result = self._refresh_values(day, until, segments, known)
         self.catalog.save_day(result)
+        self._save_coverage_total(result, segments, until)
         return result
+
+    def _save_coverage_total(self, day, segments, until, prior=None):
+        duration = prior[0] if prior else 0.0
+        ready_end = prior[2] if prior else epoch(day["window_start_at"])
+        for segment in segments:
+            duration += segment["duration"]
+            ready_end = max(ready_end, segment["end_at"])
+        self.db.execute(
+            "INSERT OR REPLACE INTO daily_coverage_totals VALUES(?,?,?,?)",
+            (day["recording_id"], duration, until, ready_end),
+        )
+        for table in ("daily_gap_dirty", "daily_segment_dirty"):
+            self.db.execute(f"DELETE FROM {table} WHERE day_id=?", (day["recording_id"],))
+
+    def _progress_rows(self, day, until):
+        total = self.db.execute(
+            "SELECT duration,covered_until,ready_end FROM daily_coverage_totals WHERE day_id=?",
+            (day["recording_id"],),
+        ).fetchone()
+        dirty = self.db.execute(
+            "SELECT min(start) FROM (SELECT start FROM daily_gap_dirty WHERE day_id=? "
+            "UNION ALL SELECT start FROM daily_segment_dirty WHERE day_id=?)",
+            (day["recording_id"], day["recording_id"]),
+        ).fetchone()[0]
+        if (
+            total is None
+            or iso(total[1]) != day["coverage_as_of_at"]
+            or total[2] > total[1]
+            or (dirty is not None and dirty < total[1])
+            or not isinstance(day.get("gaps"), list)
+            or not isinstance(day.get("available_intervals"), list)
+        ):
+            rows, known = self._coverage_rows(day, until)
+            return rows, known, None
+        rows = self.db.execute(
+            "SELECT body FROM daily_segments WHERE day_id=? AND status='ready' AND start>=? "
+            "ORDER BY start,id",
+            (day["recording_id"], total[1]),
+        ).fetchall()
+        known = [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT start,end,reason FROM daily_gaps "
+                "WHERE camera=? AND start<? AND end>? ORDER BY id",
+                (day["camera_id"], until, total[1]),
+            )
+        ]
+        return rows, known, tuple(total)
 
     async def _refresh_async(self, day: dict, until: float) -> dict:
+        with self.recording.diagnostics.measure("coverage_refresh"):
+            return await self._refresh_snapshot(day, until)
+
+    async def _refresh_snapshot(self, day: dict, until: float) -> dict:
         # The caller retains the catalogue lock across drained DB workers.
         # Slow SD reads and FULL commits must not stop JPEG/network receipt.
-        rows, known = await storage_io(self._coverage_rows, day, until)
+        until = max(epoch(day["coverage_as_of_at"]), min(epoch(day["window_end_at"]), until))
+        rows, known, prior = await storage_io(self._progress_rows, day, until)
 
         def calculate():
-            result = self._refresh_values(day, until, [json.loads(row[0]) for row in rows], known)
-            return result, json.dumps(result)
-
-        result, body = await storage_io(calculate)
-
-        def save():
-            self.db.execute(
-                "UPDATE daily_recordings SET status=?,body=? WHERE id=?",
-                (result["status"], body, result["recording_id"]),
+            segments = [json.loads(row[0]) for row in rows]
+            result = (
+                self._refresh_append_values(day, until, segments, known, prior)
+                if prior is not None
+                else self._refresh_values(day, until, segments, known)
             )
+            return result, segments
 
-        await storage_io(save)
+        result, segments = await storage_io(calculate)
+        await storage_io(self.catalog.save_day, result, notify=False)
+        self._save_coverage_total(result, segments, until, prior)
         return result
+
+    def _refresh_append_values(self, day, until, segments, known, prior):
+        duration, point, _ = prior
+        spans = []
+        for item in segments:
+            if item["start_at"] > point:
+                spans.append((point, min(item["start_at"], until)))
+            point = max(point, item["end_at"])
+        if point < until:
+            spans.append((point, until))
+        tail_gaps = build_gaps(spans, known)
+        boundary_gaps = ([day["gaps"][-1]] if day["gaps"] else []) + tail_gaps
+        intervals = build_available_intervals(
+            segments, boundary_gaps, offset=duration, initial_intervals=day["available_intervals"]
+        )
+        gaps = list(day["gaps"])
+        if (
+            gaps
+            and tail_gaps
+            and gaps[-1]["end_at"] == tail_gaps[0]["start_at"]
+            and (gaps[-1]["reason_code"] == tail_gaps[0]["reason_code"])
+        ):
+            gaps[-1] = {**gaps[-1], "end_at": tail_gaps.pop(0)["end_at"]}
+        gaps.extend(tail_gaps)
+        for item in segments:
+            duration += item["duration"]
+        playable = iso(segments[-1]["end_at"]) if segments else day["playable_until_at"]
+        day.update(
+            coverage_as_of_at=iso(until),
+            recorded_seconds=round(duration, 3),
+            gaps=gaps,
+            has_gaps=bool(gaps),
+            available_intervals=intervals,
+            playable_until_at=playable,
+            playback_state="ready" if playable else "pending",
+            playback_path=f"/api/v2/daily-recordings/{day['recording_id']}/hls/index.m3u8"
+            if playable
+            else None,
+            error=self.last_error,
+        )
+        if until >= epoch(day["window_end_at"]):
+            day.update(
+                status="closed",
+                coverage="none" if not playable else "partial" if gaps else "complete",
+                expires_at=iso(epoch(day["window_end_at"]) + day["retention_days"] * 86400),
+                export_allowed=bool(playable),
+                playback_state="ready" if playable else "unavailable",
+            )
+        return day
 
     def _refresh_values(self, day: dict, until: float, segments, known) -> dict:
         start, end = epoch(day["window_start_at"]), epoch(day["window_end_at"])
@@ -390,6 +535,8 @@ class DailyRecordingService:
                             self.db.execute("INSERT INTO daily_cursors VALUES(?,?)", (camera, now))
                     else:
                         cursor = row[0]
+                self.recording.daily_frame_watermarks[camera] = cursor
+                self.recording.diagnostics.gauge("backlog_seconds", max(0, now - cursor))
                 if now < cursor:
                     self.last_error = {
                         "code": "CLOCK_ADJUSTED",
@@ -402,12 +549,20 @@ class DailyRecordingService:
                                 "AND status IN ('recording','finalizing')",
                                 (camera,),
                             ).fetchall():
-                                paused = json.loads(item[0])
+                                paused = self.catalog.decode_day(item[0])
                                 paused["error"] = self.last_error
                                 self.catalog.save_day(paused)
                     continue
-                while cursor < now:
+                completed_slots = 0
+                while cursor < now and completed_slots < 3:
                     window = DailyWindow.from_date(seoul_date(cursor))
+                    cached_slot = self._slot_sizes.get((camera, window.recording_date.isoformat()))
+                    if (
+                        cached_slot
+                        and min(window.end_at, (math.floor(cursor / cached_slot) + 1) * cached_slot)
+                        > now
+                    ):
+                        break
                     async with self.lock:
                         async with self.recording.transaction():
                             day = self._ensure_day(camera, window, policy["retention_days"])
@@ -420,22 +575,44 @@ class DailyRecordingService:
                     )
                     if slot_end > now:
                         break
+                    empty_end = cursor
                     if now - cursor > self.settings.max_daily_pending_seconds:
-                        slot_end = min(window.end_at, now - self.settings.max_daily_pending_seconds)
-                        reason = (
-                            "SERVICE_INTERRUPTED"
-                            if any(
-                                r[0] == "SERVICE_INTERRUPTED"
-                                for r in self.db.execute(
-                                    "SELECT reason FROM daily_gaps "
-                                    "WHERE camera=? AND start<=? AND end>?",
-                                    (camera, cursor, cursor),
-                                )
-                            )
-                            else "BUFFER_DROPPED"
+                        empty_limit = min(
+                            window.end_at,
+                            math.floor(now / day["segment_seconds"]) * day["segment_seconds"],
                         )
-                        self.notify_loss(camera, cursor, slot_end, reason)
+                        async with self.lock:
+                            first = self.db.execute(
+                                "SELECT min(timestamp) FROM frames WHERE camera=? "
+                                "AND timestamp>=? AND timestamp<?",
+                                (
+                                    camera,
+                                    cursor,
+                                    empty_limit,
+                                ),
+                            ).fetchone()[0]
+                        empty_end = empty_limit
+                        if first is not None:
+                            empty_end = min(
+                                empty_end,
+                                math.floor(first / day["segment_seconds"]) * day["segment_seconds"],
+                            )
+                    if empty_end > cursor:
+                        self.recording.diagnostics.count("source_frames_missing")
+                        slot_end = empty_end
+                        async with self.lock:
+                            async with self.recording.transaction():
+                                for left, right in self._disabled_spans(camera, cursor, slot_end):
+                                    self._save_loss(camera, left, right, "RECORDING_DISABLED")
+                        LOG.info(
+                            "Daily backlog has no stored frames: camera=%s start=%s end=%s",
+                            camera,
+                            iso(cursor),
+                            iso(slot_end),
+                        )
                     else:
+                        if now - cursor > self.settings.max_daily_pending_seconds:
+                            self.recording.diagnostics.count("backlog_frames_preserved")
                         await self._record_slot(day, cursor, slot_end)
                     cursor = slot_end
                     async with self.lock:
@@ -447,8 +624,13 @@ class DailyRecordingService:
                             self.db.execute(
                                 "UPDATE daily_cursors SET cursor=? WHERE camera=?", (cursor, camera)
                             )
+                    self.recording.daily_frame_watermarks[camera] = cursor
+                    completed_slots += 1
                 # Even an empty next day exists immediately at midnight.
-                if seoul_date(cursor) == seoul_date(now):
+                current_key = (camera, seoul_date(now).isoformat())
+                if current_key not in self._slot_sizes and (
+                    policy["enabled"] or seoul_date(cursor) == seoul_date(now)
+                ):
                     async with self.lock:
                         async with self.recording.transaction():
                             self._ensure_day(
@@ -540,22 +722,23 @@ class DailyRecordingService:
                     self.storage_reservation_outputs[owner] = (path, path.with_suffix(".tmp.ts"))
                     await self.check_space(recording=True)
                     group_end = min([end, *[a for a, b in loss if a > group[-1].received_at]])
-                    metadata = await encode_daily_segment(
-                        self.recording.ffmpeg,
-                        self.recording.buffer,
-                        path,
-                        group,
-                        {
-                            **profile,
-                            "end_at": group_end,
-                            "_storage_guard": getattr(self.recording, "storage_guard", None),
-                            **(
-                                {"verified_end_at": end}
-                                if verified_tail and group is groups[-1]
-                                else {}
-                            ),
-                        },
-                    )
+                    with self.recording.diagnostics.measure("daily_encode"):
+                        metadata = await encode_daily_segment(
+                            self.recording.ffmpeg,
+                            self.recording.buffer,
+                            path,
+                            group,
+                            {
+                                **profile,
+                                "end_at": group_end,
+                                "_storage_guard": getattr(self.recording, "storage_guard", None),
+                                **(
+                                    {"verified_end_at": end}
+                                    if verified_tail and group is groups[-1]
+                                    else {}
+                                ),
+                            },
+                        )
                     # JPEG input size does not bound scaled H264/mux output.
                     # Count the finished file before making it available/recoverable.
                     self.storage_reservations[owner] = 0
@@ -564,9 +747,6 @@ class DailyRecordingService:
                     async with self.lock:
                         async with self.recording.transaction():
                             self.catalog.complete_segment(segment["segment_id"], metadata)
-                            current = self.catalog.get_day(day["recording_id"])
-                            current["revision"] += 1
-                            self.catalog.save_day(current)
                     self.last_error = None
                 except (OSError, RuntimeError, TimeoutError, ApiError) as exc:
                     LOG.exception("Daily segment failed: %s", segment["segment_id"])
@@ -615,10 +795,14 @@ class DailyRecordingService:
                     self.recording.release_frames(lease_id)
 
     async def check_space(self, reserve: int = 0, *, recording: bool = False) -> None:
+        with self.recording.diagnostics.measure("space_check"):
+            await self._check_space(reserve, recording=recording)
+
+    async def _check_space(self, reserve: int = 0, *, recording: bool = False) -> None:
         # Snapshot on the event loop; file workers must not read mutable job maps.
         reservations = dict(self.storage_reservations)
         output_owners = {
-            Path(path): owner
+            str(path): owner
             for owner in reservations
             for path in self.storage_reservation_outputs.get(owner, ())
         }
@@ -631,16 +815,24 @@ class DailyRecordingService:
                 for key, paths in self.storage_reservation_outputs.items()
                 if any(Path(p).parent.name == "daily-exports" for p in paths)
             }
-            pending = [
-                int(row[1] * 1.2) + 1048576
+            pending = []
+            if not active_archives:
+                # Select the few unarchived days first. Aggregating the entire
+                # segment history on every encoder admission blocks live input
+                # even though archived days need no additional workspace.
                 for row in self.db.execute(
-                    "SELECT d.id,coalesce(sum(json_extract(s.body,'$.size_bytes')),0) "
-                    "FROM daily_recordings d JOIN daily_segments s ON s.day_id=d.id "
-                    "WHERE d.status IN ('recording','finalizing','closed') AND s.status='ready' "
-                    "AND json_extract(d.body,'$.archive_state')!='mp4' GROUP BY d.id"
-                )
-                if row[0] not in active_archives
-            ]
+                    "SELECT id FROM daily_recordings "
+                    "WHERE status IN ('recording','finalizing','closed')"
+                ).fetchall():
+                    if self.catalog.get_state(row[0]).get("archive_state") == "mp4":
+                        continue
+                    size, count = self.db.execute(
+                        "SELECT coalesce(sum(json_extract(body,'$.size_bytes')),0),count(*) "
+                        "FROM daily_segments WHERE day_id=? AND status='ready'",
+                        (row[0],),
+                    ).fetchone()
+                    if count:
+                        pending.append(int(size * 1.2) + 1048576)
             # One archive runs at a time. Its reservation/output already occupies
             # the working room; do not reserve a *second* full archive during its
             # read-only verification. Success compacts TS, failure removes MP4.
@@ -659,15 +851,8 @@ class DailyRecordingService:
                 else tuple(self.recording.root / folder for folder in categories)
             )
             for root in roots:
-                for path in root.rglob("*"):
-                    try:
-                        info = path.stat()
-                    except FileNotFoundError:
-                        # Archive rename and retention deletion can overlap scans.
-                        continue
-                    if not stat.S_ISREG(info.st_mode):
-                        continue
-                    category = path.relative_to(self.recording.root).parts[0]
+                top_category = None if root == self.recording.root else root.name
+                for path, info, category in iter_regular_files(root, category=top_category):
                     media_total += info.st_size
                     if category in categories:
                         total += info.st_size
@@ -693,14 +878,27 @@ class DailyRecordingService:
 
         used, media_used, free, remaining, buffer_headroom = await asyncio.to_thread(usage)
         reserve += remaining
-        if (
-            used + reserve + workspace > self.settings.max_daily_storage_bytes
-            or (total_limit and media_used + reserve + workspace + buffer_headroom > total_limit)
-            or free - reserve - workspace - buffer_headroom < self.settings.min_free_storage_bytes
-        ):
-            raise ApiError(
-                503, "INSUFFICIENT_STORAGE", "Daily storage limit or free-space reserve reached."
-            )
+        conditions = (
+            ("daily_budget", used + reserve + workspace > self.settings.max_daily_storage_bytes),
+            (
+                "total_budget",
+                total_limit and media_used + reserve + workspace + buffer_headroom > total_limit,
+            ),
+            (
+                "minimum_free",
+                free - reserve - workspace - buffer_headroom < self.settings.min_free_storage_bytes,
+            ),
+        )
+        for condition, rejected in conditions:
+            if rejected:
+                self.recording.diagnostics.count("storage_rejected_" + condition)
+                error = ApiError(
+                    503,
+                    "INSUFFICIENT_STORAGE",
+                    "Daily storage limit or free-space reserve reached.",
+                )
+                error.condition = condition
+                raise error
 
     async def get_day(self, recording_id: str) -> dict:
         async with self.lock:
@@ -726,7 +924,7 @@ class DailyRecordingService:
             args.append(after[0])
         async with self.lock:
             return [
-                json.loads(r[0])
+                self.catalog.decode_day(r[0])
                 for r in self.db.execute(
                     "SELECT body FROM daily_recordings WHERE "
                     + " AND ".join(clauses)
@@ -784,7 +982,8 @@ class DailyRecordingService:
         async with self.tick_lock:
             for row in self.db.execute("SELECT camera,cursor FROM daily_cursors").fetchall():
                 camera, cursor = row["camera"], row["cursor"]
-                while cursor < now:
+                completed_slots = 0
+                while cursor < now and completed_slots < 3:
                     day = self._ensure_day(
                         camera,
                         DailyWindow.from_date(seoul_date(cursor)),
@@ -806,6 +1005,8 @@ class DailyRecordingService:
                                 "UPDATE daily_cursors SET cursor=? WHERE camera=?", (end, camera)
                             )
                     cursor = end
+                    self.recording.daily_frame_watermarks[camera] = cursor
+                    completed_slots += 1
 
     async def close(self) -> None:
         if self._closed:
