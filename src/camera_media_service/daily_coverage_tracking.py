@@ -21,14 +21,24 @@ def install_coverage_tracking(db):
                 INSERT INTO daily_segment_dirty VALUES({ref}.day_id,{ref}.start)
                 ON CONFLICT(day_id) DO UPDATE SET start=min(start,excluded.start);
             """)
+            # Extending an unchanged loss interval only changes its tail.
+            # Preserve the sealed prefix while tracking reason/priority edits
+            # and both sides of a moved interval conservatively.
+            changed_start = f"{ref}.start"
+            if event == "UPDATE":
+                changed_start = f"""CASE WHEN OLD.id=NEW.id AND OLD.camera=NEW.camera
+                    AND OLD.reason=NEW.reason AND OLD.start=NEW.start
+                    THEN min(OLD.end,NEW.end) ELSE {ref}.start END"""
             gap_statements.append(f"""
                 INSERT INTO daily_gap_dirty
-                SELECT id,{ref}.start FROM daily_recordings WHERE camera={ref}.camera
+                SELECT id,{changed_start} FROM daily_recordings WHERE camera={ref}.camera
                 AND CAST(strftime('%s',json_extract(body,'$.window_start_at')) AS REAL)<{ref}.end
                 AND CAST(strftime('%s',json_extract(body,'$.window_end_at')) AS REAL)>{ref}.start
                 ON CONFLICT(day_id) DO UPDATE SET start=min(start,excluded.start);
             """)
+        replace_update = "DROP TRIGGER IF EXISTS coverage_gap_update;" if event == "UPDATE" else ""
         db.executescript(f"""
+            {replace_update}
             CREATE TRIGGER IF NOT EXISTS coverage_segment_{event.lower()}
             AFTER {event} ON daily_segments BEGIN {"".join(segment_statements)} END;
             CREATE TRIGGER IF NOT EXISTS coverage_gap_{event.lower()}
