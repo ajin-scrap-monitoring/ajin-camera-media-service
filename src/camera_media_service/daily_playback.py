@@ -5,9 +5,12 @@ from __future__ import annotations
 from camera_media_service.recording import epoch, iso
 
 
-def build_available_intervals(segments: list[dict], gaps: list[dict] = ()) -> list[dict]:
-    intervals = []
-    offset = 0.0
+def build_available_intervals(
+    segments: list[dict], gaps: list[dict] = (), *, offset: float = 0.0, initial_intervals=()
+) -> list[dict]:
+    intervals = list(initial_intervals)
+    if intervals:
+        intervals[-1] = dict(intervals[-1])
     losses = sorted((epoch(g["start_at"]), epoch(g["end_at"])) for g in gaps)
     loss_cursor = 0
     for segment in segments:
