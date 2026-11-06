@@ -21,18 +21,36 @@ class FrameEnvelope:
 class RecordingQueue(asyncio.Queue[FrameEnvelope]):
     """A finite receipt barrier, independent of frames arriving after the snapshot."""
 
-    def __init__(self, maxsize: int):
+    def __init__(self, maxsize: int, *, max_bytes: int | None = None):
         super().__init__(maxsize)
+        self.max_bytes = max_bytes
+        self.queued_bytes = 0
         self._sequence = 0
         self._pending: dict[int, int] = {}
         self._receipt_times: dict[int, tuple[str, float]] = {}
         self._changed = asyncio.Event()
 
     def put_nowait(self, item: FrameEnvelope) -> None:
+        if not self.can_accept(item):
+            raise asyncio.QueueFull
         super().put_nowait(item)
         self._sequence += 1
         self._pending[id(item)] = self._sequence
         self._receipt_times[id(item)] = (item.camera_id, item.received_at)
+
+    def can_accept(self, item: FrameEnvelope) -> bool:
+        return not self.full() and (
+            self.max_bytes is None or self.queued_bytes + len(item.jpeg) <= self.max_bytes
+        )
+
+    def _put(self, item: FrameEnvelope) -> None:
+        super()._put(item)
+        self.queued_bytes += len(item.jpeg)
+
+    def _get(self) -> FrameEnvelope:
+        item = super()._get()
+        self.queued_bytes -= len(item.jpeg)
+        return item
 
     def acknowledge(self, item: FrameEnvelope) -> None:
         self._pending.pop(id(item))
@@ -84,23 +102,25 @@ class LiveFrameHub:
         self.latest[camera_id] = envelope
 
         for queue in list(self._subscribers):
+            if isinstance(queue, RecordingQueue):
+                diagnostics = getattr(self, "recording_diagnostics", None)
+
+                if queue.max_bytes is not None and len(envelope.jpeg) > queue.max_bytes:
+                    self._recording_loss(envelope, period)
+                    continue
+                while not queue.can_accept(envelope):
+                    dropped = queue.get_nowait()
+                    queue.acknowledge(dropped)
+                    self._recording_loss(dropped, period)
+                queue.put_nowait(envelope)
+                if diagnostics is not None:
+                    diagnostics.gauge("ingest_queue_frames", queue.qsize())
+                    diagnostics.gauge("ingest_queue_bytes", queue.queued_bytes)
+                continue
             if queue.full():
                 try:
-                    dropped = queue.get_nowait()
-                    if isinstance(queue, RecordingQueue):
-                        diagnostics = getattr(self, "recording_diagnostics", None)
-                        if diagnostics is not None:
-                            diagnostics.count("ingest_queue_full")
-                        queue.acknowledge(dropped)
-                        if self.loss_observer is not None:
-                            self.loss_observer(
-                                dropped.camera_id,
-                                dropped.received_at,
-                                dropped.received_at + period,
-                                "BUFFER_DROPPED",
-                            )
-                    else:
-                        queue.task_done()
+                    queue.get_nowait()
+                    queue.task_done()
                 except asyncio.QueueEmpty:
                     pass
             try:
@@ -110,10 +130,26 @@ class LiveFrameHub:
 
         return envelope
 
+    def _recording_loss(self, dropped: FrameEnvelope, period: float) -> None:
+        diagnostics = getattr(self, "recording_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.count("ingest_queue_full")
+        if self.loss_observer is not None:
+            self.loss_observer(
+                dropped.camera_id,
+                dropped.received_at,
+                dropped.received_at + period,
+                "BUFFER_DROPPED",
+            )
+
     def subscribe(
-        self, maxsize: int = 100, *, recording: bool = False
+        self, maxsize: int = 100, *, recording: bool = False, max_bytes: int | None = None
     ) -> asyncio.Queue[FrameEnvelope]:
-        queue = RecordingQueue(maxsize) if recording else asyncio.Queue(maxsize=maxsize)
+        queue = (
+            RecordingQueue(maxsize, max_bytes=max_bytes)
+            if recording
+            else asyncio.Queue(maxsize=maxsize)
+        )
         self._subscribers.add(queue)
         return queue
 
