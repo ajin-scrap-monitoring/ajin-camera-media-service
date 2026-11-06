@@ -121,6 +121,10 @@ def sample_hls(base, recording_id):
 def durable_snapshot(path, camera, begin, end, days):
     uri = Path(path).resolve().as_uri() + "?mode=ro"
     with sqlite3.connect(uri, uri=True, timeout=2) as db:
+        db.execute("BEGIN")
+        has_deltas = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_snapshot_deltas'"
+        ).fetchone()
         receipts = [
             row[0]
             for row in db.execute(
@@ -137,6 +141,19 @@ def durable_snapshot(path, camera, begin, end, days):
             if row is None:
                 continue
             day = json.loads(row[0])
+            if has_deltas:
+                for delta in db.execute(
+                    "SELECT body FROM daily_snapshot_deltas WHERE day_id=? ORDER BY sequence",
+                    (recording_id,),
+                ):
+                    patch = json.loads(delta[0])
+                    for key in patch.get("remove", ()):
+                        day.pop(key, None)
+                    day.update(patch["values"])
+                    for key, change in patch["arrays"].items():
+                        values = day.setdefault(key, [])
+                        del values[change["keep"] :]
+                        values.extend(change["append"])
             segments = list(
                 db.execute(
                     "SELECT start,end FROM daily_segments WHERE day_id=? AND status='ready' "
