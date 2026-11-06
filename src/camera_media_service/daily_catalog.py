@@ -59,7 +59,8 @@ class DailyCatalog:
                 r[0]
                 for r in db.execute(
                     "SELECT id FROM daily_recordings WHERE length(body)>65536 OR id IN "
-                    "(SELECT day_id FROM daily_snapshot_deltas GROUP BY day_id HAVING count(*)>1024)"
+                    "(SELECT day_id FROM daily_snapshot_deltas "
+                    "GROUP BY day_id HAVING count(*)>1024)"
                 )
             ]
             for key in keys:
