@@ -128,7 +128,7 @@ def test_prune_query_remains_fast_with_many_frames_and_pins(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_expired_frame_backlog_uses_one_durable_cleanup_commit(tmp_path):
+async def test_expired_frame_backlog_uses_bounded_durable_cleanup_batches(tmp_path):
     from camera_media_service.pipeline import LiveFrameHub
     from camera_media_service.recording import RecordingService
     from camera_media_service.store import LatestFrameStore
@@ -145,10 +145,13 @@ async def test_expired_frame_backlog_uses_one_durable_cleanup_commit(tmp_path):
         statements = []
         service.db.set_trace_callback(statements.append)
         await service._prune(1000)
+        assert service.db.execute("SELECT count(*) FROM frames").fetchone()[0] == 36
+        assert statements.count("COMMIT") == 1
+        await service._prune(1000)
         service.db.set_trace_callback(None)
         assert service.db.execute("SELECT count(*) FROM frames").fetchone()[0] == 0
         assert not list(service.buffer.glob("*.jpg"))
-        assert statements.count("COMMIT") == 1
+        assert statements.count("COMMIT") == 2
         assert service.db.execute("PRAGMA synchronous").fetchone()[0] == 2
     finally:
         service.db.close()
