@@ -715,7 +715,9 @@ class RecordingService:
 
     async def start(self) -> None:
         await self.checkpointer.start()
-        self.queue = self.hub.subscribe(maxsize=100, recording=True)
+        # Absorb measured SD commit stalls without allowing unbounded RAM growth.
+        # The writer owns at most ten additional validated frames outside this queue.
+        self.queue = self.hub.subscribe(maxsize=1200, recording=True, max_bytes=96 * 1024**2)
         assert isinstance(self.queue, RecordingQueue)
         self.tasks = [asyncio.create_task(self._writer()), asyncio.create_task(self._scheduler())]
 
@@ -755,6 +757,7 @@ class RecordingService:
                 for frame in frames:
                     self.queue.acknowledge(frame)
                 self.diagnostics.gauge("ingest_queue_frames", self.queue.qsize())
+                self.diagnostics.gauge("ingest_queue_bytes", self.queue.queued_bytes)
                 self.diagnostics.report_if_due()
 
     async def _scheduler(self) -> None:
@@ -799,12 +802,38 @@ class RecordingService:
     async def _close_resources(self) -> None:
         if self.queue is not None:
             self.hub.unsubscribe(self.queue)
-        tasks = [*self.tasks, *self.jobs.values()]
+        # Stop producers/maintenance first, then drain already accepted receipts.
+        writer = self.tasks[0] if self.tasks else None
+        tasks = [*self.tasks[1:], *self.jobs.values()]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        writer_failed = False
+        if self.queue is not None and writer is not None:
+            drain = asyncio.create_task(self.queue.join())
+            await asyncio.wait((drain, writer), return_when=asyncio.FIRST_COMPLETED)
+            writer_failed = writer.done()
+            if writer_failed:
+                LOG.error("Recording writer stopped before shutdown drain completed")
+                while not self.queue.empty():
+                    frame = self.queue.get_nowait()
+                    self.queue.acknowledge(frame)
+                    self.diagnostics.count("shutdown_writer_unavailable")
+                    if self.hub.loss_observer is not None:
+                        self.hub.loss_observer(
+                            frame.camera_id,
+                            frame.received_at,
+                            frame.received_at + 1 / 30,
+                            "STORAGE_ERROR",
+                        )
+            drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
+            writer.cancel()
+            await asyncio.gather(writer, return_exceptions=True)
         await self.checkpointer.close()
         close_probe_database(self.db)
         from camera_media_service.media_files import storage_io
 
         await storage_io(self.db.close)
+        if writer_failed:
+            raise RuntimeError("Recording writer stopped before shutdown drain completed")
