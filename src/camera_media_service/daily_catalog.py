@@ -52,8 +52,36 @@ class DailyCatalog:
                 "FROM daily_recordings WHERE id=day_id) WHERE revision < "
                 "(SELECT json_extract(body,'$.revision') FROM daily_recordings WHERE id=day_id)"
             )
+            # Run only before writers start: move legacy large arrays out of the
+            # row whose status is updated at midnight/deletion. SQLite rewrites
+            # overflow pages even for a status-only UPDATE on a large row.
+            keys = [
+                r[0]
+                for r in db.execute(
+                    "SELECT id FROM daily_recordings WHERE length(body)>65536 OR id IN "
+                    "(SELECT day_id FROM daily_snapshot_deltas GROUP BY day_id HAVING count(*)>1024)"
+                )
+            ]
+            for key in keys:
+                body = self.get_day(key)
+                arrays = {
+                    name: {"keep": 0, "append": body[name]}
+                    for name in ("gaps", "available_intervals")
+                    if name in body
+                }
+                base = {name: [] if name in arrays else value for name, value in body.items()}
+                db.execute(
+                    "UPDATE daily_recordings SET status=?,body=? WHERE id=?",
+                    (body["status"], json.dumps(base), key),
+                )
+                db.execute("DELETE FROM daily_snapshot_deltas WHERE day_id=?", (key,))
+                if arrays:
+                    db.execute(
+                        "INSERT INTO daily_snapshot_deltas(day_id,body) VALUES(?,?)",
+                        (key, json.dumps({"values": {}, "arrays": arrays})),
+                    )
             # An older image may have changed the materialized body during rollback.
-            for row in db.execute("SELECT body FROM daily_recordings").fetchall():
+            for row in db.execute("SELECT body FROM daily_recordings"):
                 self._save_state(self.decode_day(row[0]))
 
     def _save_state(self, body):
@@ -209,7 +237,9 @@ class DailyCatalog:
 
     def materialize_snapshots(self) -> None:
         """Caller stops all writers and owns the transaction before an old-image rollback."""
-        keys = [r[0] for r in self.db.execute("SELECT DISTINCT day_id FROM daily_snapshot_deltas")]
+        # Include a ready segment committed just before a crash, when only the
+        # revision counter advanced and no coverage patch exists yet.
+        keys = [r[0] for r in self.db.execute("SELECT id FROM daily_recordings")]
         for key in keys:
             body = self.get_day(key)
             self.db.execute(
