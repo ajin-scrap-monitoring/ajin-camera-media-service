@@ -19,6 +19,7 @@ from camera_media_service.daily_models import StoredFrame
 from camera_media_service.media_usage import iter_regular_files
 from camera_media_service.persisted_media_info import close_probe_database, record_generated_info
 from camera_media_service.pipeline import FrameEnvelope, LiveFrameHub, RecordingQueue
+from camera_media_service.recording_checkpoint import CatalogCheckpointer
 from camera_media_service.recording_diagnostics import RecordingDiagnostics, RecordingLock
 from camera_media_service.storage_reservations import StorageReservations
 
@@ -109,6 +110,8 @@ class RecordingService:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
+        self.db.execute("PRAGMA wal_autocheckpoint=0")
+        self.db.execute("PRAGMA journal_size_limit=8388608")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS policies(camera TEXT PRIMARY KEY, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS jobs(
@@ -140,12 +143,16 @@ class RecordingService:
         self.diagnostics = RecordingDiagnostics()
         self.hub.recording_diagnostics = self.diagnostics
         self.lock = RecordingLock(self.diagnostics)
+        self.checkpointer = CatalogCheckpointer(
+            self.root / "catalog.sqlite3", self.storage_guard, self.diagnostics
+        )
         self.encoding_slot = asyncio.Semaphore(1)
         self.queue = None
         self.tasks: list[asyncio.Task] = []
         self.jobs: dict[str, asyncio.Task] = {}
         self.storage_error = False
         self._closed = False
+        self._closing_task = None
         # A buffer write or encoder may have been interrupted. Never imply success.
         with self.db:
             for row in self.db.execute("SELECT body FROM jobs WHERE status IN (?,?)", ACTIVE):
@@ -544,6 +551,8 @@ class RecordingService:
         self.db.execute("DELETE FROM frame_pins WHERE owner=?", (owner_id,))
 
     async def _prune(self, now: float, reserve: int = 0) -> None:
+        from camera_media_service.media_files import storage_io
+
         await asyncio.to_thread(self.storage_guard)
         total = self.db.execute("SELECT coalesce(sum(size),0) FROM frames").fetchone()[0]
         cutoff = now - 300 if total + reserve <= self.max_buffer_bytes else float("inf")
@@ -552,32 +561,44 @@ class RecordingService:
         for camera, cursor in self.daily_frame_watermarks.items():
             protection += " AND NOT (f.camera=? AND f.timestamp>=?)"
             parameters.extend((camera, cursor))
+        # Reclaim a small batch during normal ingestion. Under actual byte
+        # pressure retain enough candidates to satisfy the existing budget.
+        pressured = total + reserve > self.max_buffer_bytes
+        parameters.append(-1 if pressured else 64)
         rows = self.db.execute(
-            """
-            SELECT * FROM frames f WHERE timestamp < ? AND NOT EXISTS (
+            "SELECT * FROM frames f WHERE timestamp < ? "
+            + protection
+            + """
+            AND NOT EXISTS (
                 SELECT 1 FROM jobs j WHERE j.camera=f.camera
                 AND j.status IN ('collecting','processing')
                 AND f.timestamp >= j.start AND f.timestamp < j.end)
             AND NOT EXISTS(SELECT 1 FROM frame_pins p WHERE p.path=f.path)
         """
-            + protection
-            + " ORDER BY timestamp",
+            + " ORDER BY timestamp,path LIMIT ?",
             parameters,
         ).fetchall()
         removed = []
         try:
             for row in rows:
+                if len(removed) >= 64 and total + reserve <= self.max_buffer_bytes:
+                    break
                 if row["timestamp"] >= now - 300 and total + reserve <= self.max_buffer_bytes:
                     break
-                await asyncio.to_thread((self.buffer / row["path"]).unlink, missing_ok=True)
-                removed.append((row["path"],))
+
+                def remove(row=row):
+                    self.storage_guard()
+                    (self.buffer / row["path"]).unlink(missing_ok=True)
+                    # Keep successful unlink results even if cancellation arrives
+                    # before the drained worker returns to the event loop.
+                    removed.append((row["path"],))
+
+                await storage_io(remove)
                 total -= row["size"]
         finally:
             # One FULL-synchronous commit for a backlog, rather than one fsync per old frame.
             # Also retain successful cleanup when a later unlink fails or shutdown cancels it.
             if removed:
-                from camera_media_service.media_files import storage_io
-
                 try:
                     self.db.executemany("DELETE FROM frames WHERE path=?", removed)
                     with self.diagnostics.measure("prune_commit"):
@@ -693,6 +714,7 @@ class RecordingService:
                 self.notify_thumbnail_ready("clip", clip_id, metadata)
 
     async def start(self) -> None:
+        await self.checkpointer.start()
         self.queue = self.hub.subscribe(maxsize=100, recording=True)
         assert isinstance(self.queue, RecordingQueue)
         self.tasks = [asyncio.create_task(self._writer()), asyncio.create_task(self._scheduler())]
@@ -763,14 +785,26 @@ class RecordingService:
             LOG.error("Recording task failed", exc_info=task.exception())
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        from camera_media_service.media_files import _settle_worker
+
+        if self._closing_task is None:
+            self._closed = True
+            self._closing_task = asyncio.create_task(self._close_resources())
+        try:
+            await asyncio.shield(self._closing_task)
+        except asyncio.CancelledError:
+            await _settle_worker(self._closing_task)
+            raise
+
+    async def _close_resources(self) -> None:
         if self.queue is not None:
             self.hub.unsubscribe(self.queue)
         tasks = [*self.tasks, *self.jobs.values()]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self.checkpointer.close()
         close_probe_database(self.db)
-        self.db.close()
+        from camera_media_service.media_files import storage_io
+
+        await storage_io(self.db.close)
