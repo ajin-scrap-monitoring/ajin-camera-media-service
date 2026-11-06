@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 from camera_media_service.daily_catalog import DailyCatalog
@@ -180,12 +181,17 @@ class DailyRecordingService:
             )
 
     def segment_path(self, segment: dict):
-        day = self.catalog.get_day(segment["recording_id"])
-        block = max(0, int((segment["start_at"] - epoch(day["window_start_at"])) // 600))
+        row = self.db.execute(
+            "SELECT date FROM daily_recordings WHERE id=?", (segment["recording_id"],)
+        ).fetchone()
+        if row is None:
+            raise ApiError(404, "DAILY_RECORDING_NOT_FOUND", "Daily recording does not exist.")
+        window = DailyWindow.from_date(date.fromisoformat(row[0]))
+        block = max(0, int((segment["start_at"] - window.start_at) // 600))
         return (
             self.recording.root
             / "daily"
-            / day["recording_id"]
+            / segment["recording_id"]
             / f"{block:04d}"
             / (segment["segment_id"] + ".ts")
         )
@@ -343,18 +349,10 @@ class DailyRecordingService:
         rows, known = await storage_io(self._coverage_rows, day, until)
 
         def calculate():
-            result = self._refresh_values(day, until, [json.loads(row[0]) for row in rows], known)
-            return result, json.dumps(result)
+            return self._refresh_values(day, until, [json.loads(row[0]) for row in rows], known)
 
-        result, body = await storage_io(calculate)
-
-        def save():
-            self.db.execute(
-                "UPDATE daily_recordings SET status=?,body=? WHERE id=?",
-                (result["status"], body, result["recording_id"]),
-            )
-
-        await storage_io(save)
+        result = await storage_io(calculate)
+        await storage_io(self.catalog.save_day, result, notify=False)
         return result
 
     def _refresh_values(self, day: dict, until: float, segments, known) -> dict:
@@ -441,7 +439,7 @@ class DailyRecordingService:
                                 "AND status IN ('recording','finalizing')",
                                 (camera,),
                             ).fetchall():
-                                paused = json.loads(item[0])
+                                paused = self.catalog.decode_day(item[0])
                                 paused["error"] = self.last_error
                                 self.catalog.save_day(paused)
                     continue
@@ -713,9 +711,10 @@ class DailyRecordingService:
                     "SELECT d.id,coalesce(sum(json_extract(s.body,'$.size_bytes')),0) "
                     "FROM daily_recordings d JOIN daily_segments s ON s.day_id=d.id "
                     "WHERE d.status IN ('recording','finalizing','closed') AND s.status='ready' "
-                    "AND json_extract(d.body,'$.archive_state')!='mp4' GROUP BY d.id"
+                    "GROUP BY d.id"
                 )
                 if row[0] not in active_archives
+                and self.catalog.get_state(row[0]).get("archive_state") != "mp4"
             ]
             # One archive runs at a time. Its reservation/output already occupies
             # the working room; do not reserve a *second* full archive during its

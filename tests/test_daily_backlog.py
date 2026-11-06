@@ -136,7 +136,7 @@ async def test_segment_revision_survives_restart_without_rewriting_day_json(tmp_
 
 
 @pytest.mark.asyncio
-async def test_completed_slot_writes_whole_day_only_once(tmp_path, monkeypatch):
+async def test_completed_slot_never_rewrites_whole_day(tmp_path, monkeypatch):
     start = DailyWindow.from_date(date(2026, 11, 6)).start_at
     clock = [start]
     recording, daily = make_daily(tmp_path, clock, monkeypatch)
@@ -152,7 +152,7 @@ async def test_completed_slot_writes_whole_day_only_once(tmp_path, monkeypatch):
         await daily.tick(clock[0])
         recording.db.set_trace_callback(None)
         writes = [s for s in statements if s.startswith("UPDATE daily_recordings SET")]
-        assert len(writes) == 1
+        assert not writes
         body = (await daily.list_days("camera-main", {}, 20, None))[0]
         assert body["recorded_seconds"] >= 0.9 and body["revision"] == 1
     finally:
@@ -303,7 +303,7 @@ async def test_eighty_thousand_historical_gaps_survive_new_recording_with_one_sn
         prefix = [g for g in actual["gaps"] if g["end_at"] <= iso(start + 4000)]
         assert hashlib.sha256(json.dumps(prefix).encode()).hexdigest() == expected
         assert actual["recorded_seconds"] >= 0.9
-        assert sum(s.startswith("UPDATE daily_recordings SET") for s in statements) == 1
+        assert not any(s.startswith("UPDATE daily_recordings SET") for s in statements)
     finally:
         daily.initialized = False
         await daily.close()
