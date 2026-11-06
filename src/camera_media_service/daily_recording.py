@@ -8,7 +8,6 @@ import logging
 import math
 import shutil
 import sqlite3
-import stat
 import time
 import uuid
 from collections.abc import Callable
@@ -17,11 +16,13 @@ from datetime import date
 from pathlib import Path
 
 from camera_media_service.daily_catalog import DailyCatalog
+from camera_media_service.daily_coverage_tracking import install_coverage_tracking
 from camera_media_service.daily_gaps import build_gaps
 from camera_media_service.daily_models import DailyWindow, seoul_date
 from camera_media_service.daily_playback import build_available_intervals
 from camera_media_service.encoding import encode_daily_segment, probe_media
 from camera_media_service.media_files import storage_io
+from camera_media_service.media_usage import iter_regular_files
 from camera_media_service.recording import ApiError, RecordingService, epoch, iso
 
 LOG = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ class DailyRecordingService:
             clock or time.time,
         )
         self.db, self.lock = recording.db, recording.lock
+        install_coverage_tracking(self.db)
         self.db.executescript(
             "CREATE TABLE IF NOT EXISTS daily_cursors("
             "camera TEXT PRIMARY KEY,cursor REAL NOT NULL);"
@@ -334,10 +336,61 @@ class DailyRecordingService:
 
     def _refresh(self, day: dict, until: float) -> dict:
         # Synchronous helper retained for callers already doing offline catalogue work.
+        until = max(epoch(day["coverage_as_of_at"]), min(epoch(day["window_end_at"]), until))
         rows, known = self._coverage_rows(day, until)
-        result = self._refresh_values(day, until, [json.loads(row[0]) for row in rows], known)
+        segments = [json.loads(row[0]) for row in rows]
+        result = self._refresh_values(day, until, segments, known)
         self.catalog.save_day(result)
+        self._save_coverage_total(result, segments, until)
         return result
+
+    def _save_coverage_total(self, day, segments, until, prior=None):
+        duration = prior[0] if prior else 0.0
+        ready_end = prior[2] if prior else epoch(day["window_start_at"])
+        for segment in segments:
+            duration += segment["duration"]
+            ready_end = max(ready_end, segment["end_at"])
+        self.db.execute(
+            "INSERT OR REPLACE INTO daily_coverage_totals VALUES(?,?,?,?)",
+            (day["recording_id"], duration, until, ready_end),
+        )
+        for table in ("daily_gap_dirty", "daily_segment_dirty"):
+            self.db.execute(f"DELETE FROM {table} WHERE day_id=?", (day["recording_id"],))
+
+    def _progress_rows(self, day, until):
+        total = self.db.execute(
+            "SELECT duration,covered_until,ready_end FROM daily_coverage_totals WHERE day_id=?",
+            (day["recording_id"],),
+        ).fetchone()
+        dirty = self.db.execute(
+            "SELECT min(start) FROM (SELECT start FROM daily_gap_dirty WHERE day_id=? "
+            "UNION ALL SELECT start FROM daily_segment_dirty WHERE day_id=?)",
+            (day["recording_id"], day["recording_id"]),
+        ).fetchone()[0]
+        if (
+            total is None
+            or iso(total[1]) != day["coverage_as_of_at"]
+            or total[2] > total[1]
+            or (dirty is not None and dirty < total[1])
+            or not isinstance(day.get("gaps"), list)
+            or not isinstance(day.get("available_intervals"), list)
+        ):
+            rows, known = self._coverage_rows(day, until)
+            return rows, known, None
+        rows = self.db.execute(
+            "SELECT body FROM daily_segments WHERE day_id=? AND status='ready' AND start>=? "
+            "ORDER BY start,id",
+            (day["recording_id"], total[1]),
+        ).fetchall()
+        known = [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT start,end,reason FROM daily_gaps "
+                "WHERE camera=? AND start<? AND end>? ORDER BY id",
+                (day["camera_id"], until, total[1]),
+            )
+        ]
+        return rows, known, tuple(total)
 
     async def _refresh_async(self, day: dict, until: float) -> dict:
         with self.recording.diagnostics.measure("coverage_refresh"):
@@ -346,14 +399,71 @@ class DailyRecordingService:
     async def _refresh_snapshot(self, day: dict, until: float) -> dict:
         # The caller retains the catalogue lock across drained DB workers.
         # Slow SD reads and FULL commits must not stop JPEG/network receipt.
-        rows, known = await storage_io(self._coverage_rows, day, until)
+        until = max(epoch(day["coverage_as_of_at"]), min(epoch(day["window_end_at"]), until))
+        rows, known, prior = await storage_io(self._progress_rows, day, until)
 
         def calculate():
-            return self._refresh_values(day, until, [json.loads(row[0]) for row in rows], known)
+            segments = [json.loads(row[0]) for row in rows]
+            result = (
+                self._refresh_append_values(day, until, segments, known, prior)
+                if prior is not None
+                else self._refresh_values(day, until, segments, known)
+            )
+            return result, segments
 
-        result = await storage_io(calculate)
+        result, segments = await storage_io(calculate)
         await storage_io(self.catalog.save_day, result, notify=False)
+        self._save_coverage_total(result, segments, until, prior)
         return result
+
+    def _refresh_append_values(self, day, until, segments, known, prior):
+        duration, point, _ = prior
+        spans = []
+        for item in segments:
+            if item["start_at"] > point:
+                spans.append((point, min(item["start_at"], until)))
+            point = max(point, item["end_at"])
+        if point < until:
+            spans.append((point, until))
+        tail_gaps = build_gaps(spans, known)
+        boundary_gaps = ([day["gaps"][-1]] if day["gaps"] else []) + tail_gaps
+        intervals = build_available_intervals(
+            segments, boundary_gaps, offset=duration, initial_intervals=day["available_intervals"]
+        )
+        gaps = list(day["gaps"])
+        if (
+            gaps
+            and tail_gaps
+            and gaps[-1]["end_at"] == tail_gaps[0]["start_at"]
+            and (gaps[-1]["reason_code"] == tail_gaps[0]["reason_code"])
+        ):
+            gaps[-1] = {**gaps[-1], "end_at": tail_gaps.pop(0)["end_at"]}
+        gaps.extend(tail_gaps)
+        for item in segments:
+            duration += item["duration"]
+        playable = iso(segments[-1]["end_at"]) if segments else day["playable_until_at"]
+        day.update(
+            coverage_as_of_at=iso(until),
+            recorded_seconds=round(duration, 3),
+            gaps=gaps,
+            has_gaps=bool(gaps),
+            available_intervals=intervals,
+            playable_until_at=playable,
+            playback_state="ready" if playable else "pending",
+            playback_path=f"/api/v2/daily-recordings/{day['recording_id']}/hls/index.m3u8"
+            if playable
+            else None,
+            error=self.last_error,
+        )
+        if until >= epoch(day["window_end_at"]):
+            day.update(
+                status="closed",
+                coverage="none" if not playable else "partial" if gaps else "complete",
+                expires_at=iso(epoch(day["window_end_at"]) + day["retention_days"] * 86400),
+                export_allowed=bool(playable),
+                playback_state="ready" if playable else "unavailable",
+            )
+        return day
 
     def _refresh_values(self, day: dict, until: float, segments, known) -> dict:
         start, end = epoch(day["window_start_at"]), epoch(day["window_end_at"])
@@ -692,7 +802,7 @@ class DailyRecordingService:
         # Snapshot on the event loop; file workers must not read mutable job maps.
         reservations = dict(self.storage_reservations)
         output_owners = {
-            Path(path): owner
+            str(path): owner
             for owner in reservations
             for path in self.storage_reservation_outputs.get(owner, ())
         }
@@ -741,15 +851,8 @@ class DailyRecordingService:
                 else tuple(self.recording.root / folder for folder in categories)
             )
             for root in roots:
-                for path in root.rglob("*"):
-                    try:
-                        info = path.stat()
-                    except FileNotFoundError:
-                        # Archive rename and retention deletion can overlap scans.
-                        continue
-                    if not stat.S_ISREG(info.st_mode):
-                        continue
-                    category = path.relative_to(self.recording.root).parts[0]
+                top_category = None if root == self.recording.root else root.name
+                for path, info, category in iter_regular_files(root, category=top_category):
                     media_total += info.st_size
                     if category in categories:
                         total += info.st_size

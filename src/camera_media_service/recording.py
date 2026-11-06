@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import secrets
 import shutil
 import sqlite3
@@ -17,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from camera_media_service.daily_models import StoredFrame
+from camera_media_service.media_usage import iter_regular_files
 from camera_media_service.persisted_media_info import close_probe_database, record_generated_info
 from camera_media_service.pipeline import FrameEnvelope, LiveFrameHub, RecordingQueue
 from camera_media_service.recording_diagnostics import RecordingDiagnostics, RecordingLock
@@ -229,7 +229,9 @@ class RecordingService:
             or time.monotonic() - self._buffer_budget_snapshot[0] > 5
         ):
             reservations = dict(self.capacity_reservations)
-            owners = {path: key for key, paths in self.capacity_outputs.items() for path in paths}
+            owners = {
+                str(path): key for key, paths in self.capacity_outputs.items() for path in paths
+            }
 
             def scan():
                 self.storage_guard()
@@ -237,23 +239,12 @@ class RecordingService:
                 # JPEG bytes are already maintained in the frame catalogue.
                 # Do not walk/stat that hot directory again on every reservation
                 # change; only non-buffer files need a physical snapshot.
-                for directory, children, filenames in os.walk(self.root):
-                    folder = Path(directory)
-                    if folder == self.root:
-                        children[:] = [name for name in children if name != "buffer"]
-                    for name in filenames:
-                        path = folder / name
-                        try:
-                            info = path.stat()
-                        except FileNotFoundError:
-                            continue
-                        if not stat.S_ISREG(info.st_mode):
-                            continue
-                        if folder != self.root:
-                            non_buffer += info.st_size
-                        key = owners.get(path)
-                        if key in allocated:
-                            allocated[key] += info.st_size
+                for path, info, category in iter_regular_files(self.root, exclude={"buffer"}):
+                    if category is not None:
+                        non_buffer += info.st_size
+                    key = owners.get(path)
+                    if key in allocated:
+                        allocated[key] += info.st_size
                 return non_buffer, allocated
 
             non_buffer, allocated = await asyncio.to_thread(scan)

@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,8 +14,31 @@ from test_daily_recording import make_daily
 
 import camera_media_service.daily_export as export_module
 import camera_media_service.daily_recording as recording_module
+import camera_media_service.media_usage as usage_module
 from camera_media_service.daily_models import DailyWindow
 from camera_media_service.recording import ApiError, iso
+
+
+def patch_file_observation(monkeypatch, observe):
+    """Inject races at the filesystem observation used by the exact usage walk."""
+    original = usage_module.scandir
+
+    class Entry:
+        def __init__(self, entry):
+            self.entry = entry
+
+        def __getattr__(self, name):
+            return getattr(self.entry, name)
+
+        def stat(self):
+            return observe(Path(self.entry.path))
+
+    @contextmanager
+    def scanning(path):
+        with original(path) as entries:
+            yield (Entry(entry) for entry in list(entries))
+
+    monkeypatch.setattr(usage_module, "scandir", scanning)
 
 
 @pytest_asyncio.fixture
@@ -119,7 +143,7 @@ async def test_growing_output_uses_one_stat_for_usage_and_reservation_credit(
                 output.write(b"g" * 100)
         return info
 
-    monkeypatch.setattr(Path, "stat", growing_stat)
+    patch_file_observation(monkeypatch, growing_stat)
     if admitted:
         await daily.check_space()
     else:
@@ -144,7 +168,7 @@ async def test_scan_uses_reservation_snapshot_when_live_job_maps_change(storage,
                 raise RuntimeError("test did not release storage scan")
         return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", blocked_stat)
+    patch_file_observation(monkeypatch, blocked_stat)
     checking = asyncio.create_task(daily.check_space())
     try:
         await asyncio.wait_for(entered.wait(), 1)
@@ -160,21 +184,14 @@ async def test_scan_uses_reservation_snapshot_when_live_job_maps_change(storage,
 async def test_rename_before_stat_keeps_full_unobserved_output_reservation(storage, monkeypatch):
     daily, _, temporary, final = storage
     reserve_archive(daily, temporary, final, monkeypatch)
-    real_glob, real_stat = Path.rglob, Path.stat
-
-    def listed_before_rename(path, pattern, *args, **kwargs):
-        if path == temporary.parent:
-            yield temporary
-        else:
-            yield from real_glob(path, pattern, *args, **kwargs)
+    real_stat = Path.stat
 
     def renamed_stat(path, *args, **kwargs):
         if path == temporary:
             temporary.replace(final)
         return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "rglob", listed_before_rename)
-    monkeypatch.setattr(Path, "stat", renamed_stat)
+    patch_file_observation(monkeypatch, renamed_stat)
     # The scan did not count the renamed 300 bytes: retain all 400 reserved.
     daily.settings.max_daily_storage_bytes = 999
     with pytest.raises(ApiError) as error:
@@ -196,7 +213,7 @@ async def test_file_disappearing_during_scan_does_not_break_recording_admission(
             raise FileNotFoundError(2, "output moved or removed", str(path))
         return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", disappearing_stat)
+    patch_file_observation(monkeypatch, disappearing_stat)
     daily.settings.min_free_storage_bytes = 0
     monkeypatch.setattr(recording_module.shutil, "disk_usage", lambda _: SimpleNamespace(free=400))
     await daily.check_space()
@@ -213,7 +230,7 @@ async def test_storage_permission_failure_is_not_hidden_by_scan(storage, monkeyp
             raise PermissionError(13, "cannot inspect output", str(path))
         return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", inaccessible_stat)
+    patch_file_observation(monkeypatch, inaccessible_stat)
     with pytest.raises(PermissionError):
         await daily.check_space()
 
