@@ -705,17 +705,24 @@ class DailyRecordingService:
                 for key, paths in self.storage_reservation_outputs.items()
                 if any(Path(p).parent.name == "daily-exports" for p in paths)
             }
-            pending = [
-                int(row[1] * 1.2) + 1048576
+            pending = []
+            if not active_archives:
+                # Select the few unarchived days first. Aggregating the entire
+                # segment history on every encoder admission blocks live input
+                # even though archived days need no additional workspace.
                 for row in self.db.execute(
-                    "SELECT d.id,coalesce(sum(json_extract(s.body,'$.size_bytes')),0) "
-                    "FROM daily_recordings d JOIN daily_segments s ON s.day_id=d.id "
-                    "WHERE d.status IN ('recording','finalizing','closed') AND s.status='ready' "
-                    "GROUP BY d.id"
-                )
-                if row[0] not in active_archives
-                and self.catalog.get_state(row[0]).get("archive_state") != "mp4"
-            ]
+                    "SELECT id FROM daily_recordings "
+                    "WHERE status IN ('recording','finalizing','closed')"
+                ).fetchall():
+                    if self.catalog.get_state(row[0]).get("archive_state") == "mp4":
+                        continue
+                    size, count = self.db.execute(
+                        "SELECT coalesce(sum(json_extract(body,'$.size_bytes')),0),count(*) "
+                        "FROM daily_segments WHERE day_id=? AND status='ready'",
+                        (row[0],),
+                    ).fetchone()
+                    if count:
+                        pending.append(int(size * 1.2) + 1048576)
             # One archive runs at a time. Its reservation/output already occupies
             # the working room; do not reserve a *second* full archive during its
             # read-only verification. Success compacts TS, failure removes MP4.
