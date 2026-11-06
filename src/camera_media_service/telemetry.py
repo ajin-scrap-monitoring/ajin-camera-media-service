@@ -27,6 +27,9 @@ class JsonLogFormatter(logging.Formatter):
 
 def configure_logging(log_format: str = "json") -> None:
     root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        root_logger.addHandler(logging.StreamHandler())
+    root_logger.setLevel(logging.INFO)
     if log_format == "json":
         for handler in root_logger.handlers:
             handler.setFormatter(JsonLogFormatter())

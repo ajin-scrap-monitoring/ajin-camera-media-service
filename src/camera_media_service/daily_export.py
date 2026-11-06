@@ -49,7 +49,7 @@ class DailyExportService:
             for row in self.db.execute(
                 "SELECT body FROM daily_recordings WHERE status IN ('deleted','expired')"
             ).fetchall():
-                day = json.loads(row["body"])
+                day = daily.catalog.decode_day(row["body"])
                 if day.get("cleanup_state") != "complete":
                     day.setdefault("cleanup_state", "pending")
                     day.update(cleanup_completed_at=None, space_reclaimed=None)
@@ -479,13 +479,15 @@ class DailyExportService:
         """Only update metadata on HTTP requests; file work belongs to the background worker."""
         async with self.lock:
             rows = self.db.execute(
-                "SELECT body FROM daily_recordings "
+                "SELECT id FROM daily_recordings "
                 "WHERE status NOT IN ('recording','finalizing','deleted','expired')"
             ).fetchall()
             with self.db:
                 for row in rows:
-                    day = json.loads(row[0])
+                    state = self.daily.catalog.get_state(row[0])
+                    day = state
                     if day["expires_at"] and epoch(day["expires_at"]) <= now:
+                        day = self.daily.catalog.get_day(row[0])
                         day.update(
                             status="expired",
                             playback_state="unavailable",
@@ -533,9 +535,9 @@ class DailyExportService:
                 return
             async with self.lock:
                 candidates = [
-                    json.loads(r[0])
+                    self.daily.catalog.get_state(r[0])
                     for r in self.db.execute(
-                        "SELECT body FROM daily_recordings WHERE status='closed' ORDER BY date DESC"
+                        "SELECT id FROM daily_recordings WHERE status='closed' ORDER BY date DESC"
                     )
                 ]
             for day in candidates:

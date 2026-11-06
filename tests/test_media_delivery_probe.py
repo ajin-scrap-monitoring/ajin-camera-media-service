@@ -71,3 +71,40 @@ def test_durable_snapshot_distinguishes_current_window_from_historical_holes(tmp
     assert result["window_ready_segments"] == 2
     assert result["window_boundary_pairs"] == 1
     assert result["window_positive_holes"] == 0
+
+
+def test_durable_snapshot_counts_overlay_gaps_from_read_only_catalog(tmp_path):
+    import json
+    import sqlite3
+
+    from tools.media_delivery_probe import durable_snapshot
+
+    path = tmp_path / "catalog.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.executescript(
+            "CREATE TABLE frames(camera,timestamp);"
+            "CREATE TABLE daily_recordings(id,body);"
+            "CREATE TABLE daily_segments(id INTEGER PRIMARY KEY,day_id,status,start,end);"
+            "CREATE TABLE daily_snapshot_deltas(sequence INTEGER PRIMARY KEY,day_id,body);"
+        )
+        db.execute(
+            "INSERT INTO daily_recordings VALUES(?,?)",
+            ("day", json.dumps({"recording_date": "2026-11-06", "gaps": []})),
+        )
+        db.execute(
+            "INSERT INTO daily_snapshot_deltas(day_id,body) VALUES(?,?)",
+            (
+                "day",
+                json.dumps(
+                    {
+                        "values": {},
+                        "arrays": {
+                            "gaps": {"keep": 0, "append": [{"reason_code": "BUFFER_DROPPED"}]}
+                        },
+                    }
+                ),
+            ),
+        )
+    result = durable_snapshot(path, "camera-main", 0, 1, ["day"])["days"]["day"]
+    assert result["reported_gaps"] == 1
+    assert result["gap_reasons"] == {"BUFFER_DROPPED": 1}

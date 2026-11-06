@@ -54,7 +54,7 @@ class RecordedClipService:
         left = min(start, at) if at is not None else start
         right = max(min(end, now), at + 0.001) if at is not None else min(end, now)
         rows = self.db.execute(
-            "SELECT s.body,s.status AS segment_status,d.body AS day FROM daily_segments s "
+            "SELECT s.body,s.status AS segment_status,d.id AS day_id FROM daily_segments s "
             "JOIN daily_recordings d ON d.id=s.day_id "
             "WHERE d.camera=? AND d.status NOT IN ('deleted','expired') "
             "AND s.start<? AND s.end>? ORDER BY s.start,s.id",
@@ -64,7 +64,8 @@ class RecordedClipService:
         pending = False
         finalized_center = False
         for row in rows:
-            item, day = json.loads(row["body"]), json.loads(row["day"])
+            item = json.loads(row["body"])
+            day = self.daily.catalog.get_state(row["day_id"])
             if (
                 at is not None
                 and item["start_at"] <= at < item["end_at"]
