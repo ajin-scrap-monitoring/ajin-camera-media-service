@@ -19,6 +19,7 @@ from pathlib import Path
 from camera_media_service.daily_models import StoredFrame
 from camera_media_service.persisted_media_info import close_probe_database, record_generated_info
 from camera_media_service.pipeline import FrameEnvelope, LiveFrameHub, RecordingQueue
+from camera_media_service.recording_diagnostics import RecordingDiagnostics, RecordingLock
 from camera_media_service.storage_reservations import StorageReservations
 
 LOG = logging.getLogger(__name__)
@@ -34,6 +35,10 @@ class ApiError(Exception):
 
 class StorageCapacityError(OSError):
     code = "INSUFFICIENT_STORAGE"
+
+    def __init__(self, message, *, condition="buffer_capacity"):
+        super().__init__(message)
+        self.condition = condition
 
 
 def iso(value: float) -> str:
@@ -90,6 +95,7 @@ class RecordingService:
         self.max_storage_bytes = max_storage_bytes
         self.min_free_storage_bytes = min_free_storage_bytes
         self.capacity_check = None
+        self.daily_frame_watermarks: dict[str, float] = {}
         self.thumbnail_observer = None
         self.thumbnail_change_observer = None
         self.thumbnail_pins = set()
@@ -131,7 +137,9 @@ class RecordingService:
         self.cursor_key = self.db.execute(
             "SELECT value FROM service_metadata WHERE key='cursor_key'"
         ).fetchone()[0]
-        self.lock = asyncio.Lock()
+        self.diagnostics = RecordingDiagnostics()
+        self.hub.recording_diagnostics = self.diagnostics
+        self.lock = RecordingLock(self.diagnostics)
         self.encoding_slot = asyncio.Semaphore(1)
         self.queue = None
         self.tasks: list[asyncio.Task] = []
@@ -164,7 +172,8 @@ class RecordingService:
             raise RuntimeError("Catalogue transaction requires the recording lock")
         try:
             yield self.db
-            await storage_io(self.db.commit)
+            with self.diagnostics.measure("catalog_commit"):
+                await storage_io(self.db.commit)
         except BaseException:
             await storage_io(self.db.rollback)
             raise
@@ -274,7 +283,9 @@ class RecordingService:
         )
         buffered = self.db.execute("SELECT coalesce(sum(size),0) FROM frames").fetchone()[0]
         if non_buffer + database + promised + buffered + reserve + 65536 > self.max_storage_bytes:
-            raise StorageCapacityError("Media total storage budget reached")
+            raise StorageCapacityError(
+                "Media total storage budget reached", condition="total_budget"
+            )
 
     def _save(self, body: dict) -> None:
         self.db.execute(
@@ -483,33 +494,45 @@ class RecordingService:
     async def store_frames(self, frames: list[FrameEnvelope]) -> None:
         if not frames:
             return
+        from camera_media_service.media_files import storage_io
+
         await asyncio.to_thread(self.storage_guard)
         reserve = sum(len(frame.jpeg) for frame in frames)
         if self.min_free_storage_bytes:
             free = (await asyncio.to_thread(shutil.disk_usage, self.root)).free
             if free - reserve < self.min_free_storage_bytes:
-                raise OSError("Media free-space reserve reached")
+                raise StorageCapacityError(
+                    "Media free-space reserve reached", condition="minimum_free"
+                )
         async with self.lock:
             await self._prune(time.time(), reserve=reserve)
             await self._check_buffer_capacity(reserve)
             size = self.db.execute("SELECT coalesce(sum(size),0) FROM frames").fetchone()[0]
             if size + reserve > self.max_buffer_bytes:
-                raise OSError("Pinned frames exhausted the buffer budget")
+                raise StorageCapacityError("Protected frames exhausted the buffer budget")
             paths = []
             try:
-                with self.db:
+                async with self.transaction():
                     for frame in frames:
                         name = f"{uuid.uuid4()}.jpg"
                         path = self.buffer / name
                         paths.append(path)
-                        await asyncio.to_thread(path.write_bytes, frame.jpeg)
+                        await storage_io(path.write_bytes, frame.jpeg)
                         self.db.execute(
                             "INSERT INTO frames VALUES (?,?,?,?)",
                             (name, frame.camera_id, frame.received_at, len(frame.jpeg)),
                         )
             except BaseException:
                 for path in paths:
-                    path.unlink(missing_ok=True)
+                    try:
+                        referenced = self.db.execute(
+                            "SELECT 1 FROM frames WHERE path=?", (path.name,)
+                        ).fetchone()
+                    except sqlite3.Error:
+                        # Leave uncertain files for startup reconciliation.
+                        continue
+                    if not referenced:
+                        await storage_io(path.unlink, missing_ok=True)
                 raise
 
     def pin_frames(
@@ -533,6 +556,11 @@ class RecordingService:
         await asyncio.to_thread(self.storage_guard)
         total = self.db.execute("SELECT coalesce(sum(size),0) FROM frames").fetchone()[0]
         cutoff = now - 300 if total + reserve <= self.max_buffer_bytes else float("inf")
+        protection = ""
+        parameters = [cutoff]
+        for camera, cursor in self.daily_frame_watermarks.items():
+            protection += " AND NOT (f.camera=? AND f.timestamp>=?)"
+            parameters.extend((camera, cursor))
         rows = self.db.execute(
             """
             SELECT * FROM frames f WHERE timestamp < ? AND NOT EXISTS (
@@ -540,9 +568,10 @@ class RecordingService:
                 AND j.status IN ('collecting','processing')
                 AND f.timestamp >= j.start AND f.timestamp < j.end)
             AND NOT EXISTS(SELECT 1 FROM frame_pins p WHERE p.path=f.path)
-            ORDER BY timestamp
-        """,
-            (cutoff,),
+        """
+            + protection
+            + " ORDER BY timestamp",
+            parameters,
         ).fetchall()
         removed = []
         try:
@@ -556,8 +585,15 @@ class RecordingService:
             # One FULL-synchronous commit for a backlog, rather than one fsync per old frame.
             # Also retain successful cleanup when a later unlink fails or shutdown cancels it.
             if removed:
-                with self.db:
+                from camera_media_service.media_files import storage_io
+
+                try:
                     self.db.executemany("DELETE FROM frames WHERE path=?", removed)
+                    with self.diagnostics.measure("prune_commit"):
+                        await storage_io(self.db.commit)
+                except BaseException:
+                    await storage_io(self.db.rollback)
+                    raise
 
     async def process_clip(self, clip_id: str) -> None:
         from camera_media_service.encoding import encode_clip
@@ -685,10 +721,12 @@ class RecordingService:
                         frames.append(await asyncio.wait_for(self.queue.get(), remaining))
                     except TimeoutError:
                         break
-                await self.store_frames(frames)
+                with self.diagnostics.measure("frame_store"):
+                    await self.store_frames(frames)
                 self.storage_error = False
             except (OSError, sqlite3.Error) as exc:
                 self.storage_error = True
+                self.diagnostics.count("frame_store_" + getattr(exc, "condition", "io_error"))
                 LOG.exception("Recording frame storage failed")
                 if self.hub.loss_observer is not None:
                     for frame in frames:
@@ -703,6 +741,8 @@ class RecordingService:
             finally:
                 for frame in frames:
                     self.queue.acknowledge(frame)
+                self.diagnostics.gauge("ingest_queue_frames", self.queue.qsize())
+                self.diagnostics.report_if_due()
 
     async def _scheduler(self) -> None:
         maintenance_at = 0.0

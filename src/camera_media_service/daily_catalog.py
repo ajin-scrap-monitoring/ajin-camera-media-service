@@ -21,6 +21,8 @@ class DailyCatalog:
             CREATE TABLE IF NOT EXISTS daily_recordings(
                 id TEXT PRIMARY KEY, camera TEXT NOT NULL, date TEXT NOT NULL,
                 status TEXT NOT NULL, body TEXT NOT NULL, UNIQUE(camera,date));
+            CREATE TABLE IF NOT EXISTS daily_revisions(
+                day_id TEXT PRIMARY KEY, revision INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS daily_policies(camera TEXT PRIMARY KEY, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS daily_segments(
                 id TEXT PRIMARY KEY, day_id TEXT NOT NULL, start REAL NOT NULL,
@@ -37,6 +39,14 @@ class DailyCatalog:
             CREATE TABLE IF NOT EXISTS clip_recording_pins(
                 clip_id TEXT NOT NULL,day_id TEXT NOT NULL,PRIMARY KEY(clip_id,day_id));
         """)
+        # An older binary may have advanced the legacy body during an image rollback.
+        # Reconcile small counters once at startup, never read the large body per segment.
+        with db:
+            db.execute(
+                "UPDATE daily_revisions SET revision=(SELECT json_extract(body,'$.revision') "
+                "FROM daily_recordings WHERE id=day_id) WHERE revision < "
+                "(SELECT json_extract(body,'$.revision') FROM daily_recordings WHERE id=day_id)"
+            )
 
     def ensure_day(self, camera_id: str, window: DailyWindow, retention_days: int) -> dict:
         row = self.db.execute(
@@ -44,7 +54,7 @@ class DailyCatalog:
             (camera_id, window.recording_date.isoformat()),
         ).fetchone()
         if row:
-            return json.loads(row[0])
+            return self.decode_day(row[0])
         body = {
             "recording_id": str(uuid.uuid4()),
             "camera_id": camera_id,
@@ -93,9 +103,37 @@ class DailyCatalog:
         ).fetchone()
         if row is None:
             raise ApiError(404, "DAILY_RECORDING_NOT_FOUND", "Daily recording does not exist.")
-        return json.loads(row[0])
+        return self.decode_day(row[0])
+
+    def decode_day(self, raw):
+        body = json.loads(raw)
+        row = self.db.execute(
+            "SELECT revision FROM daily_revisions WHERE day_id=?", (body["recording_id"],)
+        ).fetchone()
+        if row:
+            body["revision"] = max(body.get("revision", 0), row[0])
+        return body
+
+    def advance_revision(self, key):
+        row = self.db.execute(
+            "SELECT revision FROM daily_revisions WHERE day_id=?", (key,)
+        ).fetchone()
+        if row is None:
+            prior = self.db.execute(
+                "SELECT coalesce(json_extract(body,'$.revision'),0) "
+                "FROM daily_recordings WHERE id=?",
+                (key,),
+            ).fetchone()[0]
+            self.db.execute("INSERT INTO daily_revisions VALUES(?,?)", (key, prior + 1))
+        else:
+            self.db.execute("UPDATE daily_revisions SET revision=revision+1 WHERE day_id=?", (key,))
 
     def save_day(self, body: dict) -> None:
+        row = self.db.execute(
+            "SELECT revision FROM daily_revisions WHERE day_id=?", (body["recording_id"],)
+        ).fetchone()
+        if row:
+            body["revision"] = max(body.get("revision", 0), row[0])
         self.db.execute(
             "UPDATE daily_recordings SET status=?,body=? WHERE id=?",
             (body["status"], json.dumps(body), body["recording_id"]),
@@ -130,6 +168,8 @@ class DailyCatalog:
         body = json.loads(row[0])
         if self.root is not None and metadata.get("path"):
             record_generated_info(self.db, self.root, self.root / metadata["path"], metadata)
+        if body["status"] != "ready":
+            self.advance_revision(body["recording_id"])
         body.update({k: v for k, v in metadata.items() if not k.startswith("_")}, status="ready")
         self.db.execute(
             "UPDATE daily_segments SET start=?,end=?,status=?,body=? WHERE id=?",

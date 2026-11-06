@@ -88,6 +88,9 @@ class LiveFrameHub:
                 try:
                     dropped = queue.get_nowait()
                     if isinstance(queue, RecordingQueue):
+                        diagnostics = getattr(self, "recording_diagnostics", None)
+                        if diagnostics is not None:
+                            diagnostics.count("ingest_queue_full")
                         queue.acknowledge(dropped)
                         if self.loss_observer is not None:
                             self.loss_observer(
