@@ -40,6 +40,7 @@ async def test_incremental_refresh_matches_full_without_rescanning_history(tmp_p
         with recording.db:
             for i in range(1000):
                 segment(daily, day["recording_id"], start + i / 2, 0.033333)
+            daily._save_loss("camera-main", start + 450, start + 501, "BUFFER_DROPPED")
             daily._refresh(day, start + 500)
         original = module.build_gaps
         visited = []
@@ -52,6 +53,7 @@ async def test_incremental_refresh_matches_full_without_rescanning_history(tmp_p
         for i in range(30):
             with recording.db:
                 segment(daily, day["recording_id"], start + 500 + i / 2, 0.033333)
+                recording.db.execute("UPDATE daily_gaps SET end=?", (start + 511 + i / 2,))
             until = start + 500 + (i + 1) / 2
             current = daily.catalog.get_day(day["recording_id"])
             rows, known = daily._coverage_rows(current, until)
