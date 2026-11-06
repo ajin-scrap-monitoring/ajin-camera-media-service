@@ -61,7 +61,14 @@ async def test_http_status_never_starts_archive_and_hls_survives_source_compacti
         assert not exports.jobs and not list(exports.output.glob("*.mp4"))
         await exports.maintenance(clock[0])
         assert (await archive_ready(exports, daily, old["recording_id"]))["archive_state"] == "mp4"
-        await exports.maintenance(clock[0])
+        # Archive readiness can precede the optional thumbnail reader releasing
+        # its source lease. Compaction must defer while that reader owns it.
+        async def compact_after_readers_finish():
+            while list((recording.root / "daily" / old["recording_id"]).rglob("*.ts")):
+                await exports.maintenance(clock[0])
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(compact_after_readers_finish(), timeout=10)
         assert not list((recording.root / "daily" / old["recording_id"]).rglob("*.ts"))
         canonical = exports.output / (old["recording_id"] + ".mp4")
         modified = canonical.stat().st_mtime_ns
