@@ -14,6 +14,10 @@ deploy/camera-*.edge.env
 /docs/superpowers/
 /.superpowers/
 
+# Local outbound correspondence (never publish to the remote repository)
+/docs/INTEGRATION_REPLY_*.md
+/.local-replies/
+
 # Python environments and caches
 .venv/
 venv/
