@@ -17,7 +17,7 @@ from pathlib import Path
 
 from camera_media_service.daily_models import StoredFrame
 from camera_media_service.media_usage import iter_regular_files
-from camera_media_service.persisted_media_info import close_probe_database, record_generated_info
+from camera_media_service.persisted_media_info import close_probe_database, persist_generated_info
 from camera_media_service.pipeline import FrameEnvelope, LiveFrameHub, RecordingQueue
 from camera_media_service.recording_checkpoint import CatalogCheckpointer
 from camera_media_service.recording_diagnostics import RecordingDiagnostics, RecordingLock
@@ -323,7 +323,7 @@ class RecordingService:
         self._camera(camera)
         policy = validate_policy(value)
         async with self.lock:
-            with self.db:
+            async with self.transaction():
                 self.db.execute(
                     "INSERT OR REPLACE INTO policies VALUES (?,?)", (camera, json.dumps(policy))
                 )
@@ -376,7 +376,7 @@ class RecordingService:
                 content_path=None,
                 error=None,
             )
-            with self.db:
+            async with self.transaction():
                 self.db.execute(
                     "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?)",
                     (clip_id, camera, event, now, start, end, body["status"], json.dumps(body)),
@@ -434,7 +434,7 @@ class RecordingService:
                     return
                 await self._remove_files(clip_id)
                 body.update(status="deleted", deleted_at=iso(time.time()), content_path=None)
-                with self.db:
+                async with self.transaction():
                     self._save(body)
 
     async def _remove_files(self, clip_id: str) -> None:
@@ -457,7 +457,7 @@ class RecordingService:
         if body["status"] == "ready" and epoch(body["expires_at"]) <= time.time():
             # Deny access immediately, even when physical cleanup must be retried.
             body.update(status="expired", content_path=None)
-            with self.db:
+            async with self.transaction():
                 self._save(body)
                 self.db.execute(
                     "INSERT OR IGNORE INTO pending_cleanup VALUES (?)", (body["clip_id"],)
@@ -471,7 +471,7 @@ class RecordingService:
         if self.db.execute("SELECT 1 FROM pending_cleanup WHERE id=?", (clip_id,)).fetchone():
             try:
                 await self._remove_files(clip_id)
-                with self.db:
+                async with self.transaction():
                     self.db.execute("DELETE FROM pending_cleanup WHERE id=?", (clip_id,))
             except OSError:
                 LOG.exception("Clip cleanup failed")
@@ -648,7 +648,7 @@ class RecordingService:
                         gaps=[{"start_at": iso(start), "end_at": iso(end)}],
                         error={"code": "NO_FRAMES_AVAILABLE", "message": "No frames received."},
                     )
-                with self.db:
+                async with self.transaction():
                     self._save(body)
                 if not frames:
                     return
@@ -697,14 +697,12 @@ class RecordingService:
             finally:
                 self.capacity_reservations.pop(clip_id, None)
                 self.capacity_outputs.pop(clip_id, None)
+            if body["status"] == "ready" and metadata:
+                await persist_generated_info(self, self.clips / f"{clip_id}.mp4", metadata)
             while True:
                 try:
                     async with self.lock:
-                        with self.db:
-                            if body["status"] == "ready" and metadata:
-                                record_generated_info(
-                                    self.db, self.root, self.clips / f"{clip_id}.mp4", metadata
-                                )
+                        async with self.transaction():
                             self._save(body)
                     break
                 except sqlite3.Error:
@@ -719,7 +717,27 @@ class RecordingService:
         # The writer owns at most ten additional validated frames outside this queue.
         self.queue = self.hub.subscribe(maxsize=1200, recording=True, max_bytes=96 * 1024**2)
         assert isinstance(self.queue, RecordingQueue)
-        self.tasks = [asyncio.create_task(self._writer()), asyncio.create_task(self._scheduler())]
+        self.tasks = [
+            asyncio.create_task(self._writer()),
+            asyncio.create_task(self._scheduler()),
+            asyncio.create_task(self._observe_loop()),
+        ]
+
+    async def _observe_loop(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            expected = loop.time() + 0.25
+            wall_start = time.time() + 0.25
+            await asyncio.sleep(0.25)
+            delayed = max(0, loop.time() - expected)
+            self.diagnostics.observe("event_loop_lag", delayed)
+            if delayed > 1:
+                LOG.warning(
+                    "Recording event loop delayed: seconds=%.3f expected_at=%s observed_at=%s",
+                    delayed,
+                    iso(wall_start),
+                    iso(time.time()),
+                )
 
     async def _writer(self) -> None:
         assert self.queue is not None

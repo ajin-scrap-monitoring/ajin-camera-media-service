@@ -23,6 +23,7 @@ from camera_media_service.daily_playback import build_available_intervals
 from camera_media_service.encoding import encode_daily_segment, probe_media
 from camera_media_service.media_files import storage_io
 from camera_media_service.media_usage import iter_regular_files
+from camera_media_service.persisted_media_info import persist_generated_info
 from camera_media_service.recording import ApiError, RecordingService, epoch, iso
 
 LOG = logging.getLogger(__name__)
@@ -230,7 +231,10 @@ class DailyRecordingService:
                 await self.check_space()
                 async with self.lock:
                     async with self.recording.transaction():
-                        self.catalog.complete_segment(segment["segment_id"], metadata)
+                        self.catalog.complete_segment(
+                            segment["segment_id"], metadata, persist_measurement=False
+                        )
+                await persist_generated_info(self.recording, path, metadata)
             except (OSError, RuntimeError, ValueError, KeyError, ApiError) as exc:
                 capacity = isinstance(exc, ApiError) and exc.code == "INSUFFICIENT_STORAGE"
                 if capacity:
@@ -746,7 +750,11 @@ class DailyRecordingService:
                     metadata["path"] = str(path.relative_to(self.recording.root))
                     async with self.lock:
                         async with self.recording.transaction():
-                            self.catalog.complete_segment(segment["segment_id"], metadata)
+                            self.catalog.complete_segment(
+                                segment["segment_id"], metadata, persist_measurement=False
+                            )
+                    self.recording.notify_thumbnail_ready("day", day["recording_id"], metadata)
+                    await persist_generated_info(self.recording, path, metadata)
                     self.last_error = None
                 except (OSError, RuntimeError, TimeoutError, ApiError) as exc:
                     LOG.exception("Daily segment failed: %s", segment["segment_id"])
