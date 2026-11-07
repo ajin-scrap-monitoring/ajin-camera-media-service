@@ -156,6 +156,7 @@ async def persist_generated_info(recording, path, metadata, *, archive_segments=
     def persist():
         connection = None
         try:
+            recording.storage_guard() if hasattr(recording, "storage_guard") else None
             connection = sqlite3.connect(recording.root / METADATA_DATABASE_NAME, timeout=0.05)
 
             def save(db):

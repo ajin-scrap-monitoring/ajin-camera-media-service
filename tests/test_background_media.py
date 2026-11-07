@@ -19,6 +19,28 @@ def owner():
 
 
 @pytest.mark.asyncio
+async def test_verified_duplicate_reclamation_can_recover_storage_error(tmp_path, monkeypatch):
+    from test_daily_archive import archive_ready
+    from test_daily_export import make_exports, recorded_day
+
+    recording, daily, clock, day = await recorded_day(tmp_path, monkeypatch)
+    exports = make_exports(daily)
+    sources = list((recording.root / "daily" / day["recording_id"]).rglob("*.ts"))
+    try:
+        await exports.maintenance(clock[0])
+        assert (await archive_ready(exports, daily, day["recording_id"]))["archive_state"] == "mp4"
+        recording.queue = asyncio.Queue(1200)
+        recording.storage_error = True
+        await exports.maintenance(clock[0])
+        assert sources and not any(path.exists() for path in sources)
+    finally:
+        recording.queue = None
+        await exports.close()
+        await daily.close()
+        await recording.close()
+
+
+@pytest.mark.asyncio
 async def test_background_admission_waits_without_taking_recording_lock():
     from camera_media_service.background_media import BackgroundMedia
 
@@ -52,16 +74,28 @@ async def test_running_owned_process_pauses_and_resumes_and_is_reaped(tmp_path):
     try:
         async with control.scope():
             process = await start_media_process(sys.executable, "-c", code, str(path))
-            await asyncio.sleep(0.1)
+            for _ in range(100):
+                if path.exists():
+                    break
+                await asyncio.sleep(0.01)
+            assert path.exists()
             for _ in range(80):
                 recording.queue.put_nowait(None)
-            await asyncio.sleep(0.15)
+            for _ in range(100):
+                if recording.diagnostics.gauges.get("background_process_paused") == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert recording.diagnostics.gauges.get("background_process_paused") == 1
+            await asyncio.sleep(0.05)
             size = path.stat().st_size
             await asyncio.sleep(0.1)
             assert path.stat().st_size == size
             while not recording.queue.empty():
                 recording.queue.get_nowait()
-            await asyncio.sleep(0.6)
+            for _ in range(200):
+                if path.stat().st_size > size:
+                    break
+                await asyncio.sleep(0.01)
             assert path.stat().st_size > size
             for _ in range(80):
                 recording.queue.put_nowait(None)
@@ -91,6 +125,54 @@ async def test_archive_does_not_reserve_or_start_when_live_queue_is_pressured(
         assert not exports.jobs
         assert not exports.reservations
         assert (await daily.get_day(day["recording_id"]))["export_state"] == "not_requested"
+    finally:
+        recording.queue = None
+        await exports.close()
+        await daily.close()
+        await recording.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_stops_between_batches_when_pressure_arrives(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from test_daily_archive import archive_ready
+    from test_daily_export import make_exports, recorded_day
+
+    recording, daily, clock, day = await recorded_day(tmp_path, monkeypatch)
+    exports = make_exports(daily)
+    folder = recording.root / "daily" / day["recording_id"]
+    try:
+        await exports.maintenance(clock[0])
+        assert (await archive_ready(exports, daily, day["recording_id"]))["archive_state"] == "mp4"
+        for i in range(150):
+            (folder / f"owned-fixture-{i}.ts").write_bytes(b"owned test file")
+        recording.queue = asyncio.Queue(1200)
+        original = Path.unlink
+        loop = asyncio.get_running_loop()
+        removed = []
+
+        def pressure():
+            for _ in range(80):
+                recording.queue.put_nowait(None)
+
+        def unlink(path, *args, **kwargs):
+            result = original(path, *args, **kwargs)
+            if path.is_relative_to(folder):
+                removed.append(path)
+                if len(removed) == 64:
+                    loop.call_soon_threadsafe(pressure)
+            return result
+
+        monkeypatch.setattr(Path, "unlink", unlink)
+        await exports.maintenance(clock[0])
+        assert len(removed) == 64 and folder.exists()
+        assert recording.db.execute(
+            "SELECT 1 FROM daily_compactions WHERE day_id=?", (day["recording_id"],)
+        ).fetchone()
+        recording.queue = None
+        await exports.maintenance(clock[0])
+        assert not folder.exists()
     finally:
         recording.queue = None
         await exports.close()
