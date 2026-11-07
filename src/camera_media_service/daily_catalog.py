@@ -267,12 +267,14 @@ class DailyCatalog:
         )
         return body
 
-    def complete_segment(self, segment_id: str, metadata: dict) -> None:
+    def complete_segment(
+        self, segment_id: str, metadata: dict, *, persist_measurement=True
+    ) -> None:
         row = self.db.execute(
             "SELECT body FROM daily_segments WHERE id=?", (segment_id,)
         ).fetchone()
         body = json.loads(row[0])
-        if self.root is not None and metadata.get("path"):
+        if persist_measurement and self.root is not None and metadata.get("path"):
             record_generated_info(self.db, self.root, self.root / metadata["path"], metadata)
         if body["status"] != "ready":
             self.advance_revision(body["recording_id"])

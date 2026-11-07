@@ -8,8 +8,10 @@ import logging
 import os
 import sqlite3
 from collections import OrderedDict
+from contextlib import nullcontext
 from pathlib import Path
 
+from camera_media_service.background_media import checkpoint
 from camera_media_service.media_files import storage_io
 
 LOG = logging.getLogger(__name__)
@@ -99,10 +101,10 @@ def load_measured_info(db, root, path, identity):
     )
 
 
-def _optional_write(db, root, operation):
+def _optional_write(db, root, operation, *, connection=None):
     """A private ROLLBACK must never reach the caller's primary transaction."""
     try:
-        connection = _metadata_connection(db, root, create=True)
+        connection = connection or _metadata_connection(db, root, create=True)
         with connection:
             connection.execute("BEGIN")
             operation(connection)
@@ -122,16 +124,57 @@ def record_generated_info(db, root, path, metadata):
     info, identity = metadata.get("media_info"), metadata.get("_file_identity")
     if not identity or not info or info["status"] != "ready":
         return False
+    return _optional_write(
+        db, root, lambda connection: _save_generated(connection, root, path, metadata)
+    )
+
+
+def _save_generated(connection, root, path, metadata):
+    info, identity = metadata.get("media_info"), metadata.get("_file_identity")
+    if not identity or not info or info["status"] != "ready":
+        return
     key = Path(path).relative_to(root).as_posix()
+    ensure_probe_table(connection)
+    connection.execute(
+        "INSERT OR REPLACE INTO measured_media_files VALUES(?,?,?)",
+        (key, json.dumps(identity), json.dumps(info)),
+    )
 
-    def save(connection):
-        ensure_probe_table(connection)
-        connection.execute(
-            "INSERT OR REPLACE INTO measured_media_files VALUES(?,?,?)",
-            (key, json.dumps(identity), json.dumps(info)),
-        )
 
-    return _optional_write(db, root, save)
+async def persist_generated_info(recording, path, metadata, *, archive_segments=None):
+    """Drain optional FULL commits on a separately owned worker connection.
+
+    Call outside the primary recording lock. No owner-thread cache connection is
+    shared with the worker; failures cannot roll back primary video state.
+    """
+    if (
+        not metadata.get("_file_identity")
+        or metadata.get("media_info", {}).get("status") != "ready"
+    ):
+        return False
+
+    def persist():
+        connection = None
+        try:
+            recording.storage_guard() if hasattr(recording, "storage_guard") else None
+            connection = sqlite3.connect(recording.root / METADATA_DATABASE_NAME, timeout=0.05)
+
+            def save(db):
+                _save_generated(db, recording.root, path, metadata)
+                if archive_segments is not None:
+                    _save_verified(db, recording.root, path, metadata, archive_segments)
+
+            return _optional_write(None, recording.root, save, connection=connection)
+        except (sqlite3.Error, OSError):
+            LOG.warning("Optional measured metadata could not be saved", exc_info=True)
+            return False
+        finally:
+            if connection is not None:
+                connection.close()
+
+    diagnostics = getattr(recording, "diagnostics", None)
+    with diagnostics.measure("metadata_commit") if diagnostics else nullcontext():
+        return await storage_io(persist)
 
 
 def load_verified_archive(db, root, path, identity):
@@ -150,25 +193,32 @@ def record_verified_archive(db, root, path, metadata, segments):
     identity = metadata.get("_file_identity")
     if not identity:
         return False
+    return _optional_write(
+        db, root, lambda connection: _save_verified(connection, root, path, metadata, segments)
+    )
+
+
+def _save_verified(connection, root, path, metadata, segments):
+    identity = metadata.get("_file_identity")
+    if not identity:
+        return
     key = Path(path).relative_to(root).as_posix()
-
-    def save(connection):
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS verified_media_archives("
-            "path TEXT PRIMARY KEY, identity TEXT NOT NULL, segments TEXT NOT NULL)"
-        )
-        connection.execute(
-            "INSERT OR REPLACE INTO verified_media_archives VALUES(?,?,?)",
-            (key, json.dumps(identity), json.dumps(segments)),
-        )
-
-    return _optional_write(db, root, save)
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS verified_media_archives("
+        "path TEXT PRIMARY KEY, identity TEXT NOT NULL, segments TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT OR REPLACE INTO verified_media_archives VALUES(?,?,?)",
+        (key, json.dumps(identity), json.dumps(segments)),
+    )
 
 
 async def source_measurements(recording, segments):
     """Snapshot only identity-attested source info during actual archive generation."""
     measured = {}
-    for segment in segments:
+    for index, segment in enumerate(segments):
+        if index % 64 == 0:
+            await checkpoint()
         path = recording.root / segment["path"]
         try:
             identity = file_identity(await asyncio.to_thread(path.stat))

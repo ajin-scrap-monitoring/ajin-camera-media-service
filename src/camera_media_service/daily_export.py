@@ -5,18 +5,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import sqlite3
 import uuid
 from pathlib import Path
 
 from camera_media_service.archive_playback import ArchivedPlaybackService
+from camera_media_service.background_media import BackgroundMedia
 from camera_media_service.daily_recording import DailyRecordingService
 from camera_media_service.encoding import merge_daily_mp4, verify_archive
+from camera_media_service.media_files import storage_io
 from camera_media_service.persisted_media_info import (
     load_verified_archive,
-    record_generated_info,
-    record_verified_archive,
+    persist_generated_info,
     source_measurements,
 )
 from camera_media_service.recording import ApiError, epoch, iso
@@ -37,6 +39,7 @@ class DailyExportService:
         self.file_locks = {}
         self.task = None
         self.closed = False
+        self.background = BackgroundMedia(daily.recording, clock=daily.clock)
         self.reservations = daily.storage_reservations
         self.reservation_outputs = daily.storage_reservation_outputs
         self.playback = ArchivedPlaybackService(daily)
@@ -109,6 +112,9 @@ class DailyExportService:
         return self.output / (recording_id + ".mp4")
 
     async def _enqueue(self, recording_id: str) -> None:
+        if self.background.pressured():
+            self.daily.recording.diagnostics.count("archive_admission_deferred")
+            return
         async with self.lock:
             day = self.daily.catalog.get_day(recording_id)
             self._exportable(day)
@@ -134,7 +140,7 @@ class DailyExportService:
                 "status": "processing",
                 "error": None,
             }
-            with self.db:
+            async with self.daily.recording.transaction():
                 self.db.execute(
                     "INSERT OR REPLACE INTO daily_exports VALUES(?,?,?)",
                     (recording_id, "processing", json.dumps(job)),
@@ -175,6 +181,10 @@ class DailyExportService:
         return True
 
     async def _export(self, job: dict, segments: list[dict], *, reuse: bool = False) -> None:
+        async with self.background.scope():
+            await self._export_owned(job, segments, reuse=reuse)
+
+    async def _export_owned(self, job: dict, segments: list[dict], *, reuse: bool = False) -> None:
         recording_id = job["recording_id"]
         final = self._path(recording_id)
         error, metadata = None, None
@@ -186,17 +196,19 @@ class DailyExportService:
                 )
                 if not reuse:
                     await self.daily.check_space()
-                    await merge_daily_mp4(
-                        self.daily.recording.ffmpeg,
-                        segments,
-                        self.output / (recording_id + ".tmp.mp4"),
-                        final,
-                    )
+                    with self.daily.recording.diagnostics.measure("archive_merge"):
+                        await merge_daily_mp4(
+                            self.daily.recording.ffmpeg,
+                            segments,
+                            self.output / (recording_id + ".tmp.mp4"),
+                            final,
+                        )
                 # Verification reads the finished archive and allocates no more
                 # video output. Its existing bytes remain in disk usage.
                 self.reservations[recording_id] = 0
                 await self.daily.check_space()
-                metadata = await verify_archive(self.daily.recording.ffmpeg, final, segments)
+                with self.daily.recording.diagnostics.measure("archive_verify"):
+                    metadata = await verify_archive(self.daily.recording.ffmpeg, final, segments)
                 if reuse:
                     identity = metadata.get("_file_identity")
                     association = (
@@ -225,60 +237,89 @@ class DailyExportService:
             )
             error = {"code": code, "message": "Automatic daily MP4 preparation failed."}
             LOG.exception("Daily archive failed: %s", recording_id)
-        async with self.lock:
-            day = self.daily.catalog.get_day(recording_id)
-            if day["status"] in ("expired", "deleted") or (
-                day["expires_at"] and epoch(day["expires_at"]) <= self.daily.clock()
-            ):
-                error = {"code": "RECORDING_EXPIRED", "message": "Day expired during archive."}
-            with self.db:
-                job.update(status="failed" if error else "ready", error=error)
-                self.db.execute(
-                    "UPDATE daily_exports SET status=?,body=? WHERE day_id=?",
-                    (job["status"], json.dumps(job), recording_id),
+        if not error and metadata:
+            try:
+                await persist_generated_info(
+                    self.daily.recording, final, metadata, archive_segments=association
                 )
-                if error:
-                    day.update(
-                        export_state="failed",
-                        download_path=None,
-                        size_bytes=None,
-                        export_expires_at=None,
-                        archive_retry_at=iso(self.daily.clock() + 30),
-                        error=error,
-                    )
-                else:
-                    record_generated_info(self.db, self.root, final, metadata)
-                    record_verified_archive(self.db, self.root, final, metadata, association)
-                    offset_us = 0
-                    for segment in segments:
-                        segment.update(
-                            archive_path=str(final.relative_to(self.root)),
-                            archive_offset=offset_us / 1_000_000,
-                        )
-                        self.db.execute(
-                            "UPDATE daily_segments SET body=? WHERE id=?",
-                            (json.dumps(segment), segment["segment_id"]),
-                        )
-                        # Match the concat demuxer's per-entry microsecond durations.
-                        offset_us += round(segment["duration"] * 1_000_000)
-                    day.update(
-                        archive_state="mp4",
-                        export_state="ready",
-                        size_bytes=metadata["size_bytes"],
-                        media_info=metadata.get("media_info"),
-                        download_path=f"/api/v2/daily-recordings/{recording_id}/content",
-                        export_expires_at=day["expires_at"],
-                        archive_retry_at=None,
-                        error=None,
-                    )
-                    self.db.execute(
-                        "INSERT OR IGNORE INTO daily_compactions VALUES(?)", (recording_id,)
-                    )
-                self.daily.catalog.save_day(day)
+                with self.daily.recording.diagnostics.measure("archive_mapping"):
+                    await self._stage_archive_mappings(job, segments, final)
+            except asyncio.CancelledError:
+                error = {"code": "JOB_INTERRUPTED", "message": "Archive interrupted."}
+            except (sqlite3.Error, OSError, ApiError):
+                LOG.exception("Archive mapping preparation failed: %s", recording_id)
+                error = {"code": "STORAGE_ERROR", "message": "Archive mapping persistence failed."}
+        async with self.lock:
+            async with self.daily.recording.transaction():
+                error = await storage_io(
+                    self._publish_archive, job, segments, final, metadata, error
+                )
         if error:
-            final.unlink(missing_ok=True)
+            await storage_io(final.unlink, missing_ok=True)
         else:
             self.daily.recording.notify_thumbnail_ready("day", recording_id, metadata)
+
+    def _publish_archive(self, job, segments, final, metadata, error):
+        recording_id = job["recording_id"]
+        day = self.daily.catalog.get_day(recording_id)
+        if day["status"] in ("expired", "deleted") or (
+            day["expires_at"] and epoch(day["expires_at"]) <= self.daily.clock()
+        ):
+            error = {"code": "RECORDING_EXPIRED", "message": "Day expired during archive."}
+        job.update(status="failed" if error else "ready", error=error)
+        self.db.execute(
+            "UPDATE daily_exports SET status=?,body=? WHERE day_id=?",
+            (job["status"], json.dumps(job), recording_id),
+        )
+        if error:
+            day.update(
+                export_state="failed",
+                download_path=None,
+                size_bytes=None,
+                export_expires_at=None,
+                archive_retry_at=iso(self.daily.clock() + 30),
+                error=error,
+            )
+        else:
+            day.update(
+                archive_state="mp4",
+                export_state="ready",
+                size_bytes=metadata["size_bytes"],
+                media_info=metadata.get("media_info"),
+                download_path=f"/api/v2/daily-recordings/{recording_id}/content",
+                export_expires_at=day["expires_at"],
+                archive_retry_at=None,
+                error=None,
+            )
+            self.db.execute("INSERT OR IGNORE INTO daily_compactions VALUES(?)", (recording_id,))
+        self.daily.catalog.save_day(day, notify=False)
+        return error
+
+    async def _stage_archive_mappings(self, job, segments, final):
+        # Readers keep using TS until the final small ready transaction. Earlier
+        # batches are safe to repeat after restart; TS compaction is not admitted
+        # until all offsets are durable and the verified master is published.
+        offset_us = 0
+        for start in range(0, len(segments), 64):
+            await self.background.checkpoint()
+            async with self.lock:
+                self._accessible(self.daily.catalog.get_state(job["recording_id"]))
+                async with self.daily.recording.transaction():
+                    offset_us = await storage_io(
+                        self._stage_mapping_batch, segments[start : start + 64], final, offset_us
+                    )
+
+    def _stage_mapping_batch(self, batch, final, offset_us):
+        for segment in batch:
+            segment.update(
+                archive_path=str(final.relative_to(self.root)), archive_offset=offset_us / 1_000_000
+            )
+            self.db.execute(
+                "UPDATE daily_segments SET body=? WHERE id=?",
+                (json.dumps(segment), segment["segment_id"]),
+            )
+            offset_us += round(segment["duration"] * 1_000_000)
+        return offset_us
 
     def _file_lock(self, recording_id: str) -> asyncio.Lock:
         return self.file_locks.setdefault(recording_id, asyncio.Lock())
@@ -308,8 +349,42 @@ class DailyExportService:
                 raise
 
     async def _compact(self, recording_id: str) -> None:
+        if self.background.pressured() and not self.daily.recording.storage_error:
+            self.daily.recording.diagnostics.count("compaction_deferred")
+            return
         async with self._file_lock(recording_id):
             await self._compact_locked(recording_id)
+
+    async def _compact_files(self, folder):
+        def enumerate_files():
+            files = []
+            for parent, directories, names in os.walk(folder, followlinks=False):
+                files.extend(Path(parent) / name for name in names)
+                files.extend(
+                    Path(parent) / name
+                    for name in directories
+                    if (Path(parent) / name).is_symlink()
+                )
+            return files
+
+        files = await asyncio.to_thread(enumerate_files)
+        for start in range(0, len(files), 64):
+            if self.background.pressured() and not self.daily.recording.storage_error:
+                self.daily.recording.diagnostics.count("compaction_deferred")
+                return False
+            batch = files[start : start + 64]
+
+            def remove(batch=batch):
+                self.daily.recording.storage_guard()
+                for path in batch:
+                    path.unlink(missing_ok=True)
+
+            await self._file_work(remove)
+            await asyncio.sleep(0.01)
+            if self.background.pressured():
+                return False
+        await self._file_work(lambda: self._remove_folder(folder))
+        return True
 
     async def _compact_locked(self, recording_id: str) -> None:
         if self._has_job(recording_id):
@@ -345,7 +420,7 @@ class DailyExportService:
                             "message": "Rebuilding damaged archive from retained sources.",
                         },
                     )
-                    with self.db:
+                    async with self.daily.recording.transaction():
                         self.daily.catalog.save_day(day)
                         self.db.execute(
                             "DELETE FROM daily_compactions WHERE day_id=?", (recording_id,)
@@ -357,9 +432,10 @@ class DailyExportService:
             folder = self.root / "daily" / recording_id
             if not folder.resolve().is_relative_to((self.root / "daily").resolve()):
                 raise OSError("Invalid compaction path")
-        await self._file_work(lambda: self._remove_folder(folder))
+        if not await self._compact_files(folder):
+            return
         async with self.lock:
-            with self.db:
+            async with self.daily.recording.transaction():
                 self.db.execute("DELETE FROM daily_compactions WHERE day_id=?", (recording_id,))
 
     async def delete_day(self, recording_id: str) -> None:
@@ -395,7 +471,7 @@ class DailyExportService:
                     cleanup_error=None,
                     space_reclaimed=None,
                 )
-                with self.db:
+                async with self.daily.recording.transaction():
                     self.daily.catalog.save_day(day)
                     self.db.execute(
                         "INSERT OR IGNORE INTO daily_cleanup VALUES(?)", (recording_id,)
@@ -424,7 +500,7 @@ class DailyExportService:
                 cleanup_error=None,
                 space_reclaimed=None,
             )
-            with self.db:
+            async with self.daily.recording.transaction():
                 self.daily.catalog.save_day(day)
                 self.db.execute("INSERT OR IGNORE INTO daily_cleanup VALUES(?)", (recording_id,))
         uuid.UUID(recording_id)
@@ -457,11 +533,11 @@ class DailyExportService:
                     cleanup_error={"code": "STORAGE_ERROR", "message": "Recording cleanup failed."},
                     space_reclaimed=None,
                 )
-                with self.db:
+                async with self.daily.recording.transaction():
                     self.daily.catalog.save_day(day)
             raise
         async with self.lock:
-            with self.db:
+            async with self.daily.recording.transaction():
                 day = self.daily.catalog.get_day(recording_id)
                 day.update(
                     cleanup_state="complete",
@@ -482,7 +558,7 @@ class DailyExportService:
                 "SELECT id FROM daily_recordings "
                 "WHERE status NOT IN ('recording','finalizing','deleted','expired')"
             ).fetchall()
-            with self.db:
+            async with self.daily.recording.transaction():
                 for row in rows:
                     state = self.daily.catalog.get_state(row[0])
                     day = state
@@ -557,7 +633,7 @@ class DailyExportService:
                                 error={"code": exc.code, "message": "Automatic archive deferred."},
                                 archive_retry_at=iso(now + 30),
                             )
-                            with self.db:
+                            async with self.daily.recording.transaction():
                                 self.daily.catalog.save_day(current)
                     # Avoid repeatedly reserving space for every old day on a full disk.
                     break
@@ -586,7 +662,7 @@ class DailyExportService:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         async with self.lock:
-            with self.db:
+            async with self.daily.recording.transaction():
                 for key in keys:
                     day = self.daily.catalog.get_day(key)
                     if day["export_state"] == "processing":

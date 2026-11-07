@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 
+from camera_media_service.background_media import BackgroundMedia, checkpoint
 from camera_media_service.media_files import open_media_file, storage_io
 from camera_media_service.persisted_media_info import file_identity
 from camera_media_service.recording import ApiError, epoch, iso
@@ -76,6 +79,8 @@ class ThumbnailService:
         self.closed = False
         self.loop_task = None
         self.page_after = None
+        self.ready_days = OrderedDict()
+        self.active_after = None
         recording.thumbnail_pins = getattr(recording, "thumbnail_pins", set())
 
     @staticmethod
@@ -142,9 +147,16 @@ class ThumbnailService:
             for kind, key in await self.store.pending():
                 row = await self.store.get(kind, key)
                 await self._purge(kind, key)
-                await self.store.put(
-                    kind, key, self._base(kind, key, row["camera_id"], "failed", "JOB_INTERRUPTED")
-                )
+                failed = self._base(kind, key, row["camera_id"], "failed", "JOB_INTERRUPTED")
+                for field in (
+                    "_source_identity",
+                    "_representative_at",
+                    "_auto_attempts",
+                    "_auto_next_at",
+                ):
+                    if field in row:
+                        failed[field] = row[field]
+                await self.store.put(kind, key, failed)
             self.available = True
             self.recording.thumbnail_manager = self
             self.recording.thumbnail_observer = self.notify_ready
@@ -156,6 +168,8 @@ class ThumbnailService:
             LOG.exception("Optional thumbnail storage could not start")
 
     def notify_ready(self, kind, key, identity):
+        if kind == "day" and key in self.ready_days:
+            return
         if (
             self.available
             and not self.closed
@@ -164,6 +178,8 @@ class ThumbnailService:
             self.notifications[kind, key] = ("ready", identity)
 
     def notify_change(self, kind, key, status):
+        if kind == "day" and status in ("deleted", "expired"):
+            self.ready_days.pop(key, None)
         if status in ("deleted", "expired") and self.available and not self.closed:
             if len(self.notifications) < 64 or (kind, key) in self.notifications:
                 self.notifications[kind, key] = (status, None)
@@ -183,17 +199,39 @@ class ThumbnailService:
         else:
             if not self.daily:
                 raise ApiError(404, "DAILY_RECORDING_NOT_FOUND", "Daily recording unavailable.")
-            body = self.daily.catalog.get_day(key)
+            body = self.daily.catalog.get_state(key)
             self.recording._camera(body["camera_id"])
             self.exports._accessible(body)
             path = self.recording.root / "daily-exports" / (key + ".mp4")
-            reason = (
-                None
-                if body["status"] == "closed"
+            archived = (
+                body["status"] == "closed"
                 and body["export_state"] == "ready"
                 and body.get("archive_state") == "mp4"
-                else "DAILY_MP4_REQUIRED"
             )
+            first = self.recording.db.execute(
+                "SELECT body FROM daily_segments WHERE day_id=? AND status='ready' "
+                "ORDER BY start,id LIMIT 1",
+                (key,),
+            ).fetchone()
+            reason = None if archived else "SOURCE_NOT_READY"
+            if first:
+                segment = json.loads(first[0])
+                valid_time = (
+                    epoch(body["window_start_at"])
+                    <= segment["start_at"]
+                    < segment["end_at"]
+                    <= epoch(body["window_end_at"])
+                )
+                if valid_time:
+                    body["_thumbnail_representative_at"] = iso(segment["start_at"])
+                    if not archived:
+                        path = self.recording.root / segment["path"]
+                        owned = self.recording.root / "daily" / key
+                        if not path.is_relative_to(owned) or owned.resolve() != owned:
+                            raise OSError("Invalid owned daily source")
+                        body["_thumbnail_source_kind"] = "segment"
+                        body["_thumbnail_source_size"] = segment["size_bytes"]
+                        reason = None
         return body, path, reason
 
     async def _identity(self, path, folder):
@@ -213,6 +251,8 @@ class ThumbnailService:
             if reason is None:
                 try:
                     identity = await self._identity(path, path.parent)
+                    if body.get("_thumbnail_source_size") not in (None, identity[2]):
+                        reason = "SOURCE_UNAVAILABLE"
                 except FileNotFoundError:
                     reason = "SOURCE_UNAVAILABLE"
         return body, path, identity, reason
@@ -240,6 +280,12 @@ class ThumbnailService:
             return self._base(kind, key, body["camera_id"], "unsupported")
         self._ensure()
         row = await self.store.get(kind, key)
+        day_bound = bool(
+            kind == "day"
+            and row
+            and row.get("_day_bound")
+            and row["camera_id"] == body["camera_id"]
+        )
         if reason:
             return self._base(kind, key, body["camera_id"], "unavailable", reason)
         if row is None:
@@ -256,10 +302,15 @@ class ThumbnailService:
                     repaired = self._base(kind, key, body["camera_id"], "failed", "JOB_INTERRUPTED")
                     repaired["_source_identity"] = row.get("_source_identity")
                     repaired["_representative_at"] = row.get("_representative_at")
+                    for field in ("_auto_attempts", "_auto_next_at"):
+                        if field in row:
+                            repaired[field] = row[field]
                     await self.store.put(kind, key, repaired)
                     row = repaired
         invalid = None
-        if tuple(row.get("_source_identity") or ()) != identity:
+        if (not day_bound and tuple(row.get("_source_identity") or ()) != identity) or row[
+            "camera_id"
+        ] != body["camera_id"]:
             invalid = "SOURCE_CHANGED"
         elif row["status"] == "ready":
             try:
@@ -271,27 +322,42 @@ class ThumbnailService:
             except FileNotFoundError:
                 invalid = "IMAGE_UNAVAILABLE"
         if invalid:
+            if kind == "day":
+                self.ready_days.pop(key, None)
             retry = False
             async with self.recording.lock:
                 # Publication takes this same lock. A stale GET may invalidate only
                 # the exact row/source snapshot it observed, never a newer image.
                 current_body, current_path, current_reason = await self._parent(kind, key)
                 current_identity = (
-                    None
-                    if current_reason
-                    else await self._identity(current_path, current_path.parent)
+                    identity
+                    if day_bound
+                    else (
+                        None
+                        if current_reason
+                        else await self._identity(current_path, current_path.parent)
+                    )
                 )
                 if await self.store.get(kind, key) != row or current_identity != identity:
                     retry = True
                 else:
+                    prior = row
                     await self._purge(kind, key)
                     row = self._base(kind, key, current_body["camera_id"], "unavailable", invalid)
                     row["_source_identity"] = identity
+                    for field in ("_auto_attempts", "_auto_next_at"):
+                        if field in prior:
+                            row[field] = prior[field]
                     await self.store.put(kind, key, row)
             if retry:
                 if _attempt < 2:
                     return await self.info(kind, key, _attempt=_attempt + 1)
                 return self._base(kind, key, body["camera_id"], "unavailable", "SOURCE_CHANGED")
+        if kind == "day" and row["status"] == "ready":
+            self.ready_days[key] = None
+            self.ready_days.move_to_end(key)
+            while len(self.ready_days) > 128:
+                self.ready_days.popitem(last=False)
         return {
             ("clip_id" if kind == "clip" else "recording_id"): key,
             "camera_id": body["camera_id"],
@@ -300,6 +366,8 @@ class ThumbnailService:
 
     @staticmethod
     def _representative(body):
+        if body.get("_thumbnail_representative_at"):
+            return body["_thumbnail_representative_at"]
         parts = body.get("available_intervals") or []
         if parts:
             first = parts[0]
@@ -317,12 +385,24 @@ class ThumbnailService:
             pass
         return None
 
-    async def prepare(self, kind, key, *, retry_failed=False, attested_identity=None):
+    async def prepare(
+        self, kind, key, *, retry_failed=False, attested_identity=None, _automatic=False
+    ):
         if type(retry_failed) is not bool:
             raise ApiError(400, "INVALID_ARGUMENT", "retry_failed must be boolean.")
         async with self.admission:
             current = await self.info(kind, key)
             if not self.enabled or current["status"] in ("ready", "pending"):
+                return current, False
+            prior = await self.store.get(kind, key)
+            if (
+                _automatic
+                and prior
+                and (
+                    prior.get("_auto_attempts", 0) >= 3
+                    or prior.get("_auto_next_at", 0) > self.clock()
+                )
+            ):
                 return current, False
             if current["reason_code"] in (
                 "SOURCE_NOT_READY",
@@ -341,12 +421,29 @@ class ThumbnailService:
             body, source, identity, reason = await self._snapshot(kind, key)
             if reason:
                 return self._base(kind, key, body["camera_id"], "unavailable", reason), False
+            if kind == "day" and BackgroundMedia(self.recording, clock=self.clock).pressured():
+                deferred = self._base(kind, key, body["camera_id"], "unavailable", "RECORDING_BUSY")
+                deferred["_source_identity"] = identity
+                for field in ("_auto_attempts", "_auto_next_at"):
+                    if prior and field in prior:
+                        deferred[field] = prior[field]
+                await self.store.put(kind, key, deferred)
+                return {k: v for k, v in deferred.items() if not k.startswith("_")}, False
             owner = "thumbnail:" + kind + ":" + key
             output = self._path(kind, key)
             temporary = output.with_name(key + "." + str(uuid.uuid4()) + ".tmp.jpg")
             reserve = self.max_bytes + 65536
             pending = self._base(kind, key, body["camera_id"], "pending")
             pending["_source_identity"] = identity
+            pending["_source_kind"] = body.get("_thumbnail_source_kind")
+            if kind == "day":
+                pending["_day_bound"] = pending["_source_kind"] == "segment"
+                pending["_auto_attempts"] = (
+                    (prior or {}).get("_auto_attempts", 0) + 1 if _automatic else 0
+                )
+                pending["_auto_next_at"] = self.clock() + min(
+                    300, 30 * 2 ** pending["_auto_attempts"]
+                )
             if attested_identity and tuple(attested_identity) == identity:
                 pending["_representative_at"] = self._representative(body)
             else:
@@ -378,11 +475,18 @@ class ThumbnailService:
                 async def abandon():
                     row = await self.store.get(kind, key)
                     if row and row["status"] == "pending":
-                        await self.store.put(
-                            kind,
-                            key,
-                            self._base(kind, key, body["camera_id"], "failed", "JOB_INTERRUPTED"),
+                        failed = self._base(
+                            kind, key, body["camera_id"], "failed", "JOB_INTERRUPTED"
                         )
+                        for field in (
+                            "_source_identity",
+                            "_representative_at",
+                            "_auto_attempts",
+                            "_auto_next_at",
+                        ):
+                            if field in row:
+                                failed[field] = row[field]
+                        await self.store.put(kind, key, failed)
 
                 await settle(abandon())
                 raise
@@ -436,52 +540,77 @@ class ThumbnailService:
             LOG.exception("Optional thumbnail state recovery deferred after source reader drained")
 
     async def _run(self, kind, key, source, identity, temporary, owner, pending):
+        async with BackgroundMedia(self.recording, clock=self.clock).scope(admit=False):
+            await self._run_owned(kind, key, source, identity, temporary, owner, pending)
+
+    @asynccontextmanager
+    async def _source_guard(self, kind, key, pending):
+        if kind == "day" and pending.get("_source_kind") == "segment":
+            async with self.exports._file_lock(key):
+                yield
+        else:
+            yield
+
+    async def _run_owned(self, kind, key, source, identity, temporary, owner, pending):
         error = None
         cancelled = False
         published = False
         try:
             async with self.slot:
-                async with self.recording.lock:
-                    body, path, reason = await self._parent(kind, key)
-                    if reason or await self._identity(path, path.parent) != identity:
-                        raise ThumbnailFailure("SOURCE_CHANGED")
-                    if kind == "clip":
-                        self.recording.thumbnail_pins.add(key)
-                    else:
-                        async with self.recording.transaction():
-                            self.recording.db.execute(
-                                "INSERT INTO clip_recording_pins VALUES(?,?)", (owner, key)
-                            )
-                measured = await generate_thumbnail(
-                    self.ffmpeg, source, temporary, timeout=self.timeout, max_bytes=self.max_bytes
-                )
-                self.recording.capacity_reservations[owner] = 0
-                await self.recording.check_media_space()
-                async with self.recording.lock:
-                    body, path, reason = await self._parent(kind, key)
-                    if reason or await self._identity(path, path.parent) != identity:
-                        raise ThumbnailFailure("SOURCE_CHANGED")
-                    output = self._path(kind, key)
-                    await storage_io(os.replace, temporary, output)
-                    image_identity = await self._identity(output, output.parent)
-                    ready = self._base(kind, key, body["camera_id"], "ready")
-                    representative = pending.get("_representative_at")
-                    ready.update(
-                        measured,
-                        representative_at=representative,
-                        time_basis="server_received_at" if representative else None,
-                        reason_code=None if representative else "TIMELINE_UNAVAILABLE",
-                        generated_at=iso(self.clock()),
-                        content_path=(
-                            f"/api/v1/clips/{key}/thumbnail"
-                            if kind == "clip"
-                            else f"/api/v2/daily-recordings/{key}/thumbnail"
-                        ),
-                        _source_identity=identity,
-                        _image_identity=image_identity,
+                await checkpoint()
+                async with self._source_guard(kind, key, pending):
+                    async with self.recording.lock:
+                        body, path, reason = await self._parent(kind, key)
+                        if kind == "day" and pending.get("_source_kind") == "segment":
+                            path, reason = source, None
+                        if reason or await self._identity(path, path.parent) != identity:
+                            raise ThumbnailFailure("SOURCE_CHANGED")
+                        if kind == "clip":
+                            self.recording.thumbnail_pins.add(key)
+                        else:
+                            async with self.recording.transaction():
+                                self.recording.db.execute(
+                                    "INSERT INTO clip_recording_pins VALUES(?,?)", (owner, key)
+                                )
+                    measured = await generate_thumbnail(
+                        self.ffmpeg,
+                        source,
+                        temporary,
+                        timeout=self.timeout,
+                        max_bytes=self.max_bytes,
                     )
-                    await self.store.put(kind, key, ready)
-                    published = True
+                    self.recording.capacity_reservations[owner] = 0
+                    await self.recording.check_media_space()
+                    async with self.recording.lock:
+                        body, path, reason = await self._parent(kind, key)
+                        if kind == "day" and pending.get("_source_kind") == "segment":
+                            path, reason = source, None
+                        if reason or await self._identity(path, path.parent) != identity:
+                            raise ThumbnailFailure("SOURCE_CHANGED")
+                        output = self._path(kind, key)
+                        await storage_io(os.replace, temporary, output)
+                        image_identity = await self._identity(output, output.parent)
+                        ready = self._base(kind, key, body["camera_id"], "ready")
+                        representative = pending.get("_representative_at")
+                        ready.update(
+                            measured,
+                            representative_at=representative,
+                            time_basis="server_received_at" if representative else None,
+                            reason_code=None if representative else "TIMELINE_UNAVAILABLE",
+                            generated_at=iso(self.clock()),
+                            content_path=(
+                                f"/api/v1/clips/{key}/thumbnail"
+                                if kind == "clip"
+                                else f"/api/v2/daily-recordings/{key}/thumbnail"
+                            ),
+                            _source_identity=identity,
+                            _image_identity=image_identity,
+                        )
+                        if kind == "day":
+                            ready["_day_bound"] = pending.get("_source_kind") == "segment"
+                            ready["_auto_attempts"] = pending.get("_auto_attempts", 0)
+                        await self.store.put(kind, key, ready)
+                        published = True
         except asyncio.CancelledError:
             cancelled = True
             error = "JOB_INTERRUPTED"
@@ -521,6 +650,9 @@ class ThumbnailService:
                         )
                         failed["_source_identity"] = identity
                         failed["_representative_at"] = pending.get("_representative_at")
+                        for field in ("_auto_attempts", "_auto_next_at"):
+                            if field in pending:
+                                failed[field] = pending[field]
                         await self.store.put(kind, key, failed)
                 finally:
                     await self._release(kind, key, owner)
@@ -546,8 +678,12 @@ class ThumbnailService:
             if (
                 not row
                 or reason
-                or tuple(row.get("_source_identity") or ())
-                != await self._identity(source, source.parent)
+                or row["camera_id"] != body["camera_id"]
+                or (
+                    not (kind == "day" and row.get("_day_bound"))
+                    and tuple(row.get("_source_identity") or ())
+                    != await self._identity(source, source.parent)
+                )
             ):
                 raise ApiError(404, "THUMBNAIL_UNAVAILABLE", "Thumbnail unavailable.")
             path = self._path(kind, key)
@@ -579,6 +715,33 @@ class ThumbnailService:
                 LOG.exception("Optional thumbnail maintenance will retry")
                 await asyncio.sleep(5)
 
+    async def _poll_active_dates(self):
+        if not self.daily or not self.available or self.closed:
+            return
+        async with self.recording.lock:
+            clause = " AND (date,id)<(?,?)" if self.active_after else ""
+            page = self.recording.db.execute(
+                "SELECT id,date FROM daily_recordings WHERE status IN ('recording','finalizing')"
+                + clause
+                + " ORDER BY date DESC,id DESC LIMIT 64",
+                self.active_after or (),
+            ).fetchall()
+            self.active_after = (page[-1][1], page[-1][0]) if len(page) == 64 else None
+            keys = [row[0] for row in page]
+        for key in keys:
+            if (
+                key in self.ready_days
+                or ("day", key) in self.jobs
+                or ("day", key) in self.notifications
+            ):
+                continue
+            row = await self.store.get("day", key)
+            if row and (
+                row.get("_auto_attempts", 0) >= 3 or row.get("_auto_next_at", 0) > self.clock()
+            ):
+                continue
+            self.notify_ready("day", key, None)
+
     async def _maintenance_loop(self):
         try:
             tick = 0
@@ -588,7 +751,13 @@ class ThumbnailService:
                     status, identity = self.notifications.pop((kind, key))
                     try:
                         if status == "ready":
-                            await self.prepare(kind, key, attested_identity=identity)
+                            await self.prepare(
+                                kind,
+                                key,
+                                attested_identity=identity,
+                                retry_failed=(kind == "day"),
+                                _automatic=(kind == "day"),
+                            )
                         else:
                             try:
                                 await self._snapshot(kind, key)
@@ -603,6 +772,14 @@ class ThumbnailService:
                                     kind, key, body["camera_id"], "failed", "CAPACITY_EXCEEDED"
                                 )
                                 failed["_source_identity"] = identity
+                                prior = await self.store.get(kind, key)
+                                for field in (
+                                    "_representative_at",
+                                    "_auto_attempts",
+                                    "_auto_next_at",
+                                ):
+                                    if prior and field in prior:
+                                        failed[field] = prior[field]
                                 await self.store.put(kind, key, failed)
                             except ApiError:
                                 pass
@@ -611,6 +788,7 @@ class ThumbnailService:
                 tick += 1
                 if tick % 20:
                     continue
+                await self._poll_active_dates()
                 for kind, key, owner in list(self.unreleased)[:4]:
                     await self._release(kind, key, owner)
                 page = await self.store.page(self.page_after)
@@ -618,6 +796,15 @@ class ThumbnailService:
                 for kind, key in page:
                     try:
                         body, _, _, reason = await self._snapshot(kind, key)
+                        if kind == "day":
+                            row = await self.store.get(kind, key)
+                            if (
+                                row
+                                and row["status"] in ("failed", "unavailable")
+                                and 0 < row.get("_auto_attempts", 0) < 3
+                                and row.get("_auto_next_at", 0) <= self.clock()
+                            ):
+                                self.notify_ready(kind, key, None)
                     except ApiError as exc:
                         if exc.status not in (404, 410):
                             continue
