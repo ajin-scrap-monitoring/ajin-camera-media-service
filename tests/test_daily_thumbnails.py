@@ -313,7 +313,9 @@ async def test_pressure_defers_then_active_date_poll_retries(tmp_path, monkeypat
     try:
         # Do not call tick's receipt barrier with an artificial queue.
         recording.queue, held = None, recording.queue
+        thumbnail.available = False
         day = await add_slot(recording, daily, clock)
+        thumbnail.available = True
         recording.queue = held
         info, created = await thumbnail.prepare("day", day["recording_id"])
         assert not created and info["status"] == "unavailable"
