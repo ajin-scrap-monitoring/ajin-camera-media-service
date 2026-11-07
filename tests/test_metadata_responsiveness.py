@@ -9,6 +9,28 @@ from test_recording import make_service
 
 
 @pytest.mark.asyncio
+async def test_metadata_worker_checks_mount_guard_before_opening_database(tmp_path):
+    from camera_media_service.persisted_media_info import persist_generated_info
+
+    service = make_service(tmp_path)
+
+    def denied():
+        raise OSError("Expected SD mount unavailable")
+
+    service.storage_guard = denied
+    try:
+        result = await persist_generated_info(
+            service,
+            tmp_path / "owned.mp4",
+            {"_file_identity": (1, 2, 3, 4, 5), "media_info": {"status": "ready"}},
+        )
+        assert result is False
+        assert not (tmp_path / "media-info.sqlite3").exists()
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
 async def test_daily_metadata_commit_leaves_loop_and_primary_catalogue_available(
     tmp_path, monkeypatch
 ):

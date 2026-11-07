@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import sqlite3
 import uuid
 from pathlib import Path
@@ -60,6 +61,18 @@ class ThumbnailStore:
                         or any(type(part) is not int for part in value)
                     ):
                         raise ValueError()
+                if "_day_bound" in body and (kind != "day" or type(body["_day_bound"]) is not bool):
+                    raise ValueError()
+                if "_auto_attempts" in body and (
+                    type(body["_auto_attempts"]) is not int or not 0 <= body["_auto_attempts"] <= 3
+                ):
+                    raise ValueError()
+                if "_auto_next_at" in body and (
+                    type(body["_auto_next_at"]) not in (int, float)
+                    or not math.isfinite(body["_auto_next_at"])
+                    or body["_auto_next_at"] < 0
+                ):
+                    raise ValueError()
                 if body["status"] == "ready":
                     expected = (
                         f"/api/v1/clips/{key}/thumbnail"

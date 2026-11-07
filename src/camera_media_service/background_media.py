@@ -41,10 +41,11 @@ class BackgroundMedia:
                 await asyncio.sleep(0.1)
 
     @asynccontextmanager
-    async def scope(self):
+    async def scope(self, *, admit=True):
         token = CURRENT.set(self)
         try:
-            await self.checkpoint()
+            if admit:
+                await self.checkpoint()
             yield
         finally:
             # Encoding's finally owns kill/reap. Never leave a live child stopped

@@ -244,7 +244,7 @@ async def test_singleflight_capacity_and_delete_drains_source_reader(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_daily_requires_existing_mp4_and_delete_cleans_flat_image(tmp_path, monkeypatch):
+async def test_daily_ts_can_prepare_and_delete_cleans_flat_image(tmp_path, monkeypatch):
     from test_daily_export import make_exports, recorded_day, wait_ready
 
     from camera_media_service.thumbnails import ThumbnailService
@@ -256,7 +256,7 @@ async def test_daily_requires_existing_mp4_and_delete_cleans_flat_image(tmp_path
     key = day["recording_id"]
     try:
         info, created = await service.prepare("day", key)
-        assert not created and info["reason_code"] == "DAILY_MP4_REQUIRED" and not exports.jobs
+        assert created and info["status"] == "pending" and not exports.jobs
         await exports.maintenance(clock[0])
         await wait_ready(exports, daily, key)
         for _ in range(200):

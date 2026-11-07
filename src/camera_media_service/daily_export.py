@@ -238,9 +238,17 @@ class DailyExportService:
             error = {"code": code, "message": "Automatic daily MP4 preparation failed."}
             LOG.exception("Daily archive failed: %s", recording_id)
         if not error and metadata:
-            await persist_generated_info(
-                self.daily.recording, final, metadata, archive_segments=association
-            )
+            try:
+                await persist_generated_info(
+                    self.daily.recording, final, metadata, archive_segments=association
+                )
+                with self.daily.recording.diagnostics.measure("archive_mapping"):
+                    await self._stage_archive_mappings(job, segments, final)
+            except asyncio.CancelledError:
+                error = {"code": "JOB_INTERRUPTED", "message": "Archive interrupted."}
+            except (sqlite3.Error, OSError, ApiError):
+                LOG.exception("Archive mapping preparation failed: %s", recording_id)
+                error = {"code": "STORAGE_ERROR", "message": "Archive mapping persistence failed."}
         async with self.lock:
             async with self.daily.recording.transaction():
                 error = await storage_io(
@@ -273,18 +281,6 @@ class DailyExportService:
                 error=error,
             )
         else:
-            offset_us = 0
-            for segment in segments:
-                segment.update(
-                    archive_path=str(final.relative_to(self.root)),
-                    archive_offset=offset_us / 1_000_000,
-                )
-                self.db.execute(
-                    "UPDATE daily_segments SET body=? WHERE id=?",
-                    (json.dumps(segment), segment["segment_id"]),
-                )
-                # Match the concat demuxer's per-entry microsecond durations.
-                offset_us += round(segment["duration"] * 1_000_000)
             day.update(
                 archive_state="mp4",
                 export_state="ready",
@@ -298,6 +294,32 @@ class DailyExportService:
             self.db.execute("INSERT OR IGNORE INTO daily_compactions VALUES(?)", (recording_id,))
         self.daily.catalog.save_day(day, notify=False)
         return error
+
+    async def _stage_archive_mappings(self, job, segments, final):
+        # Readers keep using TS until the final small ready transaction. Earlier
+        # batches are safe to repeat after restart; TS compaction is not admitted
+        # until all offsets are durable and the verified master is published.
+        offset_us = 0
+        for start in range(0, len(segments), 64):
+            await self.background.checkpoint()
+            async with self.lock:
+                self._accessible(self.daily.catalog.get_state(job["recording_id"]))
+                async with self.daily.recording.transaction():
+                    offset_us = await storage_io(
+                        self._stage_mapping_batch, segments[start : start + 64], final, offset_us
+                    )
+
+    def _stage_mapping_batch(self, batch, final, offset_us):
+        for segment in batch:
+            segment.update(
+                archive_path=str(final.relative_to(self.root)), archive_offset=offset_us / 1_000_000
+            )
+            self.db.execute(
+                "UPDATE daily_segments SET body=? WHERE id=?",
+                (json.dumps(segment), segment["segment_id"]),
+            )
+            offset_us += round(segment["duration"] * 1_000_000)
+        return offset_us
 
     def _file_lock(self, recording_id: str) -> asyncio.Lock:
         return self.file_locks.setdefault(recording_id, asyncio.Lock())
@@ -327,7 +349,7 @@ class DailyExportService:
                 raise
 
     async def _compact(self, recording_id: str) -> None:
-        if self.background.pressured():
+        if self.background.pressured() and not self.daily.recording.storage_error:
             self.daily.recording.diagnostics.count("compaction_deferred")
             return
         async with self._file_lock(recording_id):
@@ -347,7 +369,7 @@ class DailyExportService:
 
         files = await asyncio.to_thread(enumerate_files)
         for start in range(0, len(files), 64):
-            if self.background.pressured():
+            if self.background.pressured() and not self.daily.recording.storage_error:
                 self.daily.recording.diagnostics.count("compaction_deferred")
                 return False
             batch = files[start : start + 64]
@@ -359,6 +381,8 @@ class DailyExportService:
 
             await self._file_work(remove)
             await asyncio.sleep(0.01)
+            if self.background.pressured():
+                return False
         await self._file_work(lambda: self._remove_folder(folder))
         return True
 
