@@ -9,7 +9,7 @@ import re
 import sqlite3
 import uuid
 
-from camera_media_service.persisted_media_info import record_generated_info
+from camera_media_service.persisted_media_info import persist_generated_info
 from camera_media_service.recording import ACTIVE, ApiError, epoch, iso
 
 LOG = logging.getLogger(__name__)
@@ -286,7 +286,7 @@ class RecordedClipService:
                     {"start_at": iso(s["clip_start"]), "end_at": iso(s["clip_end"])} for s in slices
                 ],
             )
-            with self.db:
+            async with self.recording.transaction():
                 self.db.execute(
                     "INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",
                     (clip_id, camera, event, now, start, end, "processing", json.dumps(body)),
@@ -339,20 +339,18 @@ class RecordedClipService:
                 "code": exc.code if isinstance(exc, ApiError) else "CLIP_PREPARATION_FAILED",
                 "message": "Recorded clip preparation failed.",
             }
+        if not error and metadata:
+            await persist_generated_info(
+                self.recording, self.recording.clips / f"{clip_id}.mp4", metadata
+            )
         while True:
             try:
                 async with self.lock:
                     body = self.recording._get(clip_id)
-                    with self.db:
+                    async with self.recording.transaction():
                         if error:
                             body.update(status="failed", error=error)
                         else:
-                            record_generated_info(
-                                self.db,
-                                self.recording.root,
-                                self.recording.clips / f"{clip_id}.mp4",
-                                metadata,
-                            )
                             now = self.daily.clock()
                             body.update(
                                 status="ready",
@@ -397,7 +395,7 @@ class RecordedClipService:
         await asyncio.gather(*tasks, return_exceptions=True)
         # A task cancelled before its first instruction never enters _process.
         async with self.lock:
-            with self.db:
+            async with self.recording.transaction():
                 for key in keys:
                     body = self.recording._get(key)
                     if body["status"] in ACTIVE:

@@ -13,7 +13,7 @@ from camera_media_service.persisted_media_info import (
     file_identity,
     load_measured_info,
     load_verified_archive,
-    record_generated_info,
+    persist_generated_info,
 )
 from camera_media_service.recording import ApiError
 
@@ -136,20 +136,15 @@ class MediaDetails:
             self.active -= 1
 
     async def _persist(self, path, identity, result):
-        async with self.recording.lock:
-            try:
-                if await self._identity(path) != identity:
-                    return
-                record_generated_info(
-                    self.db,
-                    self.recording.root,
-                    path,
-                    {"media_info": result, "_file_identity": identity},
-                )
-            except (sqlite3.Error, OSError):
-                # Metadata is optional; primary ready state and measured values
-                # remain usable, and a later cache hit retries the missing save.
-                pass
+        try:
+            if await self._identity(path) != identity:
+                return
+            await persist_generated_info(
+                self.recording, path, {"media_info": result, "_file_identity": identity}
+            )
+        except (sqlite3.Error, OSError):
+            # An identity-bound optional cache can be retried after failure.
+            pass
 
     async def clip(self, clip_id):
         async with self.recording.lock:
