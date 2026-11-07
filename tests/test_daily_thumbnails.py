@@ -267,10 +267,17 @@ async def test_queued_ts_reader_cannot_enter_during_source_compaction(tmp_path, 
     thumbnail = ThumbnailService(recording, daily, exports)
     await thumbnail.start()
     entered, proceed, decoded, release = (asyncio.Event() for _ in range(4))
+    finish_archive = asyncio.Event()
+    original_export = exports._export
     original = exports._compact_files
     generate = module.generate_thumbnail
     compact = None
     await thumbnail.slot.acquire()
+
+    async def held_archive(*args, **kwargs):
+        await original_export(*args, **kwargs)
+        # Public ready may precede the archive task's final cleanup.
+        await finish_archive.wait()
 
     async def blocked_compaction(folder):
         entered.set()
@@ -283,17 +290,25 @@ async def test_queued_ts_reader_cannot_enter_during_source_compaction(tmp_path, 
         return await generate(*args, **kwargs)
 
     monkeypatch.setattr(exports, "_compact_files", blocked_compaction)
+    monkeypatch.setattr(exports, "_export", held_archive)
     monkeypatch.setattr(module, "generate_thumbnail", tracked_decode)
     try:
         await thumbnail.prepare("day", day["recording_id"])
         await exports.maintenance(clock[0])
         assert (await archive_ready(exports, daily, day["recording_id"]))["archive_state"] == "mp4"
+        archive = exports.jobs[day["recording_id"]]
+        assert not archive.done()
+        await exports._compact(day["recording_id"])
+        assert not entered.is_set(), "Compaction must defer until archive cleanup finishes"
+        finish_archive.set()
+        await asyncio.wait_for(asyncio.shield(archive), 5)
         compact = asyncio.create_task(exports._compact(day["recording_id"]))
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), 5)
         thumbnail.slot.release()
         await asyncio.sleep(0.1)
         assert not decoded.is_set(), "A TS reader acquired a source lease after compaction started"
     finally:
+        finish_archive.set()
         proceed.set()
         release.set()
         if compact:
