@@ -753,8 +753,8 @@ class DailyRecordingService:
                             self.catalog.complete_segment(
                                 segment["segment_id"], metadata, persist_measurement=False
                             )
-                    await persist_generated_info(self.recording, path, metadata)
                     self.recording.notify_thumbnail_ready("day", day["recording_id"], metadata)
+                    await persist_generated_info(self.recording, path, metadata)
                     self.last_error = None
                 except (OSError, RuntimeError, TimeoutError, ApiError) as exc:
                     LOG.exception("Daily segment failed: %s", segment["segment_id"])
