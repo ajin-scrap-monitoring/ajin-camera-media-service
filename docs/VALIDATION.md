@@ -36,7 +36,7 @@ SD 전환 직후 장기 실행에서는 긴 공백과 HLS 타임아웃이 재현
 
 아래의 초기 구현/이전 단계 기록은 당시 관찰이며 현재 상태는 이 절을 따른다.
 
-운영 증거는 `/home/kyuncho/ajin-camera-media-service/deploy-20261103-sd/`의 migration-manifest, deployment/latency-deployment/db-io-deployment, boot-order/restart/final-state, api/whole-download/metadata-restart, after-db-io-delivery/steady/correlation/input-window, ingest-main-observation, loss-query-benchmark JSON과 전체 시험 로그에 있다. 상세 계약은 [후속 계약](INTEGRATION_HANDOFF_2026-11-03.md), 전달용은 [회신](INTEGRATION_REPLY_2026-11-03.md)이다. LC-5는 제외했고 썸네일/원본 생성 시각은 미지원 계약을 유지했다.
+운영 증거는 `/home/kyuncho/ajin-camera-media-service/deploy-20261103-sd/`의 migration-manifest, deployment/latency-deployment/db-io-deployment, boot-order/restart/final-state, api/whole-download/metadata-restart, after-db-io-delivery/steady/correlation/input-window, ingest-main-observation, loss-query-benchmark JSON과 전체 시험 로그에 있다. 상세 계약은 [후속 계약](INTEGRATION_HANDOFF_2026-11-03.md)에 있다. LC-5는 제외했고 썸네일/원본 생성 시각은 미지원 계약을 유지했다.
 
 ## 2026-11-03 LC-1·2·3·4·6 구현 및 로컬 검증
 
@@ -50,7 +50,7 @@ SD UUID/커널 장치/마운트 ID·쓰기 권한과 전파 witness를 검증하
 
 배포 전 운영 f4019cb의30초 관찰에서 완성 MJPEG790개, 버퍼에 저장된 수신 프레임898개, 최대 간격 각각0.743914/0.743653초였으며 둘 다1초 초과는 없었다. 같은 관찰의 새 조각 경계1개에10.069ms 공백이 있었다. 과거11월2일에는 실제1초 초과 조각 공백2,190개가 있어 이를 모두 절단 오차로 취급하지 않는다. 원본 시뮬레이터의 독립 생성 시각은 현재 입력에 없어 생성/전송 원인을 확정하지 않는다. 기존 종료 날짜 JSON에 저장된 과거 집계는 일괄 다시 쓰지 않았다.
 
-운영 SSD 원본은 보존한 채 별도 SD 마운트에 약28.99GB의 날짜 파일을 사전 복사했다. 원래 서비스는 이 단계에서 계속 SSD를 사용한다. 최종 중지·전체 해시/카탈로그 검증·SD 전환·재시작·실제 백엔드·전후 측정 결과는 후속 절에 기록한다. 자료는 서버 deploy-20261103-sd와 로컬 .test-deployment/nov03-before-delivery*.json에 보관한다. 상세 계약과 회신은 INTEGRATION_HANDOFF_2026-11-03.md 및 INTEGRATION_REPLY_2026-11-03.md다.
+운영 SSD 원본은 보존한 채 별도 SD 마운트에 약28.99GB의 날짜 파일을 사전 복사했다. 원래 서비스는 이 단계에서 계속 SSD를 사용한다. 최종 중지·전체 해시/카탈로그 검증·SD 전환·재시작·실제 백엔드·전후 측정 결과는 후속 절에 기록한다. 자료는 서버 deploy-20261103-sd와 로컬 .test-deployment/nov03-before-delivery*.json에 보관한다. 상세 계약은 [후속 계약](INTEGRATION_HANDOFF_2026-11-03.md)을 따른다.
 
 ## 2026-10-31 13:45 대용량 운영 아카이브 완료 확인
 
@@ -121,7 +121,7 @@ R-10 날짜 삭제 경합/실패 재시도, R-07 요청별 구간/재시도, R-0
 - 실제 파일의 명목FPS 분수·codec·해상도를 측정하고, metadata 동시2/대기포함8/캐시128 한도와 취소 복구·파일 교체를 검증했다. 알려지지 않은 정보는null이다.
 - 독립 검토에서 요청별 구간 접수의 공간 검사 중 기존 이벤트 요청이 같은 키를 먼저 차지하는 경합을 재현했다. 최종 카탈로그 잠금에서 중복을 재확인하도록 수정했고 회귀 시험에서503 대신409를 확인했다. 남은 Critical/Important 지적은 없다.
 
-추가 계약과 회신 초안은 [INTEGRATION_HANDOFF_2026-10-30.md](INTEGRATION_HANDOFF_2026-10-30.md), [INTEGRATION_REPLY_2026-10-30.md](INTEGRATION_REPLY_2026-10-30.md)에 있다. 선택 썸네일은 미지원이며, 실제 LiDAR 설치 자료와 엣지 원본 촬영 시각은 제공하지 못하는 범위를 명시했다.
+추가 계약은 [INTEGRATION_HANDOFF_2026-10-30.md](INTEGRATION_HANDOFF_2026-10-30.md)에 있다. 선택 썸네일은 미지원이며, 실제 LiDAR 설치 자료와 엣지 원본 촬영 시각은 제공하지 못하는 범위를 명시했다.
 
 ## 2026-10-27 자동 보관 MP4 서버 배포
 
@@ -403,7 +403,7 @@ Ubuntu 시스템 FFmpeg6.1.1로 바꾼 첫 수정은132개 통과/4개 실패였
 
 서버에서 별도 합성 MP4 서비스와 실제 백엔드 컨테이너 사이의 준비202→ready, 실제 JPEG10621bytes와 HEAD, 재시작 재사용, 재삭제204, 삭제 후410 및 실제 파일 정리를 검증했다. 운영 원본을 삭제하지 않았다. 운영 이미지22b5d9f 배포 후 healthy/systemd active/enabled, SD·환경·자원·네트워크·기존 ID 보존, 새 카메라/날짜 조각 수신, MJPEG/HLS200, 신규 조회/예외와 GET 무변환을 확인했다. 인증 게이트웨이·프론트엔드 통합은 별도다.
 
-GitHub CLI 인증 복구 후 [PR #6](https://github.com/ajin-scrap-monitoring/ajin-camera-media-service/pull/6)을 생성했다. main 통합 상태와 병합 커밋은 해당 PR을 기준으로 확인한다. 운영 실행 코드는22b5d9f이며 후속 문서 갱신은 실행 코드에 영향을 주지 않는다. 실제 계약·응답·배포 상태는 [회신](INTEGRATION_REPLY_2026-11-04.md)과 [계약](THUMBNAIL_API_CONTRACT_2026-11-04.md)을 참조한다.
+GitHub CLI 인증 복구 후 [PR #6](https://github.com/ajin-scrap-monitoring/ajin-camera-media-service/pull/6)을 생성했다. main 통합 상태와 병합 커밋은 해당 PR을 기준으로 확인한다. 운영 실행 코드는22b5d9f이며 후속 문서 갱신은 실행 코드에 영향을 주지 않는다. 실제 계약·응답은 [썸네일 계약](THUMBNAIL_API_CONTRACT_2026-11-04.md), 배포 상태는 위 검증 기록을 참조한다.
 
 
 ## 2026-11-06 날짜 녹화 지연·버퍼 보호 개선
@@ -440,7 +440,7 @@ Windows 전체469passed/3skipped(76.34초), 최신 코드의 GitHub CI 전체472
 
 1차 실제 백엔드 컨테이너 시험에서 기존 날짜 MP4 335,544,320바이트 Range206/33.46초와 이벤트 MP4 2,192,747바이트 생성을 동시 확인했다. MJPEG/HLS200·TS Range206·자체 시험 클립만 삭제/재삭제204, 기존 정책 보존을 확인했다. 진행 중11/07 날짜는 MP4 없이 자동 JPEG640×360/13,458바이트, POST 없는 준비·GET/HEAD200·no-store·반복 조회 재사용이 확인됐다. 기존 원본의 타임라인 근거가 부족해 ready/null/TIMELINE_UNAVAILABLE를 반환하며 촬영 시각으로 추정하지 않았다. 인증 게이트웨이·프론트 화면 전체 통합 검증은 아니다.
 
-기존 자정 로그는 큐1,200프레임/약64MB와 최대25초 저장·공용 잠금 지연을 보여준다. 프레임 장수 한도 도달은 확인되지만 모든 폐기의 한도 유형이나 SD 단독 원인을 소급 확정하지 않는다. 현재 저장소에는 해당 과거 공백의 재처리 원본이 없었다.08:17:10KST cutoff에서 재생 길이와 실제 확보 벽시계 구간의6.344896초 차이는15fps 정수 프레임 올림과 일치하며 추가 촬영 손실로 합산하지 않는다. 자세한 근거와 변경 계약은 [회신](INTEGRATION_REPLY_2026-11-07.md), [날짜 이미지 계약](DAILY_THUMBNAIL_CONTRACT_2026-11-07.md)을 따른다.
+기존 자정 로그는 큐1,200프레임/약64MB와 최대25초 저장·공용 잠금 지연을 보여준다. 프레임 장수 한도 도달은 확인되지만 모든 폐기의 한도 유형이나 SD 단독 원인을 소급 확정하지 않는다. 현재 저장소에는 해당 과거 공백의 재처리 원본이 없었다.08:17:10KST cutoff에서 재생 길이와 실제 확보 벽시계 구간의6.344896초 차이는15fps 정수 프레임 올림과 일치하며 추가 촬영 손실로 합산하지 않는다. 변경 계약은 [날짜 이미지 계약](DAILY_THUMBNAIL_CONTRACT_2026-11-07.md)을 따른다.
 
 최종 재관찰은 07:22:19.953Z~07:32:19.964Z다. 확정 지연 최대29.961초·마지막9.961초, frame_store 최대15.681초, metadata_commit 최대7.148초로 저장 대기는 여전히 존재한다. 이벤트 루프 지연 최대49.3ms, 큐 최대606프레임/31,814,582바이트, 상태 API 응답 표본 최대13.5ms였다. backlog_frames_preserved1회 외 폐기·저장 오류 카운터는 없었다. 컨테이너 최근5회 검사도 모두 성공했다. 유한 RAM 큐나 저장 장치의 처리량 제한이 없어진 것으로 해석하지 않는다.
 
