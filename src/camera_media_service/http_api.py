@@ -126,6 +126,27 @@ def create_http_app(
 
     app.cleanup_ctx.append(lifecycle)
 
+    async def health(request):
+        query_fields(request, ())
+
+        def readable_catalogue():
+            # WAL readers do not need the foreground writer's Python lock or
+            # its connection mutex while a FULL commit waits for storage.
+            connection = sqlite3.connect(
+                (service.root / "catalog.sqlite3").as_uri() + "?mode=ro",
+                uri=True,
+                timeout=0.1,
+            )
+            try:
+                connection.execute("SELECT 1 FROM jobs LIMIT 1").fetchone()
+            finally:
+                connection.close()
+
+        await asyncio.to_thread(readable_catalogue)
+        return web.json_response({"status": "ok"})
+
+    app.router.add_get("/healthz", health)
+
     async def policy(request):
         query_fields(request, ())
         camera = request.match_info["camera_id"]
