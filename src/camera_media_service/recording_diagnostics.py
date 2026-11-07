@@ -27,6 +27,9 @@ class RecordingDiagnostics:
     def gauge(self, name, value):
         self.gauges[self._key(self.gauges, name)] = value
 
+    def peak(self, name, value):
+        self.gauge(name, max(self.gauges.get(name, 0), value))
+
     def observe(self, stage, seconds):
         stage = self._key(self.stages, stage)
         row = self.stages.setdefault(stage, {"count": 0, "total_seconds": 0.0, "max_seconds": 0.0})
@@ -55,6 +58,9 @@ class RecordingDiagnostics:
             LOG.info("Recording diagnostics: %s", json.dumps(self.snapshot(), sort_keys=True))
             self.stages.clear()
             self.loss_counts.clear()
+            for key in list(self.gauges):
+                if key.endswith("_peak"):
+                    self.gauges.pop(key)
             self.last_report = now
 
 

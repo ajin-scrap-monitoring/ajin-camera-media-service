@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -8,6 +9,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from camera_media_service.store import LatestFrameStore
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +101,18 @@ class LiveFrameHub:
             jpeg=jpeg,
         )
         previous = self.latest.get(camera_id)
+        diagnostics = getattr(self, "recording_diagnostics", None)
+        if previous and received_at - previous.received_at > 1:
+            delta = received_at - previous.received_at
+            if diagnostics is not None:
+                diagnostics.observe("receipt_time_gap", delta)
+            LOG.warning(
+                "JPEG receipt-time gap: camera=%s previous=%.6f current=%.6f seconds=%.3f",
+                camera_id,
+                previous.received_at,
+                received_at,
+                delta,
+            )
         period = max(0.001, min(1, received_at - previous.received_at)) if previous else 1 / 30
         self.latest[camera_id] = envelope
 
@@ -106,16 +121,21 @@ class LiveFrameHub:
                 diagnostics = getattr(self, "recording_diagnostics", None)
 
                 if queue.max_bytes is not None and len(envelope.jpeg) > queue.max_bytes:
-                    self._recording_loss(envelope, period)
+                    self._recording_loss(envelope, period, "ingest_frame_oversize")
                     continue
                 while not queue.can_accept(envelope):
+                    cause = (
+                        "ingest_queue_frame_limit" if queue.full() else "ingest_queue_byte_limit"
+                    )
                     dropped = queue.get_nowait()
                     queue.acknowledge(dropped)
-                    self._recording_loss(dropped, period)
+                    self._recording_loss(dropped, period, cause)
                 queue.put_nowait(envelope)
                 if diagnostics is not None:
                     diagnostics.gauge("ingest_queue_frames", queue.qsize())
                     diagnostics.gauge("ingest_queue_bytes", queue.queued_bytes)
+                    diagnostics.peak("ingest_queue_frames_peak", queue.qsize())
+                    diagnostics.peak("ingest_queue_bytes_peak", queue.queued_bytes)
                 continue
             if queue.full():
                 try:
@@ -130,10 +150,11 @@ class LiveFrameHub:
 
         return envelope
 
-    def _recording_loss(self, dropped: FrameEnvelope, period: float) -> None:
+    def _recording_loss(self, dropped: FrameEnvelope, period: float, cause: str) -> None:
         diagnostics = getattr(self, "recording_diagnostics", None)
         if diagnostics is not None:
             diagnostics.count("ingest_queue_full")
+            diagnostics.count(cause)
         if self.loss_observer is not None:
             self.loss_observer(
                 dropped.camera_id,

@@ -11,6 +11,7 @@ import statistics
 import uuid
 from pathlib import Path
 
+from camera_media_service.background_media import CURRENT, file_input_options
 from camera_media_service.daily_models import StoredFrame
 from camera_media_service.media_files import storage_io
 from camera_media_service.media_info import MEDIA_INFO_FILTER, parse_media_info
@@ -19,9 +20,15 @@ from camera_media_service.persisted_media_info import file_identity, publish_gen
 
 async def start_media_process(*args, **kwargs):
     """Retain the OS child handle even if shutdown interrupts subprocess creation."""
+    control = CURRENT.get()
+    if control is not None:
+        await control.checkpoint()
     creation = asyncio.create_task(asyncio.create_subprocess_exec(*args, **kwargs))
     try:
-        return await asyncio.shield(creation)
+        child = await asyncio.shield(creation)
+        if control is not None:
+            control.watch(child)
+        return child
     except asyncio.CancelledError:
 
         async def reap_created_child():
@@ -323,6 +330,7 @@ async def merge_daily_mp4(ffmpeg: str, segments: list[dict], temporary: Path, fi
             "concat",
             "-safe",
             "0",
+            *file_input_options(),
             "-i",
             str(manifest),
             "-an",
@@ -336,7 +344,9 @@ async def merge_daily_mp4(ffmpeg: str, segments: list[dict], temporary: Path, fi
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, error = await asyncio.wait_for(process.communicate(), timeout=3600)
+        _, error = await asyncio.wait_for(
+            process.communicate(), timeout=max(3600, sum(s["duration"] for s in segments) * 2)
+        )
         if process.returncode:
             raise RuntimeError(error[-1500:].decode(errors="replace"))
         metadata = await probe_media(ffmpeg, temporary, full_decode=False)
@@ -365,7 +375,8 @@ async def verify_archive(ffmpeg: str, path: Path, segments: list[dict]) -> dict:
         "-nostdin",
         "-xerror",
         "-threads",
-        "2",
+        "1",
+        *file_input_options(),
         "-i",
         str(path),
         "-map",

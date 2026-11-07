@@ -734,7 +734,16 @@ async def test_owner_reuses_private_connection_and_closes_it_with_service(tmp_pa
     connect = sqlite3.connect
     connections = []
 
+    class ObservedConnection(sqlite3.Connection):
+        closed = False
+
+        def close(self):
+            super().close()
+            self.closed = True
+
     def tracked(database, *args, **kwargs):
+        if "media-info.sqlite3" in str(database):
+            kwargs["factory"] = ObservedConnection
         connection = connect(database, *args, **kwargs)
         if "media-info.sqlite3" in str(database):
             connections.append(connection)
@@ -746,11 +755,12 @@ async def test_owner_reuses_private_connection_and_closes_it_with_service(tmp_pa
         assert (await details.inspect(path))["width"] == 160
         for _ in range(100):
             assert (await details._stored_segment_info(path))["width"] == 160
-        assert len(connections) == 1
+        # Writes use one separately owned worker connection, closed immediately;
+        # repeated reads continue to reuse the one owner-thread reader.
+        assert len(connections) == 2
     finally:
         await recording.close()
-    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
-        connections[0].execute("SELECT 1")
+    assert all(connection.closed for connection in connections)
 
 
 @pytest.mark.asyncio
