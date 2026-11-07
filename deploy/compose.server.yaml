@@ -1,6 +1,6 @@
 services:
   camera-media:
-    image: ${MEDIA_IMAGE:-ajin-camera-media-service:a0e470f}
+    image: ${MEDIA_IMAGE:-ajin-camera-media-service:1edba17}
     container_name: ajin-camera-media-service
     restart: unless-stopped
     env_file:
@@ -35,7 +35,7 @@ services:
         - CMD
         - /app/.venv/bin/python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8889/api/v1/clips?limit=1', timeout=3).close()"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8889/healthz', timeout=3).close()"
       interval: 30s
       timeout: 5s
       retries: 3
