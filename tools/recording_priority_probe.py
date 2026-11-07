@@ -314,9 +314,9 @@ async def run(args):
                     "diagnostics": reports,
                     "is_24_hour_validation": False,
                 }
-                completed = True
             viewer.cancel()
             await asyncio.gather(viewer, return_exceptions=True)
+        completed = True
     finally:
         if viewer:
             viewer.cancel()
