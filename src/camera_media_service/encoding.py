@@ -17,6 +17,7 @@ from camera_media_service.daily_sampling import select_daily_frames
 from camera_media_service.media_files import storage_io
 from camera_media_service.media_info import MEDIA_INFO_FILTER, parse_media_info
 from camera_media_service.persisted_media_info import file_identity, publish_generated_info
+from camera_media_service.video_encoder import H264Encoder
 
 
 async def start_media_process(*args, **kwargs):
@@ -54,7 +55,13 @@ async def start_media_process(*args, **kwargs):
 
 
 async def encode_clip(
-    ffmpeg: str, buffer: Path, output: Path, clip_id: str, frames: list[tuple[str, float]]
+    ffmpeg: str,
+    buffer: Path,
+    output: Path,
+    clip_id: str,
+    frames: list[tuple[str, float]],
+    *,
+    encoder=None,
 ) -> dict:
     manifest = output / f"{clip_id}.ffconcat"
     temporary = output / f"{clip_id}.tmp.mp4"
@@ -67,10 +74,9 @@ async def encode_clip(
             (f"file '../buffer/{name}'", "option framerate 1000", f"duration {duration:.6f}")
         )
     lines.extend((f"file '../buffer/{frames[-1][0]}'", "option framerate 1000"))
-    process = None
     try:
         await storage_io(manifest.write_text, "\n".join(lines) + "\n", encoding="utf-8")
-        process = await start_media_process(
+        command = (
             ffmpeg,
             "-hide_banner",
             "-loglevel",
@@ -99,19 +105,16 @@ async def encode_clip(
             "-movflags",
             "+faststart",
             str(temporary),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
         )
-        _, error = await asyncio.wait_for(process.communicate(), timeout=900)
-        if process.returncode != 0:
-            raise RuntimeError(f"FFmpeg encoding failed: {error[-2000:].decode(errors='replace')}")
-        metadata = await probe_media(ffmpeg, temporary, full_decode=False)
+        metadata = await (encoder or H264Encoder(ffmpeg)).encode(
+            command,
+            lambda: probe_media(ffmpeg, temporary, full_decode=False),
+            timeout=900,
+            start=start_media_process,
+        )
         await publish_generated_info(metadata, temporary, final)
         return metadata
     finally:
-        if process is not None and process.returncode is None:
-            process.kill()
-            await process.communicate()
         manifest.unlink(missing_ok=True)
         temporary.unlink(missing_ok=True)
 
@@ -220,10 +223,9 @@ async def encode_daily_segment(
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
     )
-    process = None
     try:
         await storage_io(manifest.write_text, "\n".join(lines) + "\n", encoding="utf-8")
-        process = await start_media_process(
+        command = (
             ffmpeg,
             "-hide_banner",
             "-loglevel",
@@ -267,13 +269,13 @@ async def encode_daily_segment(
             "-f",
             "mpegts",
             str(temporary),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
         )
-        _, error = await asyncio.wait_for(process.communicate(), timeout=120)
-        if process.returncode:
-            raise RuntimeError(error[-1500:].decode(errors="replace"))
-        metadata = await probe_media(ffmpeg, temporary)
+        metadata = await (profile.get("_encoder") or H264Encoder(ffmpeg)).encode(
+            command,
+            lambda: probe_media(ffmpeg, temporary),
+            timeout=120,
+            start=start_media_process,
+        )
         metadata.update(
             start_at=frames[0].received_at,
             end_at=end_at,
@@ -294,9 +296,6 @@ async def encode_daily_segment(
         await publish_generated_info(metadata, temporary, destination)
         return metadata
     finally:
-        if process is not None and process.returncode is None:
-            process.kill()
-            await process.communicate()
 
         def cleanup():
             if guard is not None:

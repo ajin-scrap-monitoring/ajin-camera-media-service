@@ -741,6 +741,7 @@ class DailyRecordingService:
                                 "end_at": group_end,
                                 "_storage_guard": getattr(self.recording, "storage_guard", None),
                                 "_diagnostics": self.recording.diagnostics,
+                                "_encoder": self.recording.video_encoder,
                                 **(
                                     {"verified_end_at": end}
                                     if verified_tail and group is groups[-1]
