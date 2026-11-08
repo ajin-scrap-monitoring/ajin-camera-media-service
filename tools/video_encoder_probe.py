@@ -205,14 +205,51 @@ async def compare(args):
     assert copied_quality["ssim"] > 0.9999, "Mixed-encoder archive altered decoded GPU frames"
     clips = root / "clips"
     clips.mkdir()
-    await encoding.encode_clip(
-        ffmpeg, buffer, clips, "gpu-event", [(f.path, f.received_at) for f in frames], encoder=gpu
-    )
-    event = await encoding.probe_media(ffmpeg, clips / "gpu-event.mp4")
+    event_runs = []
+    for i, order in enumerate((("cpu", "gpu"), ("gpu", "cpu"), ("cpu", "gpu"))):
+        for mode in order:
+            before = [
+                resource.getrusage(k) for k in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN)
+            ]
+            began = time.monotonic()
+            metadata = await encoding.encode_clip(
+                ffmpeg,
+                buffer,
+                clips,
+                f"{mode}-event-{i}",
+                [(f.path, f.received_at) for f in frames],
+                encoder=gpu if mode == "gpu" else cpu,
+            )
+            wall = time.monotonic() - began
+            after = [
+                resource.getrusage(k) for k in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN)
+            ]
+            used = sum(
+                (a.ru_utime + a.ru_stime) - (b.ru_utime + b.ru_stime)
+                for a, b in zip(after, before, strict=True)
+            )
+            event_runs.append(
+                {
+                    "mode": mode,
+                    "cpu_seconds": used,
+                    "wall_seconds": wall,
+                    "bytes": metadata["size_bytes"],
+                }
+            )
+    event = await encoding.probe_media(ffmpeg, clips / "gpu-event-0.mp4")
+    await encoding.probe_media(ffmpeg, clips / "cpu-event-0.mp4")
+    event_medians = {
+        mode: {
+            key: statistics.median(r[key] for r in event_runs if r["mode"] == mode)
+            for key in ("cpu_seconds", "wall_seconds", "bytes")
+        }
+        for mode in ("cpu", "gpu")
+    }
+    event_quality = quality(ffmpeg, clips / "cpu-event-0.mp4", clips / "gpu-event-0.mp4")
     result = {
         "state": "completed",
         "same_input_frames": 300,
-        "raw_frames_retained": len(paths),
+        "raw_frames_retained": len(list(buffer.glob("*.jpg"))),
         "scope": "1080p30fps JPEG test input to 1080p15fps; startup probe excluded from CPU timing",
         "source_kind": (
             "provided_JPEGs_on_controlled_30fps_grid"
@@ -236,6 +273,12 @@ async def compare(args):
             "duration": event["duration"],
             "bytes": event["size_bytes"],
             "backend": gpu.backend,
+            "medians": event_medians,
+            "quality_relative_to_cpu_output": event_quality,
+            "size_ratio_gpu_to_cpu": event_medians["gpu"]["bytes"] / event_medians["cpu"]["bytes"],
+            "cpu_reduction_percent": 100
+            * (1 - event_medians["gpu"]["cpu_seconds"] / event_medians["cpu"]["cpu_seconds"]),
+            "timing_scope": "encode and fast metadata probe; full decode checked separately",
         },
         "runs": results,
     }

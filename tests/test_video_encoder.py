@@ -34,6 +34,17 @@ def test_encoder_setting_is_opt_in_and_validated():
         Settings.from_env({**env, "MEDIA_VIDEO_ENCODER": "surprise"})
 
 
+def test_nvenc_uses_independent_quality_control_without_mutating_cpu_options():
+    from camera_media_service.video_encoder import nvenc_command
+
+    cpu = ("ffmpeg", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "out.ts")
+    gpu = nvenc_command(cpu)
+    assert gpu[gpu.index("-cq") + 1] == "30"
+    assert gpu[gpu.index("-preset") + 1] == "p5"
+    assert gpu[gpu.index("-profile:v") + 1] == "high"
+    assert cpu[cpu.index("-crf") + 1] == "23"
+
+
 def fixture_frames(tmp_path):
     buffer = tmp_path / "buffer"
     buffer.mkdir()
