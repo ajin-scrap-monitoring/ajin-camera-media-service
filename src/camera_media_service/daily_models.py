@@ -30,3 +30,5 @@ class StoredFrame:
     path: str
     received_at: float
     size_bytes: int
+    pack: str | None = None
+    offset: int = 0

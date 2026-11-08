@@ -32,6 +32,7 @@ class RecordingQueue(asyncio.Queue[FrameEnvelope]):
         self._pending: dict[int, int] = {}
         self._receipt_times: dict[int, tuple[str, float]] = {}
         self._changed = asyncio.Event()
+        self._available = asyncio.Event()
 
     def put_nowait(self, item: FrameEnvelope) -> None:
         if not self.can_accept(item):
@@ -49,11 +50,21 @@ class RecordingQueue(asyncio.Queue[FrameEnvelope]):
     def _put(self, item: FrameEnvelope) -> None:
         super()._put(item)
         self.queued_bytes += len(item.jpeg)
+        self._available.set()
 
     def _get(self) -> FrameEnvelope:
         item = super()._get()
         self.queued_bytes -= len(item.jpeg)
+        if not self._queue:
+            self._available.clear()
         return item
+
+    def next_size(self):
+        return len(self._queue[0].jpeg) if self._queue else None
+
+    async def wait_available(self):
+        while self.empty():
+            await self._available.wait()
 
     def acknowledge(self, item: FrameEnvelope) -> None:
         self._pending.pop(id(item))
