@@ -14,6 +14,7 @@ from pathlib import Path
 from camera_media_service.background_media import CURRENT, file_input_options
 from camera_media_service.daily_models import StoredFrame
 from camera_media_service.daily_sampling import select_daily_frames
+from camera_media_service.frame_packs import input_name, validate_inputs
 from camera_media_service.media_files import storage_io
 from camera_media_service.media_info import MEDIA_INFO_FILTER, parse_media_info
 from camera_media_service.persisted_media_info import file_identity, publish_generated_info
@@ -56,17 +57,29 @@ async def start_media_process(*args, **kwargs):
 async def encode_clip(
     ffmpeg: str, buffer: Path, output: Path, clip_id: str, frames: list[tuple[str, float]]
 ) -> dict:
+    frames = [f if isinstance(f, StoredFrame) else StoredFrame(f[0], f[1], 0) for f in frames]
+    packed = any(f.pack is not None for f in frames)
+    if packed:
+        await storage_io(validate_inputs, buffer, frames)
     manifest = output / f"{clip_id}.ffconcat"
     temporary = output / f"{clip_id}.tmp.mp4"
     final = output / f"{clip_id}.mp4"
     # Relative, generated UUID names avoid embedding arbitrary paths in ffconcat syntax.
     lines = ["ffconcat version 1.0"]
-    for i, (name, timestamp) in enumerate(frames):
-        duration = max(0.001, frames[i + 1][1] - timestamp) if i + 1 < len(frames) else 0.033333
-        lines.extend(
-            (f"file '../buffer/{name}'", "option framerate 1000", f"duration {duration:.6f}")
+    for i, frame in enumerate(frames):
+        duration = (
+            max(0.001, frames[i + 1].received_at - frame.received_at)
+            if i + 1 < len(frames)
+            else 0.033333
         )
-    lines.extend((f"file '../buffer/{frames[-1][0]}'", "option framerate 1000"))
+        lines.extend(
+            (
+                f"file '{input_name(frame, event=True)}'",
+                "option framerate 1000",
+                f"duration {duration:.6f}",
+            )
+        )
+    lines.extend((f"file '{input_name(frames[-1], event=True)}'", "option framerate 1000"))
     process = None
     try:
         await storage_io(manifest.write_text, "\n".join(lines) + "\n", encoding="utf-8")
@@ -77,6 +90,7 @@ async def encode_clip(
             "error",
             "-nostdin",
             "-y",
+            *(["-protocol_whitelist", "file,subfile"] if packed else []),
             "-f",
             "concat",
             "-safe",
@@ -99,6 +113,7 @@ async def encode_clip(
             "-movflags",
             "+faststart",
             str(temporary),
+            **({"cwd": str(buffer)} if packed else {}),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -201,6 +216,9 @@ async def encode_daily_segment(
     if diagnostics is not None:
         diagnostics.gauge("daily_encode_source_frames", source_count)
         diagnostics.gauge("daily_encode_selected_frames", len(frames))
+    packed = any(f.pack is not None for f in frames)
+    if packed:
+        await storage_io(validate_inputs, buffer, frames)
     manifest = buffer / f"{uuid.uuid4()}.ffconcat"
     await storage_io(destination.parent.mkdir, parents=True, exist_ok=True)
     temporary = destination.with_suffix(".tmp.ts")
@@ -212,9 +230,13 @@ async def encode_daily_segment(
             else end_at - frame.received_at
         )
         lines.extend(
-            (f"file '{frame.path}'", "option framerate 1000", f"duration {max(0.001, delta):.6f}")
+            (
+                f"file '{input_name(frame)}'",
+                "option framerate 1000",
+                f"duration {max(0.001, delta):.6f}",
+            )
         )
-    lines.extend((f"file '{frames[-1].path}'", "option framerate 1000"))
+    lines.extend((f"file '{input_name(frames[-1])}'", "option framerate 1000"))
     width, height = profile["width"], profile["height"]
     filters = (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
@@ -231,6 +253,7 @@ async def encode_daily_segment(
             "-nostdin",
             "-xerror",
             "-y",
+            *(["-protocol_whitelist", "file,subfile"] if packed else []),
             "-f",
             "concat",
             "-safe",
@@ -267,6 +290,7 @@ async def encode_daily_segment(
             "-f",
             "mpegts",
             str(temporary),
+            **({"cwd": str(buffer)} if packed else {}),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
