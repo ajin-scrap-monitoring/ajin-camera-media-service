@@ -37,6 +37,7 @@ async def test_daily_metadata_commit_leaves_loop_and_primary_catalogue_available
     import camera_media_service.persisted_media_info as module
 
     service, daily, clock, _ = await recorded_day(tmp_path, monkeypatch)
+    await daily.metadata_writer.join()
     original = module._optional_write
     observed, commits = [], []
 
@@ -66,6 +67,7 @@ async def test_daily_metadata_commit_leaves_loop_and_primary_catalogue_available
     tick = asyncio.create_task(daily.tick(clock[0]))
     try:
         await asyncio.wait_for(tick, 5)
+        await asyncio.wait_for(daily.metadata_writer.join(), 5)
         assert commits
         assert all(any(a + 0.02 < sample < b - 0.02 for sample in observed) for a, b in commits), (
             "Metadata commit blocked the event loop or the primary recording lock"
