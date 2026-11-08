@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from camera_media_service.daily_models import StoredFrame
+from camera_media_service.frame_packs import FramePacks
 from camera_media_service.media_usage import iter_regular_files
 from camera_media_service.persisted_media_info import close_probe_database, persist_generated_info
 from camera_media_service.pipeline import FrameEnvelope, LiveFrameHub, RecordingQueue
@@ -76,6 +77,7 @@ class RecordingService:
         hub: LiveFrameHub,
         *,
         ffmpeg: str = "ffmpeg",
+        frame_storage_mode: str = "files",
         max_buffer_bytes: int = 2 * 1024**3,
         max_jobs: int = 32,
         storage_guard=None,
@@ -91,6 +93,10 @@ class RecordingService:
         self.buffer.mkdir(exist_ok=True)
         self.clips.mkdir(exist_ok=True)
         self.cameras, self.hub = cameras, hub
+        if frame_storage_mode not in ("files", "packed"):
+            raise ValueError("FRAME_STORAGE_MODE must be files or packed")
+        self.frame_storage_mode = frame_storage_mode
+        self._prune_after = 0.0
         self.ffmpeg = ffmpeg
         self.max_buffer_bytes, self.max_jobs = max_buffer_bytes, max_jobs
         self.max_storage_bytes = max_storage_bytes
@@ -140,6 +146,8 @@ class RecordingService:
         self.cursor_key = self.db.execute(
             "SELECT value FROM service_metadata WHERE key='cursor_key'"
         ).fetchone()[0]
+        self.frame_packs = FramePacks(self.db, self.buffer, self.storage_guard)
+        self.frame_packs.reconcile()
         self.diagnostics = RecordingDiagnostics()
         self.hub.recording_diagnostics = self.diagnostics
         self.lock = RecordingLock(self.diagnostics)
@@ -226,6 +234,8 @@ class RecordingService:
         self._budget_generation += 1
 
     async def _check_buffer_capacity(self, reserve: int) -> None:
+        from camera_media_service.media_files import storage_io
+
         if self.max_storage_bytes is None:
             return
         generation = self._budget_generation
@@ -277,10 +287,12 @@ class RecordingService:
         database = await asyncio.to_thread(database_bytes)
         if generation != self._budget_generation:
             return await self._check_buffer_capacity(reserve)
+        buffered = await storage_io(self.buffer_bytes)
+        if generation != self._budget_generation:
+            return await self._check_buffer_capacity(reserve)
         promised = sum(
             max(0, size - allocated.get(key, 0)) for key, size in self.capacity_reservations.items()
         )
-        buffered = self.db.execute("SELECT coalesce(sum(size),0) FROM frames").fetchone()[0]
         if non_buffer + database + promised + buffered + reserve + 65536 > self.max_storage_bytes:
             raise StorageCapacityError(
                 "Media total storage budget reached", condition="total_budget"
@@ -490,45 +502,82 @@ class RecordingService:
     async def store_frame(self, frame: FrameEnvelope) -> None:
         await self.store_frames([frame])
 
+    def buffer_bytes(self):
+        return self.frame_packs.bytes()
+
     async def store_frames(self, frames: list[FrameEnvelope]) -> None:
         if not frames:
             return
         from camera_media_service.media_files import storage_io
 
-        await asyncio.to_thread(self.storage_guard)
+        await storage_io(self.storage_guard)
         reserve = sum(len(frame.jpeg) for frame in frames)
         if self.min_free_storage_bytes:
-            free = (await asyncio.to_thread(shutil.disk_usage, self.root)).free
+            free = (await storage_io(shutil.disk_usage, self.root)).free
             if free - reserve < self.min_free_storage_bytes:
                 raise StorageCapacityError(
                     "Media free-space reserve reached", condition="minimum_free"
                 )
         async with self.lock:
-            await self._prune(time.time(), reserve=reserve)
+            if (
+                time.monotonic() >= self._prune_after
+                or await storage_io(self.buffer_bytes) + reserve > self.max_buffer_bytes
+            ):
+                await self._prune(time.time(), reserve=reserve)
             await self._check_buffer_capacity(reserve)
-            size = self.db.execute("SELECT coalesce(sum(size),0) FROM frames").fetchone()[0]
-            if size + reserve > self.max_buffer_bytes:
+            if await storage_io(self.buffer_bytes) + reserve > self.max_buffer_bytes:
                 raise StorageCapacityError("Protected frames exhausted the buffer budget")
-            paths = []
+            paths, packs = [], []
             try:
                 async with self.transaction():
-                    for frame in frames:
-                        name = f"{uuid.uuid4()}.jpg"
-                        path = self.buffer / name
-                        paths.append(path)
-                        await storage_io(path.write_bytes, frame.jpeg)
-                        self.db.execute(
-                            "INSERT INTO frames VALUES (?,?,?,?)",
-                            (name, frame.camera_id, frame.received_at, len(frame.jpeg)),
-                        )
+                    if self.frame_storage_mode == "packed":
+                        chunks, chunk, size = [], [], 0
+                        for frame in frames:
+                            if chunk and size + len(frame.jpeg) > 8 * 1024**2:
+                                chunks.append(chunk)
+                                chunk, size = [], 0
+                            chunk.append(frame)
+                            size += len(frame.jpeg)
+                        if chunk:
+                            chunks.append(chunk)
+                        for chunk in chunks:
+                            name = uuid.uuid4().hex + ".jpack"
+                            packs.append(name)
+                            with self.diagnostics.measure("frame_pack_write"):
+                                prepared = await storage_io(self.frame_packs.write, name, chunk)
+                            with self.diagnostics.measure("frame_index_execute"):
+                                self.frame_packs.insert(name, prepared)
+                            self.diagnostics.count("frame_packs_written")
+                    else:
+                        rows = []
+                        for frame in frames:
+                            name = f"{uuid.uuid4()}.jpg"
+                            paths.append(self.buffer / name)
+                            rows.append((name, frame.camera_id, frame.received_at, len(frame.jpeg)))
+
+                        def write_files():
+                            for path, frame in zip(paths, frames, strict=True):
+                                self.storage_guard()
+                                path.write_bytes(frame.jpeg)
+
+                        with self.diagnostics.measure("jpeg_batch_write"):
+                            await storage_io(write_files)
+                        with self.diagnostics.measure("frame_index_execute"):
+                            self.db.executemany("INSERT INTO frames VALUES (?,?,?,?)", rows)
+                    self.diagnostics.gauge("frame_store_batch_frames", len(frames))
+                    self.diagnostics.gauge("frame_store_batch_bytes", reserve)
             except BaseException:
+                for name in packs:
+                    if not self.db.execute(
+                        "SELECT 1 FROM frame_packs WHERE pack=?", (name,)
+                    ).fetchone():
+                        await storage_io(self.frame_packs.discard, name)
                 for path in paths:
                     try:
                         referenced = self.db.execute(
                             "SELECT 1 FROM frames WHERE path=?", (path.name,)
                         ).fetchone()
                     except sqlite3.Error:
-                        # Leave uncertain files for startup reconciliation.
                         continue
                     if not referenced:
                         await storage_io(path.unlink, missing_ok=True)
@@ -539,74 +588,112 @@ class RecordingService:
     ) -> list[StoredFrame]:
         """Caller holds lock/transaction; leases survive process interruption."""
         rows = self.db.execute(
-            "SELECT * FROM frames WHERE camera=? AND timestamp>=? AND timestamp<? "
-            "ORDER BY timestamp,path",
+            "SELECT f.*,r.pack,r.offset_bytes FROM frames f "
+            "LEFT JOIN frame_ranges r ON r.path=f.path "
+            "WHERE f.camera=? AND f.timestamp>=? AND f.timestamp<? "
+            "ORDER BY f.timestamp,f.path",
             (camera_id, start_at, end_at),
         ).fetchall()
         self.db.executemany(
             "INSERT OR IGNORE INTO frame_pins VALUES(?,?)", ((owner_id, r["path"]) for r in rows)
         )
-        return [StoredFrame(r["path"], r["timestamp"], r["size"]) for r in rows]
+        return self.frame_packs.descriptors(rows)
 
     def release_frames(self, owner_id: str) -> None:
         self.db.execute("DELETE FROM frame_pins WHERE owner=?", (owner_id,))
 
+    async def _gc_packs(self):
+        from camera_media_service.media_files import storage_io
+
+        names = await storage_io(self.frame_packs.empty)
+        removed = []
+
+        def discard():
+            for name in names:
+                self.frame_packs.discard(name)
+                removed.append((name,))
+
+        try:
+            if names:
+                with self.diagnostics.measure("frame_pack_delete"):
+                    await storage_io(discard)
+        finally:
+            if removed:
+                try:
+                    self.db.executemany("DELETE FROM frame_packs WHERE pack=?", removed)
+                    with self.diagnostics.measure("prune_commit"):
+                        await storage_io(self.db.commit)
+                except BaseException:
+                    await storage_io(self.db.rollback)
+                    raise
+
     async def _prune(self, now: float, reserve: int = 0) -> None:
         from camera_media_service.media_files import storage_io
 
-        await asyncio.to_thread(self.storage_guard)
-        total = self.db.execute("SELECT coalesce(sum(size),0) FROM frames").fetchone()[0]
-        cutoff = now - 300 if total + reserve <= self.max_buffer_bytes else float("inf")
-        protection = ""
-        parameters = [cutoff]
+        await storage_io(self.storage_guard)
+        total = await storage_io(self.buffer_bytes)
+        pressured = total + reserve > self.max_buffer_bytes
+        cutoff = float("inf") if pressured else now - 300
+        protection, parameters = "", [cutoff]
         for camera, cursor in self.daily_frame_watermarks.items():
             protection += " AND NOT (f.camera=? AND f.timestamp>=?)"
             parameters.extend((camera, cursor))
-        # Reclaim a small batch during normal ingestion. Under actual byte
-        # pressure retain enough candidates to satisfy the existing budget.
-        pressured = total + reserve > self.max_buffer_bytes
-        parameters.append(-1 if pressured else 64)
+        parameters.append(
+            -1 if pressured else (2048 if self.frame_storage_mode == "packed" else 64)
+        )
         rows = self.db.execute(
-            "SELECT * FROM frames f WHERE timestamp < ? "
+            "SELECT f.*,r.pack FROM frames f LEFT JOIN frame_ranges r ON r.path=f.path "
+            "WHERE f.timestamp < ? "
             + protection
             + """
-            AND NOT EXISTS (
-                SELECT 1 FROM jobs j WHERE j.camera=f.camera
+            AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.camera=f.camera
                 AND j.status IN ('collecting','processing')
-                AND f.timestamp >= j.start AND f.timestamp < j.end)
-            AND NOT EXISTS(SELECT 1 FROM frame_pins p WHERE p.path=f.path)
-        """
-            + " ORDER BY timestamp,path LIMIT ?",
+                AND f.timestamp>=j.start AND f.timestamp<j.end)
+            AND NOT EXISTS (SELECT 1 FROM frame_pins p WHERE p.path=f.path)
+            ORDER BY f.timestamp,f.path LIMIT ?
+            """,
             parameters,
         ).fetchall()
-        removed = []
-        try:
-            for row in rows:
-                if len(removed) >= 64 and total + reserve <= self.max_buffer_bytes:
-                    break
-                if row["timestamp"] >= now - 300 and total + reserve <= self.max_buffer_bytes:
-                    break
-
-                def remove(row=row):
-                    self.storage_guard()
-                    (self.buffer / row["path"]).unlink(missing_ok=True)
-                    # Keep successful unlink results even if cancellation arrives
-                    # before the drained worker returns to the event loop.
-                    removed.append((row["path"],))
-
-                await storage_io(remove)
+        counts = dict(self.db.execute("SELECT pack,count(*) FROM frame_ranges GROUP BY pack"))
+        sizes = dict(self.db.execute("SELECT pack,size FROM frame_packs"))
+        removed, legacy = [], []
+        for row in rows:
+            if pressured and total + reserve <= self.max_buffer_bytes:
+                break
+            if row["timestamp"] >= now - 300 and total + reserve <= self.max_buffer_bytes:
+                break
+            if row["pack"] is None:
+                legacy.append(row)
                 total -= row["size"]
+            else:
+                removed.append((row["path"],))
+                counts[row["pack"]] -= 1
+                if counts[row["pack"]] == 0:
+                    total -= sizes[row["pack"]]
+
+        def unlink_legacy():
+            for row in legacy:
+                self.storage_guard()
+                (self.buffer / row["path"]).unlink(missing_ok=True)
+                removed.append((row["path"],))
+
+        try:
+            if legacy:
+                with self.diagnostics.measure("jpeg_batch_delete"):
+                    await storage_io(unlink_legacy)
         finally:
-            # One FULL-synchronous commit for a backlog, rather than one fsync per old frame.
-            # Also retain successful cleanup when a later unlink fails or shutdown cancels it.
             if removed:
                 try:
+                    self.db.executemany("DELETE FROM frame_ranges WHERE path=?", removed)
                     self.db.executemany("DELETE FROM frames WHERE path=?", removed)
                     with self.diagnostics.measure("prune_commit"):
                         await storage_io(self.db.commit)
                 except BaseException:
                     await storage_io(self.db.rollback)
                     raise
+        # Data rows are durably unreferenced BEFORE a whole physical pack is removed.
+        await self._gc_packs()
+        self._prune_after = time.monotonic() + (5 if self.frame_storage_mode == "packed" else 0.5)
 
     async def process_clip(self, clip_id: str) -> None:
         from camera_media_service.encoding import encode_clip
@@ -624,8 +711,10 @@ class RecordingService:
                 if time.time() < end:
                     return
                 frames = self.db.execute(
-                    "SELECT * FROM frames WHERE camera=? AND timestamp>=? AND timestamp<? "
-                    "ORDER BY timestamp,path",
+                    "SELECT f.*,r.pack,r.offset_bytes FROM frames f "
+                    "LEFT JOIN frame_ranges r ON r.path=f.path "
+                    "WHERE f.camera=? AND f.timestamp>=? AND f.timestamp<? "
+                    "ORDER BY f.timestamp,f.path",
                     (body["camera_id"], start, end),
                 ).fetchall()
                 times = [r["timestamp"] for r in frames]
@@ -667,7 +756,7 @@ class RecordingService:
                     self.buffer,
                     self.clips,
                     clip_id,
-                    [(r["path"], r["timestamp"]) for r in frames],
+                    self.frame_packs.descriptors(frames),
                 )
                 self.capacity_reservations[clip_id] = 0
                 await self.check_media_space()
@@ -715,7 +804,7 @@ class RecordingService:
     async def start(self) -> None:
         await self.checkpointer.start()
         # Absorb measured SD commit stalls without allowing unbounded RAM growth.
-        # The writer owns at most ten additional validated frames outside this queue.
+        # Writer-owned batch is bounded to 60 frames / 8MiB (or one larger frame).
         self.queue = self.hub.subscribe(maxsize=1200, recording=True, max_bytes=96 * 1024**2)
         assert isinstance(self.queue, RecordingQueue)
         self.tasks = [
@@ -746,15 +835,24 @@ class RecordingService:
             frame = await self.queue.get()
             frames = [frame]
             try:
-                deadline = asyncio.get_running_loop().time() + 0.1
-                while len(frames) < 10:
+                deadline = asyncio.get_running_loop().time() + 0.5
+                size = len(frame.jpeg)
+                while len(frames) < 60:
                     remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
                         break
-                    try:
-                        frames.append(await asyncio.wait_for(self.queue.get(), remaining))
-                    except TimeoutError:
-                        break
+                    next_size = self.queue.next_size()
+                    if next_size is not None:
+                        if size + next_size > 8 * 1024**2:
+                            break
+                        item = self.queue.get_nowait()
+                        frames.append(item)
+                        size += len(item.jpeg)
+                    else:
+                        try:
+                            await asyncio.wait_for(self.queue.wait_available(), remaining)
+                        except TimeoutError:
+                            break
                 with self.diagnostics.measure("frame_store"):
                     await self.store_frames(frames)
                 self.storage_error = False
