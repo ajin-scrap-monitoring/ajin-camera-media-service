@@ -76,6 +76,7 @@ class RecordingService:
         hub: LiveFrameHub,
         *,
         ffmpeg: str = "ffmpeg",
+        video_encoder: str = "cpu",
         max_buffer_bytes: int = 2 * 1024**3,
         max_jobs: int = 32,
         storage_guard=None,
@@ -91,6 +92,9 @@ class RecordingService:
         self.buffer.mkdir(exist_ok=True)
         self.clips.mkdir(exist_ok=True)
         self.cameras, self.hub = cameras, hub
+        from camera_media_service.video_encoder import H264Encoder
+
+        self.video_encoder = H264Encoder(ffmpeg, video_encoder) if video_encoder != "cpu" else None
         self.ffmpeg = ffmpeg
         self.max_buffer_bytes, self.max_jobs = max_buffer_bytes, max_jobs
         self.max_storage_bytes = max_storage_bytes
@@ -141,6 +145,8 @@ class RecordingService:
             "SELECT value FROM service_metadata WHERE key='cursor_key'"
         ).fetchone()[0]
         self.diagnostics = RecordingDiagnostics()
+        if self.video_encoder is not None:
+            self.video_encoder.diagnostics = self.diagnostics
         self.hub.recording_diagnostics = self.diagnostics
         self.lock = RecordingLock(self.diagnostics)
         self.checkpointer = CatalogCheckpointer(
@@ -668,6 +674,7 @@ class RecordingService:
                     self.clips,
                     clip_id,
                     [(r["path"], r["timestamp"]) for r in frames],
+                    **({"encoder": self.video_encoder} if self.video_encoder else {}),
                 )
                 self.capacity_reservations[clip_id] = 0
                 await self.check_media_space()

@@ -1,0 +1,14 @@
+# Opt-in only: add after the base and storage overrides on an NVIDIA-capable host.
+# Do not include this file on hosts without the NVIDIA Container Toolkit/GPU.
+services:
+  camera-media:
+    environment:
+      MEDIA_VIDEO_ENCODER: auto
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${MEDIA_GPU_DEVICE:-0}"]
+              capabilities: [gpu]

@@ -144,6 +144,7 @@ class WebSocketServer:
                 set(self.settings.camera_tokens),
                 self.hub,
                 ffmpeg=self.settings.ffmpeg_path,
+                video_encoder=self.settings.video_encoder,
                 max_buffer_bytes=self.settings.max_buffer_bytes,
                 max_jobs=self.settings.max_clip_jobs,
                 storage_guard=self.storage_guard.check,
