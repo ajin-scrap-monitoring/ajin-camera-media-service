@@ -915,7 +915,7 @@ class DailyRecordingService:
 
     async def get_day(self, recording_id: str) -> dict:
         async with self.lock:
-            return self.catalog.get_day(recording_id)
+            return await storage_io(self.catalog.get_day, recording_id)
 
     async def list_days(
         self, camera_id: str, filters: dict, limit: int, after: tuple | None
@@ -936,31 +936,39 @@ class DailyRecordingService:
             clauses.append("date<?")
             args.append(after[0])
         async with self.lock:
-            return [
-                self.catalog.decode_day(r[0])
-                for r in self.db.execute(
-                    "SELECT body FROM daily_recordings WHERE "
-                    + " AND ".join(clauses)
-                    + " ORDER BY date DESC LIMIT ?",
-                    (*args, limit),
-                )
-            ]
+
+            def read():
+                return [
+                    self.catalog.decode_day(r[0])
+                    for r in self.db.execute(
+                        "SELECT body FROM daily_recordings WHERE "
+                        + " AND ".join(clauses)
+                        + " ORDER BY date DESC LIMIT ?",
+                        (*args, limit),
+                    )
+                ]
+
+            return await storage_io(read)
 
     async def playback_snapshot(self, recording_id: str) -> tuple[dict, list[dict]]:
         async with self.lock:
-            day = self.catalog.get_day(recording_id)
+            day = await storage_io(self.catalog.get_day, recording_id)
             if day["status"] in ("expired", "deleted"):
                 raise ApiError(
                     410,
                     "DAILY_RECORDING_" + day["status"].upper(),
                     "Recording is no longer available.",
                 )
-            rows = self.db.execute(
-                "SELECT body FROM daily_segments WHERE day_id=? AND status='ready' "
-                "ORDER BY start,id",
-                (recording_id,),
-            ).fetchall()
-            segments = await storage_io(lambda: [json.loads(row[0]) for row in rows])
+
+            def read_segments():
+                rows = self.db.execute(
+                    "SELECT body FROM daily_segments WHERE day_id=? AND status='ready' "
+                    "ORDER BY start,id",
+                    (recording_id,),
+                ).fetchall()
+                return [json.loads(row[0]) for row in rows]
+
+            segments = await storage_io(read_segments)
             return day, segments
 
     async def start(self) -> None:

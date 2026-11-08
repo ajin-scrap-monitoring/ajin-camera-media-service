@@ -234,6 +234,8 @@ class RecordingService:
         self._budget_generation += 1
 
     async def _check_buffer_capacity(self, reserve: int) -> None:
+        from camera_media_service.media_files import storage_io
+
         if self.max_storage_bytes is None:
             return
         generation = self._budget_generation
@@ -288,7 +290,7 @@ class RecordingService:
         promised = sum(
             max(0, size - allocated.get(key, 0)) for key, size in self.capacity_reservations.items()
         )
-        buffered = self.buffer_bytes()
+        buffered = await storage_io(self.buffer_bytes)
         if non_buffer + database + promised + buffered + reserve + 65536 > self.max_storage_bytes:
             raise StorageCapacityError(
                 "Media total storage budget reached", condition="total_budget"
@@ -517,11 +519,11 @@ class RecordingService:
         async with self.lock:
             if (
                 time.monotonic() >= self._prune_after
-                or self.buffer_bytes() + reserve > self.max_buffer_bytes
+                or await storage_io(self.buffer_bytes) + reserve > self.max_buffer_bytes
             ):
                 await self._prune(time.time(), reserve=reserve)
             await self._check_buffer_capacity(reserve)
-            if self.buffer_bytes() + reserve > self.max_buffer_bytes:
+            if await storage_io(self.buffer_bytes) + reserve > self.max_buffer_bytes:
                 raise StorageCapacityError("Protected frames exhausted the buffer budget")
             paths, packs = [], []
             try:
@@ -601,7 +603,7 @@ class RecordingService:
     async def _gc_packs(self):
         from camera_media_service.media_files import storage_io
 
-        names = self.frame_packs.empty()
+        names = await storage_io(self.frame_packs.empty)
         removed = []
 
         def discard():
@@ -627,7 +629,7 @@ class RecordingService:
         from camera_media_service.media_files import storage_io
 
         await storage_io(self.storage_guard)
-        total = self.buffer_bytes()
+        total = await storage_io(self.buffer_bytes)
         pressured = total + reserve > self.max_buffer_bytes
         cutoff = float("inf") if pressured else now - 300
         protection, parameters = "", [cutoff]
