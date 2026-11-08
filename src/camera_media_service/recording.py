@@ -287,10 +287,12 @@ class RecordingService:
         database = await asyncio.to_thread(database_bytes)
         if generation != self._budget_generation:
             return await self._check_buffer_capacity(reserve)
+        buffered = await storage_io(self.buffer_bytes)
+        if generation != self._budget_generation:
+            return await self._check_buffer_capacity(reserve)
         promised = sum(
             max(0, size - allocated.get(key, 0)) for key, size in self.capacity_reservations.items()
         )
-        buffered = await storage_io(self.buffer_bytes)
         if non_buffer + database + promised + buffered + reserve + 65536 > self.max_storage_bytes:
             raise StorageCapacityError(
                 "Media total storage budget reached", condition="total_budget"
