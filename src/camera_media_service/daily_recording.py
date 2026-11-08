@@ -18,6 +18,7 @@ from pathlib import Path
 from camera_media_service.daily_catalog import DailyCatalog
 from camera_media_service.daily_coverage_tracking import install_coverage_tracking
 from camera_media_service.daily_gaps import build_gaps
+from camera_media_service.daily_metadata import DailyMetadataWriter
 from camera_media_service.daily_models import DailyWindow, seoul_date
 from camera_media_service.daily_playback import build_available_intervals
 from camera_media_service.encoding import encode_daily_segment, probe_media
@@ -66,6 +67,7 @@ class DailyRecordingService:
         self.losses = []
         self.offline = {}
         self.last_error = None
+        self.metadata_writer = DailyMetadataWriter(recording, clock=self.clock)
         self._closed = False
         self.storage_reservations = recording.capacity_reservations
         self.storage_reservation_outputs = {}
@@ -234,6 +236,8 @@ class DailyRecordingService:
                         self.catalog.complete_segment(
                             segment["segment_id"], metadata, persist_measurement=False
                         )
+                # Recovery must make its fresh identity available before returning;
+                # ordinary newly recorded slots use the optional background queue.
                 await persist_generated_info(self.recording, path, metadata)
             except (OSError, RuntimeError, ValueError, KeyError, ApiError) as exc:
                 capacity = isinstance(exc, ApiError) and exc.code == "INSUFFICIENT_STORAGE"
@@ -736,6 +740,7 @@ class DailyRecordingService:
                                 **profile,
                                 "end_at": group_end,
                                 "_storage_guard": getattr(self.recording, "storage_guard", None),
+                                "_diagnostics": self.recording.diagnostics,
                                 **(
                                     {"verified_end_at": end}
                                     if verified_tail and group is groups[-1]
@@ -754,7 +759,7 @@ class DailyRecordingService:
                                 segment["segment_id"], metadata, persist_measurement=False
                             )
                     self.recording.notify_thumbnail_ready("day", day["recording_id"], metadata)
-                    await persist_generated_info(self.recording, path, metadata)
+                    self.metadata_writer.offer(path, metadata)
                     self.last_error = None
                 except (OSError, RuntimeError, TimeoutError, ApiError) as exc:
                     LOG.exception("Daily segment failed: %s", segment["segment_id"])
@@ -1020,6 +1025,13 @@ class DailyRecordingService:
         if self._closed:
             return
         self._closed = True
+        self.metadata_writer.stop()
+        try:
+            await self._close_daily()
+        finally:
+            await self.metadata_writer.close()
+
+    async def _close_daily(self) -> None:
         if self.task:
             try:
                 await asyncio.wait_for(asyncio.shield(self.task), timeout=25)

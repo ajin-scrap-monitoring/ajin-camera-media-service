@@ -435,6 +435,7 @@ async def test_recovered_segment_persists_fresh_probe_identity(tmp_path, monkeyp
     from test_daily_export import recorded_day
 
     recording, daily, clock, day = await recorded_day(tmp_path, monkeypatch)
+    await daily.metadata_writer.join()
     try:
         segment = daily.catalog.segments(day["recording_id"], ready_only=True)[0]
         with recording.db:

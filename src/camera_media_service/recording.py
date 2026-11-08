@@ -149,6 +149,7 @@ class RecordingService:
         self.encoding_slot = asyncio.Semaphore(1)
         self.queue = None
         self.tasks: list[asyncio.Task] = []
+        self.optional_metadata_workers = set()
         self.jobs: dict[str, asyncio.Task] = {}
         self.storage_error = False
         self._closed = False
@@ -818,6 +819,9 @@ class RecordingService:
             raise
 
     async def _close_resources(self) -> None:
+        optional_workers = list(self.optional_metadata_workers)
+        for optional in optional_workers:
+            optional.stop()
         if self.queue is not None:
             self.hub.unsubscribe(self.queue)
         # Stop producers/maintenance first, then drain already accepted receipts.
@@ -848,6 +852,7 @@ class RecordingService:
             await asyncio.gather(drain, return_exceptions=True)
             writer.cancel()
             await asyncio.gather(writer, return_exceptions=True)
+        await asyncio.gather(*(optional.close() for optional in optional_workers))
         await self.checkpointer.close()
         close_probe_database(self.db)
         from camera_media_service.media_files import storage_io
