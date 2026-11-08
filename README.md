@@ -104,7 +104,7 @@ ready 클립·완료 날짜의 기존 MP4에서 실제 첫 프레임 JPEG를 준
 | `MEDIA_API_HOST`, `MEDIA_API_PORT` | `127.0.0.1`, `8889` |
 | `MEDIA_STORAGE_PATH` | `/var/lib/camera-media`, 전용 영속 저장 디렉터리 |
 | `FFMPEG_PATH` | `ffmpeg`, 실행 파일 경로 |
-| `MEDIA_VIDEO_ENCODER` | `cpu` 기본값. `auto`는 실제 NVENC 인코딩 검사 후 사용하고, GPU 부재·인코딩/검증 실패 시 CPU로 복귀 |
+| `MEDIA_VIDEO_ENCODER` | `cpu` 기본값. `auto`는 상시 녹화에 실제 NVENC 인코딩 검사 후 사용하고, GPU 부재·인코딩/검증 실패 시 CPU로 복귀 |
 | `MAX_BUFFER_BYTES` | `2147483648`, 전체 카메라 JPEG 버퍼 한도 |
 | `MAX_CLIP_JOBS` | `32`, 동시 미완료 작업 한도 |
 | `MAX_FRAME_BYTES` | `4194304`, JPEG 메시지 한도 |
@@ -186,7 +186,7 @@ coverage는 누적 원래 길이와 날짜별 변경 추적을 이용해 새 구
 
 ### 선택적 NVIDIA 인코딩
 
-기본 구성은 GPU 없이 실행됩니다. `MEDIA_VIDEO_ENCODER=auto`는 상시 녹화와 JPEG 원본 이벤트의 H.264 인코딩에 NVENC를 사용하고, 사용 불가 또는 처리/결과 검증 실패 시 같은 보존 원본으로 CPU 재시도합니다. 실패한 GPU는 해당 프로세스 수명 동안 재시도하지 않습니다. JPEG 디코딩·저장·DB와 기존 MP4 다운로드/구간 복사는 기존 경로를 유지합니다. CPU는 x264 veryfast/CRF 23, NVENC는 p5/VBR/CQ 30/High 프로파일을 사용합니다. CRF와 CQ는 같은 숫자로 같은 화질을 뜻하지 않으며, 영상에 따라 화질·크기를 별도로 비교해야 합니다.
+기본 구성은 GPU 없이 실행됩니다. `MEDIA_VIDEO_ENCODER=auto`는 상시 녹화의 H.264 인코딩에 NVENC를 사용하고, 사용 불가 또는 처리/결과 검증 실패 시 같은 보존 원본으로 CPU 재시도합니다. 실패한 GPU는 해당 프로세스 수명 동안 재시도하지 않습니다. JPEG 원본 이벤트는 CPU를 유지합니다. GPU 이벤트의 파일 크기 증가를 피하기 위해 운영 경로에서는 활성화하지 않습니다. JPEG 디코딩·저장·DB와 기존 MP4 다운로드/구간 복사는 기존 경로를 유지합니다. CPU는 x264 veryfast/CRF 23, NVENC는 p5/VBR/CQ 30/High 프로파일을 사용합니다. CRF와 CQ는 같은 숫자로 같은 화질을 뜻하지 않으며, 영상에 따라 화질·크기를 별도로 비교해야 합니다.
 
 NVIDIA 드라이버와 Container Toolkit이 있는 서버만 기존 base·저장소 Compose 파일 뒤에 `deploy/compose.nvidia.yaml`을 선택적으로 추가합니다. GPU가 없는 서버에서는 이 파일을 포함하지 않습니다. 하드웨어 예약 때문에 컨테이너 생성 자체가 실패하면 앱의 CPU 복귀가 실행될 수 없으므로, 공통 Compose 파일에는 GPU 예약을 넣지 않았습니다. `MEDIA_GPU_DEVICE` 기본값은 `0`입니다. GPU 변경 후 재시작하면 실제 인코딩 검사를 다시 수행합니다.
 
