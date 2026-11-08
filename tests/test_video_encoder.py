@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -22,6 +23,35 @@ async def test_service_attaches_encoder_diagnostics_without_gpu_required(tmp_pat
     try:
         assert service.video_encoder.diagnostics is service.diagnostics
         assert service.video_encoder.backend is None
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_auto_does_not_enable_experimental_gpu_event_encoding(tmp_path):
+    from camera_media_service.pipeline import FrameEnvelope, LiveFrameHub
+    from camera_media_service.recording import RecordingService
+    from camera_media_service.store import LatestFrameStore
+
+    service = RecordingService(
+        tmp_path,
+        {"camera-main"},
+        LiveFrameHub(LatestFrameStore()),
+        ffmpeg=imageio_ffmpeg.get_ffmpeg_exe(),
+        video_encoder="auto",
+    )
+    try:
+        await service.set_policy(
+            "camera-main", {"pre_roll_seconds": 1, "post_roll_seconds": 0, "retention_days": 1}
+        )
+        now = time.time()
+        await service.store_frames(
+            [FrameEnvelope("camera-main", now - 0.9 + i / 30, i, jpeg()) for i in range(27)]
+        )
+        job, _ = await service.create_clip("camera-main", "portable-cpu-event")
+        await service.process_clip(job["clip_id"])
+        assert (await service.get_clip(job["clip_id"]))["status"] == "ready"
+        assert service.video_encoder.backend is None, "Event path must leave daily GPU unprobed"
     finally:
         await service.close()
 

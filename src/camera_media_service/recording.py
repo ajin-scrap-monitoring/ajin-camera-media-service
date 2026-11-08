@@ -674,7 +674,6 @@ class RecordingService:
                     self.clips,
                     clip_id,
                     [(r["path"], r["timestamp"]) for r in frames],
-                    **({"encoder": self.video_encoder} if self.video_encoder else {}),
                 )
                 self.capacity_reservations[clip_id] = 0
                 await self.check_media_space()
