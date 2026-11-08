@@ -220,6 +220,10 @@ async def compare(args):
                 [(f.path, f.received_at) for f in frames],
                 encoder=gpu if mode == "gpu" else cpu,
             )
+            actual_backend = (gpu if mode == "gpu" else cpu).backend
+            assert actual_backend == ("h264_nvenc" if mode == "gpu" else "libx264"), (
+                "Event comparison cannot measure CPU fallback as GPU encoding"
+            )
             wall = time.monotonic() - began
             after = [
                 resource.getrusage(k) for k in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN)
@@ -231,6 +235,7 @@ async def compare(args):
             event_runs.append(
                 {
                     "mode": mode,
+                    "backend": actual_backend,
                     "cpu_seconds": used,
                     "wall_seconds": wall,
                     "bytes": metadata["size_bytes"],
