@@ -28,6 +28,7 @@ class Settings:
     api_host: str = "127.0.0.1"
     api_port: int = 8889
     ffmpeg_path: str = "ffmpeg"
+    frame_storage_mode: str = "files"
     max_buffer_bytes: int = 2 * 1024**3
     max_media_storage_bytes: int | None = None
     daily_archive_workspace_bytes: int = 0
@@ -119,6 +120,10 @@ class Settings:
         if daily_width % 2 or daily_height % 2:
             raise SettingsError("DAILY_WIDTH and DAILY_HEIGHT must be even")
 
+        storage_mode = _read_required_text(environ, "FRAME_STORAGE_MODE", "files")
+        if storage_mode not in ("files", "packed"):
+            raise SettingsError("FRAME_STORAGE_MODE must be files or packed")
+
         return cls(
             camera_tokens=camera_tokens,
             host=host,
@@ -139,6 +144,7 @@ class Settings:
             api_host=_read_required_text(environ, "MEDIA_API_HOST", "127.0.0.1"),
             api_port=_read_int(environ, "MEDIA_API_PORT", 8889, 1, 65535),
             ffmpeg_path=_read_required_text(environ, "FFMPEG_PATH", "ffmpeg"),
+            frame_storage_mode=storage_mode,
             max_buffer_bytes=_read_int(environ, "MAX_BUFFER_BYTES", 2 * 1024**3, 1),
             max_media_storage_bytes=media_budget or None,
             daily_archive_workspace_bytes=archive_workspace,

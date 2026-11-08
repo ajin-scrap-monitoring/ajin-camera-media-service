@@ -136,7 +136,7 @@ def register_daily_routes(app, daily, exports, *, media_details=None) -> None:
         recording_id = request.match_info["recording_id"]
         segment_id = request.match_info["segment_id"]
         async with daily.lock:
-            day = daily.catalog.get_day(recording_id)
+            day = await storage_io(daily.catalog.get_day, recording_id)
             exports._accessible(day)
             row = daily.db.execute(
                 "SELECT body FROM daily_segments WHERE id=? AND day_id=? AND status='ready'",
@@ -176,7 +176,7 @@ def register_daily_routes(app, daily, exports, *, media_details=None) -> None:
         await exports.refresh_retention(daily.clock())
         recording_id = request.match_info["recording_id"]
         async with daily.lock:
-            day = daily.catalog.get_day(recording_id)
+            day = await storage_io(daily.catalog.get_day, recording_id)
             exports._accessible(day)
             if day["export_state"] != "ready":
                 raise ApiError(409, "EXPORT_NOT_READY", "Prepare the daily MP4 first.")
