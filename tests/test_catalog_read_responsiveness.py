@@ -7,6 +7,7 @@ from test_daily_recording import make_daily
 from test_frame_packs import frames, service_at
 
 from camera_media_service.daily_models import DailyWindow
+from camera_media_service.recording import StorageCapacityError
 
 
 @pytest.mark.asyncio
@@ -55,6 +56,38 @@ async def test_slow_catalogue_read_keeps_receiver_responsive_and_lock_until_work
         await asyncio.gather(task, return_exceptions=True)
         monkeypatch.setattr(daily.catalog, "decode_day", original)
         await daily.close()
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_reservation_change_during_pack_accounting_rechecks_total_budget(
+    tmp_path, monkeypatch
+):
+    service = service_at(tmp_path, max_storage_bytes=10 * 1024**2)
+    entered, release = threading.Event(), threading.Event()
+    original = service.frame_packs.bytes
+
+    def blocked():
+        entered.set()
+        assert release.wait(5)
+        return original()
+
+    monkeypatch.setattr(service.frame_packs, "bytes", blocked)
+
+    async def check():
+        async with service.lock:
+            await service._check_buffer_capacity(1)
+
+    task = asyncio.create_task(check())
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        service.capacity_reservations["new-event"] = 20 * 1024**2
+        release.set()
+        with pytest.raises(StorageCapacityError, match="total storage budget"):
+            await task
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
         await service.close()
 
 
