@@ -14,7 +14,9 @@ def nvenc_command(command):
     if "-preset" in args:
         args[args.index("-preset") + 1] = "p5"
     if "-crf" in args:
-        args[args.index("-crf")] = "-cq"
+        index = args.index("-crf")
+        # CQ and x264 CRF are different scales; keep the CPU policy unchanged.
+        args[index : index + 2] = ["-cq", "30"]
     index = args.index("h264_nvenc") + 1
     args[index:index] = ["-rc", "vbr", "-b:v", "0", "-profile:v", "high"]
     return args
