@@ -13,6 +13,7 @@ from pathlib import Path
 
 from camera_media_service.background_media import CURRENT, file_input_options
 from camera_media_service.daily_models import StoredFrame
+from camera_media_service.daily_sampling import select_daily_frames
 from camera_media_service.media_files import storage_io
 from camera_media_service.media_info import MEDIA_INFO_FILTER, parse_media_info
 from camera_media_service.persisted_media_info import file_identity, publish_generated_info
@@ -192,6 +193,14 @@ async def encode_daily_segment(
         profile.get("end_at", float("inf")),
     )
     duration = max(0.001, end_at - frames[0].received_at)
+    # Derive coverage/cadence from ALL receipts before selecting decoder inputs.
+    # The retained JPEG buffer and event encoder are unchanged.
+    source_count = len(frames)
+    frames = select_daily_frames(frames, fps, end_at)
+    diagnostics = profile.get("_diagnostics")
+    if diagnostics is not None:
+        diagnostics.gauge("daily_encode_source_frames", source_count)
+        diagnostics.gauge("daily_encode_selected_frames", len(frames))
     manifest = buffer / f"{uuid.uuid4()}.ffconcat"
     await storage_io(destination.parent.mkdir, parents=True, exist_ok=True)
     temporary = destination.with_suffix(".tmp.ts")
