@@ -546,7 +546,7 @@ class RecordingService:
                             with self.diagnostics.measure("frame_pack_write"):
                                 prepared = await storage_io(self.frame_packs.write, name, chunk)
                             with self.diagnostics.measure("frame_index_execute"):
-                                self.frame_packs.insert(name, prepared)
+                                await storage_io(self.frame_packs.insert, name, prepared)
                             self.diagnostics.count("frame_packs_written")
                     else:
                         rows = []
@@ -563,14 +563,18 @@ class RecordingService:
                         with self.diagnostics.measure("jpeg_batch_write"):
                             await storage_io(write_files)
                         with self.diagnostics.measure("frame_index_execute"):
-                            self.db.executemany("INSERT INTO frames VALUES (?,?,?,?)", rows)
+                            await storage_io(
+                                self.db.executemany, "INSERT INTO frames VALUES (?,?,?,?)", rows
+                            )
                     self.diagnostics.gauge("frame_store_batch_frames", len(frames))
                     self.diagnostics.gauge("frame_store_batch_bytes", reserve)
             except BaseException:
                 for name in packs:
-                    if not self.db.execute(
-                        "SELECT 1 FROM frame_packs WHERE pack=?", (name,)
-                    ).fetchone():
+                    if not await storage_io(
+                        lambda name=name: self.db.execute(
+                            "SELECT 1 FROM frame_packs WHERE pack=?", (name,)
+                        ).fetchone()
+                    ):
                         await storage_io(self.frame_packs.discard, name)
                 for path in paths:
                     try:
@@ -620,7 +624,9 @@ class RecordingService:
         finally:
             if removed:
                 try:
-                    self.db.executemany("DELETE FROM frame_packs WHERE pack=?", removed)
+                    await storage_io(
+                        self.db.executemany, "DELETE FROM frame_packs WHERE pack=?", removed
+                    )
                     with self.diagnostics.measure("prune_commit"):
                         await storage_io(self.db.commit)
                 except BaseException:
@@ -641,21 +647,27 @@ class RecordingService:
         parameters.append(
             -1 if pressured else (2048 if self.frame_storage_mode == "packed" else 64)
         )
-        rows = self.db.execute(
-            "SELECT f.*,r.pack FROM frames f LEFT JOIN frame_ranges r ON r.path=f.path "
-            "WHERE f.timestamp < ? "
-            + protection
-            + """
-            AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.camera=f.camera
-                AND j.status IN ('collecting','processing')
-                AND f.timestamp>=j.start AND f.timestamp<j.end)
-            AND NOT EXISTS (SELECT 1 FROM frame_pins p WHERE p.path=f.path)
-            ORDER BY f.timestamp,f.path LIMIT ?
-            """,
-            parameters,
-        ).fetchall()
-        counts = dict(self.db.execute("SELECT pack,count(*) FROM frame_ranges GROUP BY pack"))
-        sizes = dict(self.db.execute("SELECT pack,size FROM frame_packs"))
+
+        def snapshot():
+            rows = self.db.execute(
+                "SELECT f.*,r.pack FROM frames f LEFT JOIN frame_ranges r ON r.path=f.path "
+                "WHERE f.timestamp < ? "
+                + protection
+                + """
+                AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.camera=f.camera
+                    AND j.status IN ('collecting','processing')
+                    AND f.timestamp>=j.start AND f.timestamp<j.end)
+                AND NOT EXISTS (SELECT 1 FROM frame_pins p WHERE p.path=f.path)
+                ORDER BY f.timestamp,f.path LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            counts = dict(self.db.execute("SELECT pack,count(*) FROM frame_ranges GROUP BY pack"))
+            sizes = dict(self.db.execute("SELECT pack,size FROM frame_packs"))
+            return rows, counts, sizes
+
+        with self.diagnostics.measure("frame_prune_select"):
+            rows, counts, sizes = await storage_io(snapshot)
         removed, legacy = [], []
         for row in rows:
             if pressured and total + reserve <= self.max_buffer_bytes:
@@ -684,8 +696,13 @@ class RecordingService:
         finally:
             if removed:
                 try:
-                    self.db.executemany("DELETE FROM frame_ranges WHERE path=?", removed)
-                    self.db.executemany("DELETE FROM frames WHERE path=?", removed)
+
+                    def delete_rows():
+                        self.db.executemany("DELETE FROM frame_ranges WHERE path=?", removed)
+                        self.db.executemany("DELETE FROM frames WHERE path=?", removed)
+
+                    with self.diagnostics.measure("frame_prune_execute"):
+                        await storage_io(delete_rows)
                     with self.diagnostics.measure("prune_commit"):
                         await storage_io(self.db.commit)
                 except BaseException:
