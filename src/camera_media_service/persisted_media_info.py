@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -215,19 +214,21 @@ def _save_verified(connection, root, path, metadata, segments):
 
 async def source_measurements(recording, segments):
     """Snapshot only identity-attested source info during actual archive generation."""
+    from camera_media_service.metadata_reads import read_segment_measurements
+
     measured = {}
-    for index, segment in enumerate(segments):
-        if index % 64 == 0:
-            await checkpoint()
-        path = recording.root / segment["path"]
-        try:
-            identity = file_identity(await asyncio.to_thread(path.stat))
-            async with recording.lock:
-                info = load_measured_info(recording.db, recording.root, path, identity)
-            if info and file_identity(await asyncio.to_thread(path.stat)) == identity:
+    for start in range(0, len(segments), 64):
+        await checkpoint()
+        parts = segments[start : start + 64]
+        rows = await storage_io(
+            read_segment_measurements,
+            recording.root,
+            parts,
+            getattr(recording, "storage_guard", None),
+        )
+        for segment, (_, identity, info) in zip(parts, rows, strict=True):
+            if info:
                 measured[segment["segment_id"]] = {"identity": identity, "media_info": info}
-        except OSError:
-            continue
     return measured
 
 
