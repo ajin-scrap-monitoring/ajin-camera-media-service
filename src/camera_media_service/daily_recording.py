@@ -438,7 +438,7 @@ class DailyRecordingService:
 
         result, segments = await storage_io(calculate)
         await storage_io(self.catalog.save_day, result, notify=False)
-        self._save_coverage_total(result, segments, until, prior)
+        await storage_io(self._save_coverage_total, result, segments, until, prior)
         return result
 
     def _refresh_append_values(self, day, until, segments, known, prior):
@@ -549,7 +549,9 @@ class DailyRecordingService:
                         cursor = now
                         window = DailyWindow.from_date(seoul_date(now))
                         async with self.recording.transaction():
-                            day = self._ensure_day(camera, window, policy["retention_days"])
+                            day = await storage_io(
+                                self._ensure_day, camera, window, policy["retention_days"]
+                            )
                             if now > window.start_at:
                                 self.db.execute(
                                     "INSERT INTO daily_gaps(camera,start,end,reason) "
@@ -594,10 +596,13 @@ class DailyRecordingService:
                         break
                     async with self.lock:
                         async with self.recording.transaction():
-                            day = self._ensure_day(camera, window, policy["retention_days"])
+                            with self.recording.diagnostics.measure("daily_day_snapshot"):
+                                day = await storage_io(
+                                    self._ensure_day, camera, window, policy["retention_days"]
+                                )
                             if now >= window.end_at and day["status"] == "recording":
                                 day["status"] = "finalizing"
-                                self.catalog.save_day(day)
+                                await storage_io(self.catalog.save_day, day, notify=False)
                     slot_end = min(
                         window.end_at,
                         (math.floor(cursor / day["segment_seconds"]) + 1) * day["segment_seconds"],
@@ -649,15 +654,19 @@ class DailyRecordingService:
                                         self.catalog.get_day, day["recording_id"]
                                     )
                                     pending_day["error"] = self.last_error
-                                    self.catalog.save_day(pending_day)
+                                    await storage_io(
+                                        self.catalog.save_day, pending_day, notify=False
+                                    )
                             break
                     cursor = slot_end
                     async with self.lock:
                         async with self.recording.transaction():
                             self._flush_losses(now)
-                            await self._refresh_async(
-                                self.catalog.get_day(day["recording_id"]), cursor
-                            )
+                            with self.recording.diagnostics.measure("daily_day_snapshot"):
+                                snapshot = await storage_io(
+                                    self.catalog.get_day, day["recording_id"]
+                                )
+                            await self._refresh_async(snapshot, cursor)
                             self.db.execute(
                                 "UPDATE daily_cursors SET cursor=? WHERE camera=?", (cursor, camera)
                             )
@@ -670,7 +679,8 @@ class DailyRecordingService:
                 ):
                     async with self.lock:
                         async with self.recording.transaction():
-                            self._ensure_day(
+                            await storage_io(
+                                self._ensure_day,
                                 camera,
                                 DailyWindow.from_date(seoul_date(now)),
                                 policy["retention_days"],
