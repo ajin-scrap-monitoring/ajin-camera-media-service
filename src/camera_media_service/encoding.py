@@ -16,7 +16,7 @@ from camera_media_service.daily_models import StoredFrame
 from camera_media_service.daily_sampling import select_daily_frames
 from camera_media_service.frame_packs import input_name, validate_inputs
 from camera_media_service.media_files import storage_io
-from camera_media_service.media_info import MEDIA_INFO_FILTER, parse_media_info
+from camera_media_service.media_info import MEDIA_INFO_FILTER, completed_probe, parse_media_info
 from camera_media_service.persisted_media_info import file_identity, publish_generated_info
 
 
@@ -181,7 +181,7 @@ async def probe_media(ffmpeg: str, path: Path, *, full_decode: bool = True) -> d
     return {
         "duration": duration,
         "size_bytes": size_bytes,
-        "media_info": parse_media_info(text, size_bytes),
+        "media_info": completed_probe(parse_media_info(text, size_bytes)),
         "_file_identity": final,
     }
 
@@ -466,6 +466,6 @@ async def verify_archive(ffmpeg: str, path: Path, segments: list[dict]) -> dict:
         "duration": duration,
         "size_bytes": size_bytes,
         "packet_count": packet_count,
-        "media_info": parse_media_info(text, size_bytes),
+        "media_info": completed_probe(parse_media_info(text, size_bytes)),
         "_file_identity": final,
     }

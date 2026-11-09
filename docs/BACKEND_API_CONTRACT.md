@@ -458,3 +458,41 @@ DELETE /api/v1/clips/550e8400-e29b-41d4-a716-446655440000
 - MJPEG multipart 형식: <https://ffmpeg.org/ffmpeg-formats.html#mpjpeg>
 
 API 경로, 필드, 기본값, 시간·삭제 정책은 이 프로젝트의 계약이다. MJPEG와 저장 영상 파일 외의 일반 응답은 위 JSON 규격을 따른다.
+
+## 파일 검사 시각과 취득 경로 (Q7, 선택 필드)
+
+클립 `media-info`의 `media_info`와 날짜 `media-info`의 개별 `file` 객체에
+`measured_at`, `metadata_origin`을 추가한다. 기존 형식 필드와 `source=file_probe`는 유지한다.
+
+- `measured_at`: 실제 성공한 파일 검사 완료 시각, UTC ISO8601 `Z` 문자열 또는 `null`.
+  저장값·메모리 캐시 재사용과 재시작으로 변경되지 않는다. 과거 값에 시각이 없으면 `null`이다.
+  GET 시각·mtime·DB 저장 시각·촬영 시각으로 대체하지 않는다.
+- `metadata_origin`: 이번 응답의 취득 경로. `request_probe`는 해당 요청 또는 합쳐진 동시 요청에서
+  검사한 값, `memory_cache`는 메모리 재사용, `persisted_probe`는 현재 파일 identity와 일치한
+  저장값 재사용, `unknown`은 경로를 구분할 수 없는 값이다. 새 검사와 재사용을 구분한다.
+- 파일 변경·파일 부재·검사 실패는 기존 `status=unknown`, `reason_code` 규칙을 유지하고
+  `measured_at=null`, `metadata_origin=unknown`으로 응답한다.
+- 생성·검증 과정의 내부 측정값에도 실제 검사 시각을 저장한다. 응답 취득 경로를 별도로 검증하지
+  않는 생성 메타데이터의 `metadata_origin`은 `unknown`일 수 있다.
+- 날짜 `segments`는 여러 파일의 집계이므로 위 단일 파일 시각을 집계 전체에 복사하지 않는다.
+  기존 `total/measured/formats/mixed`로 검사 범위를 표현한다.
+
+합성 응답 예:
+
+```json
+{
+  "status": "ready",
+  "source": "file_probe",
+  "codec": "h264",
+  "width": 1920,
+  "height": 1080,
+  "fps": 15.0,
+  "fps_num": 15,
+  "fps_den": 1,
+  "size_bytes": 1234567,
+  "measured_at": "2026-11-09T00:00:01.234Z",
+  "metadata_origin": "persisted_probe"
+}
+```
+
+두 필드는 선택적인 확장이므로 기존 응답·과거 데이터는 계속 수용한다.

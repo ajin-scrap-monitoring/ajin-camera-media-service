@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import UTC, datetime
 from fractions import Fraction
 from pathlib import Path
 
@@ -27,6 +28,8 @@ def unknown_media_info(reason_code: str, size_bytes: int | None = None) -> dict:
         "fps_den": None,
         "size_bytes": size_bytes,
         "reason_code": reason_code,
+        "measured_at": None,
+        "metadata_origin": "unknown",
     }
 
 
@@ -60,7 +63,27 @@ def parse_media_info(text: str, size_bytes: int) -> dict:
         "fps_num": fps.numerator,
         "fps_den": fps.denominator,
         "size_bytes": size_bytes,
+        "measured_at": None,
+        "metadata_origin": "unknown",
     }
+
+
+def completed_probe(info):
+    if info["status"] != "ready":
+        return info
+    return dict(
+        info,
+        measured_at=datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+    )
+
+
+def response_info(info, origin):
+    result = dict(info)
+    result.setdefault("measured_at", None)
+    result["metadata_origin"] = origin if result["status"] == "ready" else "unknown"
+    if result["status"] != "ready":
+        result["measured_at"] = None
+    return result
 
 
 async def inspect_media_info(ffmpeg: str, path: Path) -> dict:
@@ -123,7 +146,7 @@ async def inspect_media_info(ffmpeg: str, path: Path) -> dict:
             final.st_mtime_ns,
         ):
             return unknown_media_info("file_changed")
-        return parse_media_info(error.decode(errors="replace"), final.st_size)
+        return completed_probe(parse_media_info(error.decode(errors="replace"), final.st_size))
 
     try:
         return await asyncio.wait_for(inspect(), PROBE_TIMEOUT_SECONDS)
