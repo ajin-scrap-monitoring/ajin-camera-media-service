@@ -14,6 +14,157 @@ from camera_media_service.recording import ApiError
 
 
 @pytest.mark.asyncio
+async def test_archive_publication_cancel_keeps_committed_compaction_owner(tmp_path, monkeypatch):
+    from test_range_commit_responsiveness import CommitBarrier
+
+    service, daily, clock, old = await recorded_day(tmp_path, monkeypatch)
+    exports = make_exports(daily)
+    key = old["recording_id"]
+    real = service.db
+    barrier = CommitBarrier(real, 1)
+    original = exports._stage_archive_mappings
+
+    async def stage(*args):
+        await original(*args)
+        await daily.metadata_writer.join()
+        service.db = daily.db = daily.catalog.db = exports.db = barrier
+
+    monkeypatch.setattr(exports, "_stage_archive_mappings", stage)
+    try:
+        await exports.maintenance(clock[0])
+        assert await asyncio.to_thread(barrier.entered.wait, 3)
+        task = exports.jobs[key]
+        task.cancel()
+        await asyncio.sleep(0.02)
+        barrier.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert real.execute("SELECT 1 FROM daily_compactions WHERE day_id=?", (key,)).fetchone()
+        assert key in exports.compaction_owners, "Published archive lost its duplicate workspace"
+        assert key in daily.storage_reservation_outputs
+    finally:
+        barrier.release.set()
+        service.db = daily.db = daily.catalog.db = exports.db = real
+        await exports.close()
+        await daily.close()
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_inflight_archive_finishes_when_capacity_wait_freezes_cursor(tmp_path, monkeypatch):
+    import camera_media_service.daily_export as module
+    from camera_media_service.background_media import checkpoint
+
+    service, daily, clock, old = await recorded_day(tmp_path, monkeypatch)
+    exports = make_exports(daily)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = module.verify_archive
+
+    async def verify(*args):
+        entered.set()
+        await release.wait()
+        await checkpoint()
+        return await original(*args)
+
+    monkeypatch.setattr(module, "verify_archive", verify)
+    try:
+        await exports.maintenance(clock[0])
+        await asyncio.wait_for(entered.wait(), 2)
+        service.queue = RecordingQueue(1200)
+        service.daily_frame_watermarks["camera-main"] = clock[0] - 100
+        daily.capacity_pending["camera-main"] = {"start": clock[0] - 100}
+        release.set()
+        await asyncio.wait_for(asyncio.shield(exports.jobs[old["recording_id"]]), 3)
+        await exports._compact(old["recording_id"])
+        assert old["recording_id"] not in exports.compaction_owners
+        assert not (service.root / "daily" / old["recording_id"]).exists()
+    finally:
+        release.set()
+        service.queue = None
+        daily.capacity_pending.clear()
+        await exports.close()
+        await daily.close()
+        await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["deleted", "expired"])
+async def test_restart_keeps_workspace_for_inaccessible_day_pending_cleanup(
+    tmp_path, monkeypatch, status
+):
+    service, daily, clock, old = await recorded_day(tmp_path, monkeypatch)
+    exports = make_exports(daily)
+    key = old["recording_id"]
+    await exports.maintenance(clock[0])
+    await archive_ready(exports, daily, key)
+    while exports.jobs:
+        await asyncio.sleep(0)
+    with service.db:
+        day = daily.catalog.get_day(key)
+        day.update(status=status, cleanup_state="failed")
+        daily.catalog.save_day(day)
+    await exports.close()
+    await daily.close()
+    await service.close()
+    service, daily = make_daily(tmp_path, clock, monkeypatch)
+    exports = make_exports(daily)
+    try:
+        assert key in exports.compaction_owners, "Unremoved duplicate files still own workspace"
+        assert key in daily.storage_reservation_outputs
+        assert await exports._cleanup(key)
+        assert key not in exports.compaction_owners
+    finally:
+        await exports.close()
+        await daily.close()
+        await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["delete", "compact"])
+async def test_final_cleanup_commit_cancellation_releases_workspace(
+    tmp_path, monkeypatch, operation
+):
+    from test_range_commit_responsiveness import CommitBarrier
+
+    service, daily, clock, old = await recorded_day(tmp_path, monkeypatch)
+    exports = make_exports(daily)
+    key = old["recording_id"]
+    await exports.maintenance(clock[0])
+    await archive_ready(exports, daily, key)
+    while exports.jobs:
+        await asyncio.sleep(0)
+    if operation == "delete":
+        with service.db:
+            day = daily.catalog.get_day(key)
+            day.update(status="deleted", cleanup_state="pending")
+            daily.catalog.save_day(day)
+    await daily.metadata_writer.join()
+    real = service.db
+    barrier = CommitBarrier(real, 2 if operation == "delete" else 1)
+    service.db = daily.db = daily.catalog.db = exports.db = barrier
+    task = asyncio.create_task(
+        exports._cleanup(key) if operation == "delete" else exports._compact(key)
+    )
+    try:
+        assert await asyncio.to_thread(barrier.entered.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0.02)
+        barrier.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not real.execute("SELECT 1 FROM daily_compactions WHERE day_id=?", (key,)).fetchone()
+        assert key not in exports.compaction_owners, "Committed cleanup stranded workspace owner"
+        assert key not in daily.storage_reservation_outputs
+    finally:
+        barrier.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        service.db = daily.db = daily.catalog.db = exports.db = real
+        await exports.close()
+        await daily.close()
+        await service.close()
+
+
+@pytest.mark.asyncio
 async def test_capacity_scan_rechecks_reservations_changed_during_worker(tmp_path, monkeypatch):
     import camera_media_service.daily_recording as module
 
