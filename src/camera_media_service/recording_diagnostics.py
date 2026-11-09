@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from contextlib import contextmanager
+from datetime import UTC, datetime
 
 LOG = logging.getLogger(__name__)
 
@@ -40,10 +41,34 @@ class RecordingDiagnostics:
     @contextmanager
     def measure(self, stage):
         start = time.monotonic()
+        fields = None
+        failed = True
+        if stage in ("archive_merge", "archive_verify", "archive_mapping"):
+            fields = {
+                "phase": stage,
+                "phase_event": "started",
+                "phase_started_at": datetime.now(UTC)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
+            }
+            LOG.info("Archive phase %s", json.dumps(fields, sort_keys=True), extra=fields)
         try:
             yield
+            failed = False
         finally:
-            self.observe(stage, time.monotonic() - start)
+            elapsed = time.monotonic() - start
+            self.observe(stage, elapsed)
+            if fields:
+                fields = dict(
+                    fields,
+                    phase_event="completed",
+                    phase_ended_at=datetime.now(UTC)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z"),
+                    elapsed_seconds=elapsed,
+                    outcome="failed" if failed else "succeeded",
+                )
+                LOG.info("Archive phase %s", json.dumps(fields, sort_keys=True), extra=fields)
 
     def snapshot(self):
         return {

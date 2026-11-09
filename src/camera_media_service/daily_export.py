@@ -39,6 +39,7 @@ class DailyExportService:
         self.file_locks = {}
         self.task = None
         self.closed = False
+        self.compaction_owners = set()
         self.background = BackgroundMedia(daily.recording, clock=daily.clock)
         self.reservations = daily.storage_reservations
         self.reservation_outputs = daily.storage_reservation_outputs
@@ -78,6 +79,18 @@ class DailyExportService:
                 daily.catalog.save_day(day)
                 (self.output / (row["day_id"] + ".tmp.mp4")).unlink(missing_ok=True)
                 (self.output / (row["day_id"] + ".ffconcat")).unlink(missing_ok=True)
+
+        for row in self.db.execute("SELECT day_id FROM daily_compactions"):
+            day = self.daily.catalog.get_state(row[0])
+            if day.get("archive_state") == "mp4" and day["status"] not in ("deleted", "expired"):
+                self.compaction_owners.add(row[0])
+                self.reservations[row[0]] = 0
+                self.reservation_outputs[row[0]] = (self._path(row[0]),)
+
+    def _release_workspace(self, key):
+        self.compaction_owners.discard(key)
+        self.reservations.pop(key, None)
+        self.reservation_outputs.pop(key, None)
 
     def _accessible(self, day: dict) -> None:
         expired = day["expires_at"] and epoch(day["expires_at"]) <= self.daily.clock()
@@ -121,7 +134,7 @@ class DailyExportService:
             if day.get("archive_state") == "mp4" or self._has_job(recording_id):
                 return
             # One archive at a time also bounds temporary duplicate disk reservations.
-            if self.jobs:
+            if self.jobs or self.compaction_owners:
                 return
             segments = self.daily.catalog.segments(recording_id, ready_only=True)
             reuse = self._path(recording_id).is_file()
@@ -131,7 +144,12 @@ class DailyExportService:
         async with self.lock:
             day = self.daily.catalog.get_day(recording_id)
             self._exportable(day)
-            if self.closed or self.jobs or day.get("archive_state") == "mp4":
+            if (
+                self.closed
+                or self.jobs
+                or self.compaction_owners
+                or day.get("archive_state") == "mp4"
+            ):
                 return
             job = {
                 "job_id": str(uuid.uuid4()),
@@ -166,8 +184,8 @@ class DailyExportService:
     def _done(self, key, task):
         if self.jobs.get(key) is task:
             self.jobs.pop(key, None)
-            self.reservations.pop(key, None)
-            self.reservation_outputs.pop(key, None)
+            if key not in self.compaction_owners:
+                self._release_workspace(key)
         if not task.cancelled() and task.exception():
             LOG.error("Daily archive failed", exc_info=task.exception())
 
@@ -257,6 +275,7 @@ class DailyExportService:
         if error:
             await storage_io(final.unlink, missing_ok=True)
         else:
+            self.compaction_owners.add(recording_id)
             self.daily.recording.notify_thumbnail_ready("day", recording_id, metadata)
 
     def _publish_archive(self, job, segments, final, metadata, error):
@@ -348,8 +367,17 @@ class DailyExportService:
             if exc.filename is None or Path(exc.filename) != folder:
                 raise
 
+    def _compaction_pressured(self):
+        queue = self.daily.recording.queue
+        if queue is not None and (queue.qsize() > 60 or queue.queued_bytes > 8 * 1024**2):
+            return True
+        return (
+            self.background.pressured(ignore_backlog=bool(self.daily.capacity_pending))
+            and not self.daily.recording.storage_error
+        )
+
     async def _compact(self, recording_id: str) -> None:
-        if self.background.pressured() and not self.daily.recording.storage_error:
+        if self._compaction_pressured():
             self.daily.recording.diagnostics.count("compaction_deferred")
             return
         async with self._file_lock(recording_id):
@@ -369,7 +397,7 @@ class DailyExportService:
 
         files = await asyncio.to_thread(enumerate_files)
         for start in range(0, len(files), 64):
-            if self.background.pressured() and not self.daily.recording.storage_error:
+            if self._compaction_pressured():
                 self.daily.recording.diagnostics.count("compaction_deferred")
                 return False
             batch = files[start : start + 64]
@@ -381,7 +409,7 @@ class DailyExportService:
 
             await self._file_work(remove)
             await asyncio.sleep(0.01)
-            if self.background.pressured():
+            if self._compaction_pressured():
                 return False
         await self._file_work(lambda: self._remove_folder(folder))
         return True
@@ -408,6 +436,7 @@ class DailyExportService:
                     for part in segments
                 )
                 if intact:
+                    await storage_io(master.unlink, missing_ok=True)
                     day.update(
                         archive_state="segments",
                         export_state="failed",
@@ -425,7 +454,7 @@ class DailyExportService:
                         self.db.execute(
                             "DELETE FROM daily_compactions WHERE day_id=?", (recording_id,)
                         )
-                    master.unlink(missing_ok=True)
+                    self._release_workspace(recording_id)
                 return
             # New admissions now use MP4. Old snapshot leases prevented reaching this point.
             uuid.UUID(recording_id)
@@ -437,6 +466,7 @@ class DailyExportService:
         async with self.lock:
             async with self.daily.recording.transaction():
                 self.db.execute("DELETE FROM daily_compactions WHERE day_id=?", (recording_id,))
+            self._release_workspace(recording_id)
 
     async def delete_day(self, recording_id: str) -> None:
         async with self.daily.recording.thumbnail_deletion("day", recording_id):
@@ -493,6 +523,7 @@ class DailyExportService:
                 return False
             day = self.daily.catalog.get_day(recording_id)
             if day.get("cleanup_state") == "complete":
+                self._release_workspace(recording_id)
                 return True
             day.update(
                 cleanup_state="pending",
@@ -549,6 +580,7 @@ class DailyExportService:
                 self.daily.catalog.save_day(day)
                 self.db.execute("DELETE FROM daily_cleanup WHERE day_id=?", (recording_id,))
                 self.db.execute("DELETE FROM daily_compactions WHERE day_id=?", (recording_id,))
+            self._release_workspace(recording_id)
         return True
 
     async def refresh_retention(self, now: float) -> None:

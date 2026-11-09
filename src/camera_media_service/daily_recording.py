@@ -67,6 +67,22 @@ class DailyRecordingService:
         self.losses = []
         self.offline = {}
         self.last_error = None
+        self.capacity_pending = {}
+        self._capacity_retry_at = {}
+        for row in self.db.execute(
+            "SELECT d.camera,min(s.start),max(s.end) FROM daily_segments s "
+            "JOIN daily_recordings d ON d.id=s.day_id "
+            "WHERE s.status='deferred' GROUP BY d.camera"
+        ):
+            if row[0] in recording.cameras:
+                self.capacity_pending[row[0]] = {
+                    "start": row[1],
+                    "end": row[2],
+                    "condition": "unknown",
+                }
+                recording.daily_frame_watermarks[row[0]] = min(
+                    recording.daily_frame_watermarks.get(row[0], row[1]), row[1] - 1
+                )
         self.metadata_writer = DailyMetadataWriter(recording, clock=self.clock)
         self._closed = False
         self.storage_reservations = recording.capacity_reservations
@@ -543,7 +559,9 @@ class DailyRecordingService:
                             self.db.execute("INSERT INTO daily_cursors VALUES(?,?)", (camera, now))
                     else:
                         cursor = row[0]
-                self.recording.daily_frame_watermarks[camera] = cursor
+                self.recording.daily_frame_watermarks[camera] = cursor - (
+                    1 if camera in self.capacity_pending else 0
+                )
                 self.recording.diagnostics.gauge("backlog_seconds", max(0, now - cursor))
                 if now < cursor:
                     self.last_error = {
@@ -563,6 +581,8 @@ class DailyRecordingService:
                     continue
                 completed_slots = 0
                 while cursor < now and completed_slots < 3:
+                    if time.monotonic() < self._capacity_retry_at.get(camera, 0):
+                        break
                     window = DailyWindow.from_date(seoul_date(cursor))
                     cached_slot = self._slot_sizes.get((camera, window.recording_date.isoformat()))
                     if (
@@ -621,7 +641,15 @@ class DailyRecordingService:
                     else:
                         if now - cursor > self.settings.max_daily_pending_seconds:
                             self.recording.diagnostics.count("backlog_frames_preserved")
-                        await self._record_slot(day, cursor, slot_end)
+                        if await self._record_slot(day, cursor, slot_end) is False:
+                            async with self.lock:
+                                async with self.recording.transaction():
+                                    pending_day = await storage_io(
+                                        self.catalog.get_day, day["recording_id"]
+                                    )
+                                    pending_day["error"] = self.last_error
+                                    self.catalog.save_day(pending_day)
+                            break
                     cursor = slot_end
                     async with self.lock:
                         async with self.recording.transaction():
@@ -647,7 +675,7 @@ class DailyRecordingService:
                                 policy["retention_days"],
                             )
 
-    async def _record_slot(self, day: dict, start: float, end: float) -> None:
+    async def _record_slot(self, day: dict, start: float, end: float) -> bool:
         lease_id = str(uuid.uuid4())
         async with self.lock:
             async with self.recording.transaction():
@@ -724,9 +752,13 @@ class DailyRecordingService:
                             ((segment["segment_id"], f.path) for f in group),
                         )
                 path = self.segment_path(segment)
+                metadata = None
+                admission_stage = "before_encode"
                 try:
                     owner = segment["segment_id"]
-                    self.storage_reservations[owner] = sum(f.size_bytes for f in group)
+                    self.storage_reservations[owner] = max(
+                        sum(f.size_bytes for f in group), segment.get("capacity_reserve_bytes", 0)
+                    )
                     self.storage_reservation_outputs[owner] = (path, path.with_suffix(".tmp.ts"))
                     await self.check_space(recording=True)
                     group_end = min([end, *[a for a, b in loss if a > group[-1].received_at]])
@@ -751,6 +783,7 @@ class DailyRecordingService:
                     # JPEG input size does not bound scaled H264/mux output.
                     # Count the finished file before making it available/recoverable.
                     self.storage_reservations[owner] = 0
+                    admission_stage = "before_publication"
                     await self.check_space()
                     metadata["path"] = str(path.relative_to(self.recording.root))
                     async with self.lock:
@@ -762,7 +795,12 @@ class DailyRecordingService:
                     self.metadata_writer.offer(path, metadata)
                     self.last_error = None
                 except (OSError, RuntimeError, TimeoutError, ApiError) as exc:
-                    LOG.exception("Daily segment failed: %s", segment["segment_id"])
+                    capacity = isinstance(exc, ApiError) and exc.code in (
+                        "INSUFFICIENT_STORAGE",
+                        "CAPACITY_SNAPSHOT_BUSY",
+                    )
+                    if not capacity:
+                        LOG.exception("Daily segment failed: %s", segment["segment_id"])
 
                     def discard_new_output(path=path):
                         self.recording.storage_guard()
@@ -773,6 +811,43 @@ class DailyRecordingService:
                         await storage_io(discard_new_output)
                     except OSError:
                         LOG.exception("Rejected segment cleanup deferred")
+                    if capacity:
+                        segment.update(
+                            status="deferred",
+                            capacity_reserve_bytes=max(
+                                sum(f.size_bytes for f in group),
+                                (metadata or {}).get("size_bytes", 0),
+                                segment.get("capacity_reserve_bytes", 0),
+                            ),
+                        )
+                        async with self.lock:
+                            async with self.recording.transaction():
+                                self.db.execute(
+                                    "UPDATE daily_segments SET status='deferred',body=? WHERE id=?",
+                                    (json.dumps(segment), segment["segment_id"]),
+                                )
+                        self.capacity_pending[day["camera_id"]] = {
+                            "start": start,
+                            "end": end,
+                            "condition": getattr(exc, "condition", "unknown"),
+                        }
+                        self._capacity_retry_at[day["camera_id"]] = time.monotonic() + 2
+                        self.recording.daily_frame_watermarks[day["camera_id"]] = start - 1
+                        self.last_error = {
+                            "code": exc.code,
+                            "message": "Recording awaits capacity; source frames remain pending.",
+                        }
+                        self.recording.diagnostics.count("daily_capacity_deferred")
+                        LOG.warning(
+                            "Daily segment capacity deferred: camera=%s start=%s "
+                            "end=%s stage=%s budget=%s",
+                            day["camera_id"],
+                            iso(start),
+                            iso(end),
+                            admission_stage,
+                            json.dumps(getattr(exc, "budget", {}), sort_keys=True),
+                        )
+                        return False
                     code = (
                         exc.code
                         if isinstance(exc, ApiError)
@@ -806,13 +881,31 @@ class DailyRecordingService:
             async with self.lock:
                 async with self.recording.transaction():
                     self.recording.release_frames(lease_id)
+        if day["camera_id"] in self.capacity_pending:
+            async with self.lock:
+                async with self.recording.transaction():
+                    self.db.execute(
+                        "UPDATE daily_segments SET status='failed', "
+                        "body=json_set(body,'$.status','failed') "
+                        "WHERE day_id=? AND status='deferred' AND start<? AND end>?",
+                        (day["recording_id"], end, start),
+                    )
+            if self.last_error and self.last_error["code"] in (
+                "INSUFFICIENT_STORAGE",
+                "CAPACITY_SNAPSHOT_BUSY",
+            ):
+                self.last_error = None
+        self.capacity_pending.pop(day["camera_id"], None)
+        self._capacity_retry_at.pop(day["camera_id"], None)
+        return True
 
     async def check_space(self, reserve: int = 0, *, recording: bool = False) -> None:
         with self.recording.diagnostics.measure("space_check"):
             await self._check_space(reserve, recording=recording)
 
-    async def _check_space(self, reserve: int = 0, *, recording: bool = False) -> None:
+    async def _check_space(self, reserve: int = 0, *, recording: bool = False, _attempt=0) -> None:
         # Snapshot on the event loop; file workers must not read mutable job maps.
+        generation = self.recording._budget_generation
         reservations = dict(self.storage_reservations)
         output_owners = {
             str(path): owner
@@ -889,7 +982,16 @@ class DailyRecordingService:
                 buffer_headroom,
             )
 
-        used, media_used, free, remaining, buffer_headroom = await asyncio.to_thread(usage)
+        used, media_used, free, remaining, buffer_headroom = await storage_io(usage)
+        if generation != self.recording._budget_generation:
+            if _attempt >= 2:
+                error = ApiError(
+                    503, "CAPACITY_SNAPSHOT_BUSY", "Storage reservations changed during admission."
+                )
+                error.condition = "reservation_changed"
+                error.budget = {"condition": error.condition, "attempts": _attempt + 1}
+                raise error
+            return await self._check_space(reserve, recording=recording, _attempt=_attempt + 1)
         reserve += remaining
         conditions = (
             ("daily_budget", used + reserve + workspace > self.settings.max_daily_storage_bytes),
@@ -911,6 +1013,19 @@ class DailyRecordingService:
                     "Daily storage limit or free-space reserve reached.",
                 )
                 error.condition = condition
+                error.budget = {
+                    "condition": condition,
+                    "daily_used_bytes": used,
+                    "media_used_bytes": media_used,
+                    "filesystem_free_bytes": free,
+                    "unallocated_reserved_bytes": remaining,
+                    "additional_reserve_bytes": reserve - remaining,
+                    "workspace_bytes": workspace,
+                    "buffer_headroom_bytes": buffer_headroom,
+                    "daily_limit_bytes": self.settings.max_daily_storage_bytes,
+                    "media_limit_bytes": total_limit,
+                    "minimum_free_bytes": self.settings.min_free_storage_bytes,
+                }
                 raise error
 
     async def get_day(self, recording_id: str) -> dict:
@@ -1015,7 +1130,8 @@ class DailyRecordingService:
                         epoch(day["window_end_at"]),
                         (math.floor(cursor / day["segment_seconds"]) + 1) * day["segment_seconds"],
                     )
-                    await self._record_slot(day, cursor, end)
+                    if await self._record_slot(day, cursor, end) is False:
+                        break
                     async with self.lock:
                         async with self.recording.transaction():
                             self._flush_losses(now)

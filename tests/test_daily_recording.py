@@ -47,7 +47,7 @@ async def test_normal_shutdown_flushes_short_tail(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_storage_limit_keeps_live_data_but_reports_recording_loss(tmp_path, monkeypatch):
+async def test_storage_limit_keeps_live_data_and_recording_pending(tmp_path, monkeypatch):
     window = DailyWindow.from_date(date(2026, 10, 14))
     clock = [window.start_at]
     service, daily = make_daily(tmp_path, clock, monkeypatch)
@@ -61,7 +61,11 @@ async def test_storage_limit_keeps_live_data_but_reports_recording_loss(tmp_path
         await daily.tick(clock[0])
         day = (await daily.list_days("camera-main", {}, 20, None))[0]
         assert day["recorded_seconds"] == 0
-        assert any(g["reason_code"] == "STORAGE_FULL" for g in day["gaps"])
+        assert not any(g["reason_code"] == "STORAGE_FULL" for g in day["gaps"])
+        assert day["error"]["code"] == "INSUFFICIENT_STORAGE"
+        assert (
+            service.db.execute("SELECT cursor FROM daily_cursors").fetchone()[0] == window.start_at
+        )
         assert service.db.execute("SELECT count(*) FROM frame_pins").fetchone()[0] == 0
     finally:
         await daily.close()
