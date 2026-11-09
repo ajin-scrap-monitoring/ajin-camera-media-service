@@ -13,6 +13,7 @@ from pathlib import Path
 
 from camera_media_service.archive_playback import ArchivedPlaybackService
 from camera_media_service.background_media import BackgroundMedia
+from camera_media_service.catalog_pins import finish_cleanup
 from camera_media_service.daily_recording import DailyRecordingService
 from camera_media_service.encoding import merge_daily_mp4, verify_archive
 from camera_media_service.media_files import storage_io
@@ -40,7 +41,14 @@ class DailyExportService:
         self.task = None
         self.closed = False
         self.compaction_owners = set()
-        self.background = BackgroundMedia(daily.recording, clock=daily.clock)
+        self.background = BackgroundMedia(
+            daily.recording,
+            clock=daily.clock,
+            # A capacity-frozen cursor must not stop the existing archive that
+            # must finish before duplicate bytes can be reclaimed. Actual input
+            # queue/byte pressure and storage errors still pause its work.
+            backlog_exemption=lambda: bool(daily.capacity_pending and self.jobs),
+        )
         self.reservations = daily.storage_reservations
         self.reservation_outputs = daily.storage_reservation_outputs
         self.playback = ArchivedPlaybackService(daily)
@@ -82,7 +90,7 @@ class DailyExportService:
 
         for row in self.db.execute("SELECT day_id FROM daily_compactions"):
             day = self.daily.catalog.get_state(row[0])
-            if day.get("archive_state") == "mp4" and day["status"] not in ("deleted", "expired"):
+            if day.get("archive_state") == "mp4":
                 self.compaction_owners.add(row[0])
                 self.reservations[row[0]] = 0
                 self.reservation_outputs[row[0]] = (self._path(row[0]),)
@@ -91,6 +99,20 @@ class DailyExportService:
         self.compaction_owners.discard(key)
         self.reservations.pop(key, None)
         self.reservation_outputs.pop(key, None)
+
+    async def _commit_workspace_release(self, key, *, day=None, cleanup=False):
+        # The caller holds the catalogue lock until both the durable transition
+        # and its in-memory owner release finish, even after repeated cancellation.
+        async def commit():
+            async with self.daily.recording.transaction():
+                if day is not None:
+                    self.daily.catalog.save_day(day)
+                self.db.execute("DELETE FROM daily_compactions WHERE day_id=?", (key,))
+                if cleanup:
+                    self.db.execute("DELETE FROM daily_cleanup WHERE day_id=?", (key,))
+            self._release_workspace(key)
+
+        await finish_cleanup(commit())
 
     def _accessible(self, day: dict) -> None:
         expired = day["expires_at"] and epoch(day["expires_at"]) <= self.daily.clock()
@@ -267,16 +289,20 @@ class DailyExportService:
             except (sqlite3.Error, OSError, ApiError):
                 LOG.exception("Archive mapping preparation failed: %s", recording_id)
                 error = {"code": "STORAGE_ERROR", "message": "Archive mapping persistence failed."}
-        async with self.lock:
-            async with self.daily.recording.transaction():
-                error = await storage_io(
-                    self._publish_archive, job, segments, final, metadata, error
-                )
-        if error:
-            await storage_io(final.unlink, missing_ok=True)
-        else:
-            self.compaction_owners.add(recording_id)
-            self.daily.recording.notify_thumbnail_ready("day", recording_id, metadata)
+
+        async def publish():
+            async with self.lock:
+                async with self.daily.recording.transaction():
+                    failure = await storage_io(
+                        self._publish_archive, job, segments, final, metadata, error
+                    )
+                if not failure:
+                    self.compaction_owners.add(recording_id)
+                    self.daily.recording.notify_thumbnail_ready("day", recording_id, metadata)
+            if failure:
+                await storage_io(final.unlink, missing_ok=True)
+
+        await finish_cleanup(publish())
 
     def _publish_archive(self, job, segments, final, metadata, error):
         recording_id = job["recording_id"]
@@ -451,12 +477,7 @@ class DailyExportService:
                             "message": "Rebuilding damaged archive from retained sources.",
                         },
                     )
-                    async with self.daily.recording.transaction():
-                        self.daily.catalog.save_day(day)
-                        self.db.execute(
-                            "DELETE FROM daily_compactions WHERE day_id=?", (recording_id,)
-                        )
-                    self._release_workspace(recording_id)
+                    await self._commit_workspace_release(recording_id, day=day)
                 return
             # New admissions now use MP4. Old snapshot leases prevented reaching this point.
             uuid.UUID(recording_id)
@@ -466,9 +487,7 @@ class DailyExportService:
         if not await self._compact_files(folder):
             return
         async with self.lock:
-            async with self.daily.recording.transaction():
-                self.db.execute("DELETE FROM daily_compactions WHERE day_id=?", (recording_id,))
-            self._release_workspace(recording_id)
+            await self._commit_workspace_release(recording_id)
 
     async def delete_day(self, recording_id: str) -> None:
         async with self.daily.recording.thumbnail_deletion("day", recording_id):
@@ -570,19 +589,15 @@ class DailyExportService:
                     self.daily.catalog.save_day(day)
             raise
         async with self.lock:
-            async with self.daily.recording.transaction():
-                day = self.daily.catalog.get_day(recording_id)
-                day.update(
-                    cleanup_state="complete",
-                    cleanup_completed_at=iso(self.daily.clock()),
-                    cleanup_error=None,
-                    # Open handles can retain physical blocks after path removal.
-                    space_reclaimed=None,
-                )
-                self.daily.catalog.save_day(day)
-                self.db.execute("DELETE FROM daily_cleanup WHERE day_id=?", (recording_id,))
-                self.db.execute("DELETE FROM daily_compactions WHERE day_id=?", (recording_id,))
-            self._release_workspace(recording_id)
+            day = self.daily.catalog.get_day(recording_id)
+            day.update(
+                cleanup_state="complete",
+                cleanup_completed_at=iso(self.daily.clock()),
+                cleanup_error=None,
+                # Open handles can retain physical blocks after path removal.
+                space_reclaimed=None,
+            )
+            await self._commit_workspace_release(recording_id, day=day, cleanup=True)
         return True
 
     async def refresh_retention(self, now: float) -> None:

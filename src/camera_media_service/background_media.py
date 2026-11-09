@@ -13,11 +13,13 @@ CURRENT = contextvars.ContextVar("background_media", default=None)
 
 
 class BackgroundMedia:
-    def __init__(self, recording, *, clock=time.time, readrate=8):
+    def __init__(self, recording, *, clock=time.time, readrate=8, backlog_exemption=None):
         self.recording, self.clock, self.readrate = recording, clock, readrate
+        self.backlog_exemption = backlog_exemption
         self.watchers = set()
 
     def pressured(self, *, recovering=False, ignore_backlog=False):
+        ignore_backlog = ignore_backlog or bool(self.backlog_exemption and self.backlog_exemption())
         queue = self.recording.queue
         if queue is None:
             return False
