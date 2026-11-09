@@ -831,20 +831,33 @@ class RecordingService:
         ]
 
     async def _observe_loop(self):
+        from camera_media_service.loop_watchdog import LoopWatchdog
+
         loop = asyncio.get_running_loop()
-        while True:
-            expected = loop.time() + 0.25
-            wall_start = time.time() + 0.25
-            await asyncio.sleep(0.25)
-            delayed = max(0, loop.time() - expected)
-            self.diagnostics.observe("event_loop_lag", delayed)
-            if delayed > 1:
-                LOG.warning(
-                    "Recording event loop delayed: seconds=%.3f expected_at=%s observed_at=%s",
-                    delayed,
-                    iso(wall_start),
-                    iso(time.time()),
-                )
+        watchdog = LoopWatchdog()
+        watchdog.start()
+        last_stack_log = float("-inf")
+        try:
+            while True:
+                expected = loop.time() + 0.25
+                wall_start = time.time() + 0.25
+                await asyncio.sleep(0.25)
+                delayed = max(0, loop.time() - expected)
+                witness = watchdog.heartbeat()
+                self.diagnostics.observe("event_loop_lag", delayed)
+                if witness and loop.time() - last_stack_log >= 30:
+                    witness["loop_lag_seconds"] = delayed
+                    LOG.warning("Recording event loop stack: %s", json.dumps(witness))
+                    last_stack_log = loop.time()
+                if delayed > 1:
+                    LOG.warning(
+                        "Recording event loop delayed: seconds=%.3f expected_at=%s observed_at=%s",
+                        delayed,
+                        iso(wall_start),
+                        iso(time.time()),
+                    )
+        finally:
+            await watchdog.close()
 
     async def _writer(self) -> None:
         assert self.queue is not None
