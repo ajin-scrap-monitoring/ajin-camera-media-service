@@ -79,6 +79,9 @@ def create_http_app(
 
     tracker = status_tracker if status_tracker is not None else CameraStatusTracker(service.cameras)
     media_details = MediaDetails(service, daily, exports)
+    from camera_media_service.storage_status import StorageStatus
+
+    storage_status = StorageStatus(service, daily)
 
     @web.middleware
     async def boundary(request, handler):
@@ -116,6 +119,7 @@ def create_http_app(
                 await exports.start()
             yield
         finally:
+            await storage_status.close()
             await thumbnails.close()
             if recorded_clips is not None:
                 await recorded_clips.close()
@@ -146,6 +150,17 @@ def create_http_app(
         return web.json_response({"status": "ok"})
 
     app.router.add_get("/healthz", health)
+
+    async def storage_snapshot(request):
+        query_fields(request, ())
+        result = await storage_status.snapshot()
+        return web.json_response(
+            result,
+            status=200 if result["status"] == "ready" else 503,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    app.router.add_get("/api/v1/storage/status", storage_snapshot, allow_head=False)
 
     async def policy(request):
         query_fields(request, ())

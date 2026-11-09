@@ -496,3 +496,51 @@ API 경로, 필드, 기본값, 시간·삭제 정책은 이 프로젝트의 계�
 ```
 
 두 필드는 선택적인 확장이므로 기존 응답·과거 데이터는 계속 수용한다.
+
+## 저장 공간 상태 조회 (Q8)
+
+`GET /api/v1/storage/status`는 현재 관리 파일시스템과 날짜 영역의 읽기 전용 관측이다.
+기존 내부 게이트웨이 경계를 사용하며 별도 API 토큰을 추가하지 않는다. 쿼리 인수는 받지 않는다.
+응답은 `Cache-Control: no-store`이며, 같은 서비스 내 동시 요청은 하나의 측정으로 합친다.
+성공 관측은 최대 2초 재사용하고 예약 변경 시 무효화한다. 재사용 시 관측 시각을 바꾸지 않는다.
+
+| 필드 | 정의 |
+| --- | --- |
+| `status` | `ready` 또는 `unavailable`. ready는 관측 성공이며 새 녹화 작업의 용량 승인을 의미하지 않는다. |
+| `observation_started_at`, `observed_at` | 측정 시작·완료 UTC ISO8601 Z 시각. 파일시스템과 파일 열거는 이 구간의 관측이며 원자적 파일시스템 스냅샷은 아니다. 실패 시 null. |
+| `storage_type` | `filesystem`. 관리 파일시스템을 뜻하며 SD/SSD 등 물리 매체를 추정하지 않는다. |
+| `filesystem_total_bytes` | 관리 파일시스템의 전체 크기. 정책 한도와 별개. |
+| `filesystem_available_bytes` | 서비스 계정 기준 파일시스템 가용 바이트. Linux의 f_bavail 기준이며 새 작업 허용량을 뜻하지 않는다. |
+| `media_limit_bytes` | 전체 미디어의 설정된 한도. 설정을 확인할 수 없으면 null. |
+| `daily_limit_bytes` | 날짜 영역의 설정된 한도. 전체 미디어 한도와 겹치며 합산하지 않는다. |
+| `daily_usage_bytes` | daily·daily-exports·daily-playback·daily-thumbnails의 실제 파일 길이 합계. 보관 전 중복 TS/MP4·임시 출력도 정리 전까지 포함한다. DB/WAL·clips·원본 JPEG/묶음 버퍼는 제외한다. |
+| `daily_reserved_bytes` | 위 날짜 영역에 출력 경로가 등록된 작업의 미할당 예약 합계. 같은 관측에서 확인한 출력 바이트를 예약에서 차감해 중복 계산하지 않는다. clips 등 다른 영역의 예약은 제외한다. 예약의 영역을 확인할 수 없으면 null. |
+| `reason_code` | 정상 null. 마운트·파일시스템 관측 실패는 STORAGE_UNAVAILABLE, 예약 변경이 반복돼 일관된 관측을 얻지 못하면 STORAGE_SNAPSHOT_BUSY, 선택 예약 필드의 범위가 불명확하면 RESERVATION_SCOPE_UNKNOWN. |
+
+바이트는 음이 아닌 정수이며 실제 0과 확인 불가 null을 구분한다. JPEG 묶음 버퍼는 원본 영역이므로
+위 날짜 사용량에 중복 포함하지 않는다. 전체 미디어·날짜 한도·예약·보관 작업 공간·파일시스템 가용량은
+서로 범위가 다르며 합산하거나 위 필드만 빼서 작업 승인 가능량을 계산하면 안 된다.
+녹화 예산 판정은 다른 영역의 공유 예약과 보관 작업 공간도 고려한다.
+
+성공은 HTTP 200이다. 마운트 확인은 캐시 재사용 때도 수행한다. 관측 불가·반복 변경은 HTTP 503으로
+`status=unavailable`, 관측 시각·파일시스템 값·사용량·예약은 null을 반환한다.
+확인 가능한 설정 한도는 유지한다. 내부 경로·장치 ID·자격 증명은 반환하지 않는다.
+잘못된 쿼리는 기존 HTTP 400 오류 형식을 따른다. 조회는 파일 검사·인코딩·영상 생성·정리 작업을 시작하지 않는다.
+
+합성 정상 응답:
+
+```json
+{
+  "status": "ready",
+  "observation_started_at": "2026-11-09T00:00:00.000Z",
+  "observed_at": "2026-11-09T00:00:00.020Z",
+  "storage_type": "filesystem",
+  "filesystem_total_bytes": 128000000000,
+  "filesystem_available_bytes": 40000000000,
+  "media_limit_bytes": 51539607552,
+  "daily_limit_bytes": 45097156608,
+  "daily_usage_bytes": 20000000000,
+  "daily_reserved_bytes": 1048576,
+  "reason_code": null
+}
+```
