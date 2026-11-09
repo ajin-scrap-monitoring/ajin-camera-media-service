@@ -9,6 +9,8 @@ import re
 import sqlite3
 import uuid
 
+from camera_media_service.catalog_pins import finish_cleanup
+from camera_media_service.media_files import storage_io
 from camera_media_service.persisted_media_info import persist_generated_info
 from camera_media_service.recording import ACTIVE, ApiError, epoch, iso
 
@@ -50,7 +52,27 @@ class RecordedClipService:
                 "(SELECT id FROM jobs WHERE status IN ('collecting','processing'))"
             )
 
-    def _select(self, camera, at, now, start, end):
+    def _live_observation(self, camera):
+        times = (
+            self.recording.queue.pending_timestamps(camera)
+            if self.recording.queue is not None
+            else []
+        )
+        latest = self.recording.hub.latest.get(camera)
+        if latest is not None:
+            times.append(latest.received_at)
+        return {
+            "losses": list(self.daily.losses),
+            "offline": self.daily.offline.get(camera),
+            "times": times,
+        }
+
+    async def _select_async(self, camera, at, now, start, end):
+        observed = self._live_observation(camera)
+        return await storage_io(self._select, camera, at, now, start, end, observed)
+
+    def _select(self, camera, at, now, start, end, observed=None):
+        observed = self._live_observation(camera) if observed is None else observed
         left = min(start, at) if at is not None else start
         right = max(min(end, now), at + 0.001) if at is not None else min(end, now)
         rows = self.db.execute(
@@ -69,7 +91,7 @@ class RecordedClipService:
             if (
                 at is not None
                 and item["start_at"] <= at < item["end_at"]
-                and row["segment_status"] != "processing"
+                and row["segment_status"] not in ("processing", "deferred")
             ):
                 finalized_center = True
             if day["expires_at"] and epoch(day["expires_at"]) <= now:
@@ -86,7 +108,7 @@ class RecordedClipService:
                 owned = self.recording.root / ("daily-exports" if archive else "daily")
                 if path.is_relative_to(owned.resolve()) and path.is_file():
                     segments.append(item)
-            elif row["segment_status"] == "processing" and (
+            elif row["segment_status"] in ("processing", "deferred") and (
                 at is None or item["start_at"] <= at < item["end_at"]
             ):
                 pending = True
@@ -98,8 +120,8 @@ class RecordedClipService:
                 (camera, max(end, at + 0.001) if at is not None else end, left),
             )
         ]
-        losses.extend((a, b, reason) for cam, a, b, reason in self.daily.losses if cam == camera)
-        offline = self.daily.offline.get(camera)
+        losses.extend((a, b, reason) for cam, a, b, reason in observed["losses"] if cam == camera)
+        offline = observed["offline"]
         if offline is not None and offline < now:
             losses.append((offline, now, "CAMERA_DISCONNECTED"))
         center_lost = at is not None and any(a <= at < b for a, b, _ in losses)
@@ -107,7 +129,7 @@ class RecordedClipService:
             not any(s["start_at"] <= at < s["end_at"] for s in segments) or center_lost
         ):
             if not center_lost and (
-                pending or (not finalized_center and self._pending_input(camera, at))
+                pending or (not finalized_center and self._pending_input(camera, at, observed))
             ):
                 raise ApiError(409, "RECORDING_NOT_READY", "Recording is still being prepared.")
             raise ApiError(404, "RECORDING_NOT_FOUND_AT_TIME", "No recording at event_at.")
@@ -148,13 +170,9 @@ class RecordedClipService:
                         (camera, start, min(end, now)),
                     )
                 ]
-                if self.recording.queue is not None:
-                    candidates.extend(self.recording.queue.pending_timestamps(camera))
-                latest = self.recording.hub.latest.get(camera)
-                if latest is not None:
-                    candidates.append(latest.received_at)
+                candidates.extend(observed["times"])
                 if pending or any(
-                    start <= t < min(end, now) and self._pending_input(camera, t)
+                    start <= t < min(end, now) and self._pending_input(camera, t, observed)
                     for t in candidates
                 ):
                     raise ApiError(409, "RECORDING_NOT_READY", "Recording is still being prepared.")
@@ -197,7 +215,7 @@ class RecordedClipService:
         finally:
             self.range_tasks.discard(task)
 
-    def _pending_input(self, camera, at):
+    def _pending_input(self, camera, at, observed=None):
         cursor = self.db.execute(
             "SELECT cursor FROM daily_cursors WHERE camera=?", (camera,)
         ).fetchone()
@@ -214,12 +232,8 @@ class RecordedClipService:
                 (camera, at - 1, at + 1),
             )
         ]
-        queue = self.recording.queue
-        if queue is not None:
-            times.extend(queue.pending_timestamps(camera))
-        latest = self.recording.hub.latest.get(camera)
-        if latest is not None:
-            times.append(latest.received_at)
+        observed = self._live_observation(camera) if observed is None else observed
+        times.extend(observed["times"])
         before = sorted({t for t in times if at - 1 <= t <= at})
         after = sorted(t for t in times if at <= t <= at + 1)
         if not before:
@@ -258,7 +272,7 @@ class RecordedClipService:
                 raise ApiError(503, "SERVICE_BUSY", "Too many active recordings.")
             policy = self.recording._policy(camera)
             start, end = at - policy["pre_roll_seconds"], at + policy["post_roll_seconds"]
-            slices, gaps = self._select(camera, at, now, start, end)
+            slices, gaps = await self._select_async(camera, at, now, start, end)
             reserve = int(sum(s["size_bytes"] for s in slices) * 1.2) + 1048576
             await self.daily.check_space(reserve)
             clip_id = str(uuid.uuid4())
@@ -286,27 +300,67 @@ class RecordedClipService:
                     {"start_at": iso(s["clip_start"]), "end_at": iso(s["clip_end"])} for s in slices
                 ],
             )
-            async with self.recording.transaction():
-                self.db.execute(
-                    "INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",
-                    (clip_id, camera, event, now, start, end, "processing", json.dumps(body)),
-                )
-                self.db.execute(
-                    "INSERT INTO clip_sources VALUES(?,?)", (clip_id, json.dumps(slices))
-                )
-                self.db.executemany(
-                    "INSERT OR IGNORE INTO clip_recording_pins VALUES(?,?)",
-                    ((clip_id, s["recording_id"]) for s in slices),
-                )
-            task = asyncio.create_task(self._process(clip_id, slices))
-            self.daily.storage_reservations[clip_id] = reserve
-            self.daily.storage_reservation_outputs[clip_id] = (
-                self.recording.clips / f"{clip_id}.tmp.mp4",
-                self.recording.clips / f"{clip_id}.mp4",
-            )
-            self.jobs[clip_id] = task
-            task.add_done_callback(lambda done, key=clip_id: self._done(key, done))
-            return body, True
+
+            async def publish():
+                try:
+                    async with self.recording.transaction():
+                        self.db.execute(
+                            "INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",
+                            (
+                                clip_id,
+                                camera,
+                                event,
+                                now,
+                                start,
+                                end,
+                                "processing",
+                                json.dumps(body),
+                            ),
+                        )
+                        self.db.execute(
+                            "INSERT INTO clip_sources VALUES(?,?)", (clip_id, json.dumps(slices))
+                        )
+                        self.db.executemany(
+                            "INSERT OR IGNORE INTO clip_recording_pins VALUES(?,?)",
+                            ((clip_id, s["recording_id"]) for s in slices),
+                        )
+                    task = asyncio.create_task(self._process(clip_id, slices))
+                    self.daily.storage_reservations[clip_id] = reserve
+                    self.daily.storage_reservation_outputs[clip_id] = (
+                        self.recording.clips / f"{clip_id}.tmp.mp4",
+                        self.recording.clips / f"{clip_id}.mp4",
+                    )
+                    self.jobs[clip_id] = task
+                    task.add_done_callback(lambda done, key=clip_id: self._done(key, done))
+                    return body, True
+                except BaseException:
+                    await finish_cleanup(self._discard_unadmitted_locked(clip_id))
+                    raise
+
+            return await finish_cleanup(publish())
+
+    async def _discard_unadmitted_locked(self, key):
+        async with self.recording.transaction():
+            row = self.db.execute("SELECT body FROM jobs WHERE id=?", (key,)).fetchone()
+            if row and key not in self.jobs:
+                body = json.loads(row[0])
+                if body["status"] == "processing":
+                    body.update(
+                        status="failed",
+                        error={
+                            "code": "JOB_INTERRUPTED",
+                            "message": "Extraction admission interrupted.",
+                        },
+                    )
+                    self.recording._save(body)
+            self.db.execute("DELETE FROM clip_recording_pins WHERE clip_id=?", (key,))
+            self.db.execute("DELETE FROM clip_sources WHERE clip_id=?", (key,))
+        self.daily.storage_reservations.pop(key, None)
+        self.daily.storage_reservation_outputs.pop(key, None)
+
+    async def _discard_unadmitted(self, key):
+        async with self.lock:
+            await self._discard_unadmitted_locked(key)
 
     def _done(self, key, task):
         if self.jobs.get(key) is task:

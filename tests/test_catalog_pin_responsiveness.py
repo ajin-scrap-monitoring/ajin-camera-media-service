@@ -45,6 +45,51 @@ async def test_workspace_history_read_uses_owned_worker_connection(tmp_path, mon
         await service.close()
 
 
+@pytest.mark.asyncio
+async def test_day_shutdown_drains_blocked_worker_and_releases_pin(tmp_path, monkeypatch):
+    import camera_media_service.media_details as module
+    from camera_media_service.recording import ApiError
+
+    service, daily, clock, old = await recorded_day(tmp_path, monkeypatch)
+    exports = make_exports(daily)
+    await daily.metadata_writer.join()
+    details = MediaDetails(service, daily, exports)
+    entered, release = threading.Event(), threading.Event()
+    original = module.read_segment_measurements
+
+    def blocked(*args):
+        entered.set()
+        assert release.wait(5)
+        return original(*args)
+
+    monkeypatch.setattr(module, "read_segment_measurements", blocked)
+    request = asyncio.create_task(details.day(old["recording_id"]))
+    closing = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        closing = asyncio.create_task(details.close())
+        await asyncio.sleep(0.03)
+        closing.cancel()
+        await asyncio.sleep(0.03)
+        assert not closing.done()
+        assert service.db.execute(
+            "SELECT 1 FROM clip_recording_pins WHERE clip_id LIKE 'info:%'"
+        ).fetchone()
+        with pytest.raises(ApiError, match="stopped"):
+            await details.day(old["recording_id"])
+        release.set()
+        await asyncio.gather(request, closing, return_exceptions=True)
+        assert not service.db.execute(
+            "SELECT 1 FROM clip_recording_pins WHERE clip_id LIKE 'info:%'"
+        ).fetchone()
+    finally:
+        release.set()
+        await asyncio.gather(request, *([closing] if closing else []), return_exceptions=True)
+        await exports.close()
+        await daily.close()
+        await service.close()
+
+
 class DelayedCommit:
     def __init__(self, db, entered, release):
         self.db, self.entered, self.release = db, entered, release
@@ -142,6 +187,51 @@ async def test_media_info_catalogue_snapshot_read_is_off_receiver_loop(tmp_path,
         assert body["segments"]["measured"] > 0
     finally:
         monkeypatch.setattr(daily.catalog, "get_day", original)
+        await exports.close()
+        await daily.close()
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_day_information_coalesces_and_preserves_one_waiter(
+    tmp_path, monkeypatch
+):
+    import camera_media_service.media_details as module
+
+    service, daily, clock, old = await recorded_day(tmp_path, monkeypatch)
+    exports = make_exports(daily)
+    await daily.metadata_writer.join()
+    details = MediaDetails(service, daily, exports)
+    entered, release = threading.Event(), threading.Event()
+    original = module.read_segment_measurements
+    calls = []
+
+    def blocked(*args):
+        calls.append(1)
+        entered.set()
+        assert release.wait(5)
+        return original(*args)
+
+    monkeypatch.setattr(module, "read_segment_measurements", blocked)
+    first = asyncio.create_task(details.day(old["recording_id"]))
+    second = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        second = asyncio.create_task(details.day(old["recording_id"]))
+        await asyncio.sleep(0.1)
+        assert len(calls) == 1, "The same date must not dispatch duplicate file scans"
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert not second.done()
+        release.set()
+        assert (await second)["segments"]["measured"] == 1
+        assert not service.db.execute(
+            "SELECT 1 FROM clip_recording_pins WHERE clip_id LIKE 'info:%'"
+        ).fetchone()
+    finally:
+        release.set()
+        await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
         await exports.close()
         await daily.close()
         await service.close()

@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 from collections import OrderedDict
 
-from camera_media_service.catalog_pins import pinned_snapshot
+from camera_media_service.catalog_pins import finish_cleanup, pinned_snapshot
 from camera_media_service.media_files import storage_io
 from camera_media_service.media_info import inspect_media_info, response_info, unknown_media_info
 from camera_media_service.metadata_reads import read_measurement, read_segment_measurements
@@ -39,7 +39,27 @@ class MediaDetails:
         self.active = 0
         self.cache = OrderedDict()
         self.flights = {}
+        self.day_flights = {}
+        self.day_slot = asyncio.Semaphore(2)
+        self.closed = False
         self.db = getattr(recording, "db", None)
+
+    def _available(self):
+        if self.closed:
+            raise ApiError(503, "METADATA_UNAVAILABLE", "Media inspection is stopped.")
+
+    async def close(self):
+        self.closed = True
+
+        async def drain():
+            tasks = [
+                flight["task"] for flight in (*self.day_flights.values(), *self.flights.values())
+            ]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        await finish_cleanup(drain())
 
     async def _identity(self, path):
         return file_identity(await asyncio.to_thread(path.stat))
@@ -51,6 +71,7 @@ class MediaDetails:
             self.cache.popitem(last=False)
 
     async def inspect(self, path):
+        self._available()
         try:
             identity = await self._identity(path)
         except OSError:
@@ -88,6 +109,7 @@ class MediaDetails:
             return response_info(result, origin)
         flight = self.flights.get(fingerprint)
         if flight is None:
+            self._available()
             if self.active >= 8:
                 raise ApiError(503, "METADATA_CAPACITY_EXCEEDED", "Media inspection queue is full.")
             self.active += 1
@@ -205,6 +227,38 @@ class MediaDetails:
         return None
 
     async def day(self, recording_id):
+        self._available()
+        flight = self.day_flights.get(recording_id)
+        if flight is None:
+            if len(self.day_flights) >= 8:
+                raise ApiError(503, "METADATA_CAPACITY_EXCEEDED", "Media inspection queue is full.")
+            flight = {"task": asyncio.create_task(self._bounded_day(recording_id)), "waiters": 0}
+            self.day_flights[recording_id] = flight
+        flight["waiters"] += 1
+        try:
+            result = await asyncio.shield(flight["task"])
+            async with self.recording.lock:
+                self.exports._accessible(await storage_io(self.daily.catalog.get_day, recording_id))
+            return result
+        finally:
+            flight["waiters"] -= 1
+            if not flight["waiters"]:
+
+                async def release():
+                    if not flight["task"].done():
+                        flight["task"].cancel()
+                    await asyncio.gather(flight["task"], return_exceptions=True)
+                    if self.day_flights.get(recording_id) is flight:
+                        self.day_flights.pop(recording_id, None)
+
+                await finish_cleanup(release())
+
+    async def _bounded_day(self, recording_id):
+        async with self.day_slot:
+            self._available()
+            return await self._day(recording_id)
+
+    async def _day(self, recording_id):
         owner = "info:" + str(uuid.uuid4())
 
         def snapshot():

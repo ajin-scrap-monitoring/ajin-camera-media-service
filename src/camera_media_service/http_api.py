@@ -120,6 +120,7 @@ def create_http_app(
             yield
         finally:
             await storage_status.close()
+            await media_details.close()
             await thumbnails.close()
             if recorded_clips is not None:
                 await recorded_clips.close()

@@ -153,16 +153,20 @@ async def test_growing_output_uses_one_stat_for_usage_and_reservation_credit(
 
 
 @pytest.mark.asyncio
-async def test_scan_uses_reservation_snapshot_when_live_job_maps_change(storage, monkeypatch):
+async def test_scan_reobserves_released_reservations_when_live_job_maps_change(
+    storage, monkeypatch
+):
     daily, source, temporary, final = storage
     reserve_archive(daily, temporary, final, monkeypatch)
     daily.settings.max_daily_storage_bytes = 999
     real_stat = Path.stat
     entered, release = asyncio.Event(), threading.Event()
     loop = asyncio.get_running_loop()
+    observations = []
 
     def blocked_stat(path, *args, **kwargs):
         if path == source:
+            observations.append(path)
             loop.call_soon_threadsafe(entered.set)
             if not release.wait(3):
                 raise RuntimeError("test did not release storage scan")
@@ -176,8 +180,13 @@ async def test_scan_uses_reservation_snapshot_when_live_job_maps_change(storage,
         daily.storage_reservation_outputs.clear()
     finally:
         release.set()
+    # A released promise no longer consumes quota, but its 300-byte file still
+    # does. Re-scan after generation change instead of using the stale snapshot.
+    await checking
+    assert len(observations) == 2
+    daily.settings.max_daily_storage_bytes = 899
     with pytest.raises(ApiError):
-        await checking
+        await daily.check_space()
 
 
 @pytest.mark.asyncio
@@ -294,6 +303,10 @@ async def test_verification_keeps_job_active_without_future_output_reservation(
         finish.set()
         await exports.jobs[key]
         await asyncio.sleep(0)
+        # Completed MP4 verification still owns the duplicate TS workspace.
+        assert daily.storage_reservations[key] == 0
+        assert key in daily.storage_reservation_outputs
+        await exports._compact(key)
         assert key not in daily.storage_reservations
         assert key not in daily.storage_reservation_outputs
     finally:

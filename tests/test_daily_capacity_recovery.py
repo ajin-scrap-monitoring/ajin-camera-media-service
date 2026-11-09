@@ -65,6 +65,17 @@ async def test_capacity_denial_keeps_cursor_and_boundary_frames_until_recovery(
         await daily.tick(clock[0])
         cursor = service.db.execute("SELECT cursor FROM daily_cursors").fetchone()[0]
         assert cursor == start, "Transient admission must not finalize a missing interval"
+        from camera_media_service.recorded_clips import RecordedClipService
+        from camera_media_service.recording import iso
+
+        clips = RecordedClipService(service, daily)
+        try:
+            with pytest.raises(ApiError) as pending:
+                await clips.create_clip("camera-main", "pending-event", iso(start + 5))
+            assert pending.value.status == 409
+            assert pending.value.code == "RECORDING_NOT_READY"
+        finally:
+            await clips.close()
         assert not service.db.execute(
             "SELECT 1 FROM daily_gaps WHERE reason='STORAGE_FULL'"
         ).fetchone()
