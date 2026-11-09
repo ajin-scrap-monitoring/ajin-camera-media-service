@@ -180,7 +180,9 @@ async def test_actual_encoded_output_cannot_become_ready_over_daily_budget(tmp_p
         await daily.tick(clock[0])
         day = (await daily.list_days("camera-main", {}, 20, None))[0]
         assert not daily.catalog.segments(day["recording_id"], ready_only=True)
-        assert any(g["reason_code"] == "STORAGE_FULL" for g in day["gaps"])
+        assert not any(g["reason_code"] == "STORAGE_FULL" for g in day["gaps"])
+        assert day["error"]["code"] == "INSUFFICIENT_STORAGE"
+        assert daily.capacity_pending
         assert not list((tmp_path / "daily").rglob("*.ts"))
         assert not list((tmp_path / "daily").rglob("*.prepared.json"))
         assert not daily.storage_reservations

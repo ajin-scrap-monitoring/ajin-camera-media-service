@@ -13,11 +13,13 @@ CURRENT = contextvars.ContextVar("background_media", default=None)
 
 
 class BackgroundMedia:
-    def __init__(self, recording, *, clock=time.time, readrate=8):
+    def __init__(self, recording, *, clock=time.time, readrate=8, backlog_exemption=None):
         self.recording, self.clock, self.readrate = recording, clock, readrate
+        self.backlog_exemption = backlog_exemption
         self.watchers = set()
 
-    def pressured(self, *, recovering=False):
+    def pressured(self, *, recovering=False, ignore_backlog=False):
+        ignore_backlog = ignore_backlog or bool(self.backlog_exemption and self.backlog_exemption())
         queue = self.recording.queue
         if queue is None:
             return False
@@ -28,9 +30,12 @@ class BackgroundMedia:
             queue.qsize() > frames
             or getattr(queue, "queued_bytes", 0) > size
             or self.recording.storage_error
-            or any(
-                self.clock() - cursor > lag
-                for cursor in self.recording.daily_frame_watermarks.values()
+            or (
+                not ignore_backlog
+                and any(
+                    self.clock() - cursor > lag
+                    for cursor in self.recording.daily_frame_watermarks.values()
+                )
             )
         )
 

@@ -365,7 +365,7 @@ async def test_persisted_read_checks_identity_after_lookup(tmp_path, monkeypatch
     assert (await first.inspect(path))["status"] == "ready"
     first.recording.db.close()
     details = details_for(tmp_path)
-    load = media_details.load_measured_info
+    load = media_details.read_measurement
 
     def changed(*args):
         info = load(*args)
@@ -375,7 +375,7 @@ async def test_persisted_read_checks_identity_after_lookup(tmp_path, monkeypatch
             os.replace(replacement, path)
         return info
 
-    monkeypatch.setattr(media_details, "load_measured_info", changed)
+    monkeypatch.setattr(media_details, "read_measurement", changed)
     try:
         info = await details.inspect(path)
         assert info["status"] == "unknown"
@@ -724,14 +724,16 @@ async def test_archived_aggregate_requires_verified_current_master_identity(
 
 
 @pytest.mark.asyncio
-async def test_owner_reuses_private_connection_and_closes_it_with_service(tmp_path, monkeypatch):
+async def test_bulk_reader_reuses_and_closes_its_worker_owned_connection(tmp_path, monkeypatch):
     from test_recording import make_service
 
     from camera_media_service import persisted_media_info
 
     recording = make_service(tmp_path)
     recording.ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    path = make_video(tmp_path)
+    directory = tmp_path / "daily"
+    directory.mkdir()
+    path = make_video(directory)
     connect = sqlite3.connect
     connections = []
 
@@ -754,11 +756,15 @@ async def test_owner_reuses_private_connection_and_closes_it_with_service(tmp_pa
     details = media_details.MediaDetails(recording)
     try:
         assert (await details.inspect(path))["width"] == 160
-        for _ in range(100):
-            assert (await details._stored_segment_info(path))["width"] == 160
-        # Writes use one separately owned worker connection, closed immediately;
-        # repeated reads continue to reuse the one owner-thread reader.
+        from camera_media_service.media_files import storage_io
+        from camera_media_service.metadata_reads import read_segment_measurements
+
+        parts = [{"path": path.relative_to(tmp_path).as_posix()} for _ in range(100)]
+        measured = await storage_io(read_segment_measurements, tmp_path, parts)
+        assert all(info["width"] == 160 for _, _, info in measured)
+        # One writer and one bulk reader, each created/closed in its own worker.
         assert len(connections) == 2
+        assert all(connection.closed for connection in connections)
     finally:
         await recording.close()
     assert all(connection.closed for connection in connections)

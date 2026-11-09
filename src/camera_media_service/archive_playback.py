@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from camera_media_service.catalog_pins import finish_cleanup, pin_day_locked, release_day_locked
 from camera_media_service.media_files import open_media_file, storage_io
 from camera_media_service.recording import ApiError, epoch
 
@@ -65,6 +66,9 @@ class ArchivedPlaybackService:
             return False
 
     async def _snapshot(self, recording_id, segment_id):
+        return await storage_io(self._read_snapshot, recording_id, segment_id)
+
+    def _read_snapshot(self, recording_id, segment_id):
         day = self.daily.catalog.get_day(recording_id)
         if day["status"] in ("deleted", "expired"):
             raise ApiError(
@@ -85,7 +89,7 @@ class ArchivedPlaybackService:
             or day["export_state"] != "ready"
         ):
             raise ApiError(409, "PLAYBACK_NOT_READY", "Archived media is not ready.")
-        return await storage_io(self._mapping, item)
+        return self._mapping(item)
 
     def _mapping(self, item):
         guard = getattr(self.daily.recording, "storage_guard", None)
@@ -184,10 +188,11 @@ class ArchivedPlaybackService:
                     raise self._storage_error()
                 cache = await storage_io(self._cache_path, key)
                 job = _Job("hls:" + str(uuid.uuid4()), reserve)
-                with self.daily.db:
-                    self.daily.db.execute(
-                        "INSERT INTO clip_recording_pins VALUES(?,?)", (job.owner, recording_id)
-                    )
+                try:
+                    await pin_day_locked(self.daily.recording, job.owner, recording_id)
+                except BaseException:
+                    await finish_cleanup(release_day_locked(self.daily.recording, job.owner))
+                    raise
                 self.daily.storage_reservations[job.owner] = reserve
                 self.daily.storage_reservation_outputs[job.owner] = (
                     cache,
@@ -207,17 +212,20 @@ class ArchivedPlaybackService:
                     raise self._storage_error()
                 return cached
         finally:
+            await finish_cleanup(self._finish_waiter(key, job))
+
+    async def _finish_waiter(self, key, job):
+        async with self.daily.lock:
+            job.waiters -= 1
+            last = job.waiters == 0
+            if last and not job.task.done():
+                job.task.cancel()
+        if last:
+            await asyncio.gather(job.task, return_exceptions=True)
             async with self.daily.lock:
-                job.waiters -= 1
-                last = job.waiters == 0
-                if last and not job.task.done():
-                    job.task.cancel()
-            if last:
-                await asyncio.gather(job.task, return_exceptions=True)
-                async with self.daily.lock:
-                    self._release(job)
-                    if self.jobs.get(key) is job:
-                        self.jobs.pop(key, None)
+                await self._release(job)
+                if self.jobs.get(key) is job:
+                    self.jobs.pop(key, None)
 
     async def _cached(self, key):
         if key not in self.entries:
@@ -234,12 +242,15 @@ class ArchivedPlaybackService:
         self.entries[key] = size, self.daily.clock()
         return file, size
 
-    def _release(self, job):
-        with self.daily.db:
-            self.daily.db.execute("DELETE FROM clip_recording_pins WHERE clip_id=?", (job.owner,))
+    async def _release(self, job):
+        await release_day_locked(self.daily.recording, job.owner)
         self.daily.storage_reservations.pop(job.owner, None)
         self.daily.storage_reservation_outputs.pop(job.owner, None)
         job.reserve = 0
+
+    async def _release_owned(self, job):
+        async with self.daily.lock:
+            await self._release(job)
 
     async def _prepare(self, key, job, source, offset, duration):
         temporary = self.root / key[0] / (key[1] + ".tmp")
@@ -332,8 +343,7 @@ class ArchivedPlaybackService:
                     pass
                 await process.wait()
             await storage_io(self._unlink, temporary)
-            async with self.daily.lock:
-                self._release(job)
+            await finish_cleanup(self._release_owned(job))
 
     async def maintenance(self, now: float):
         async with self.daily.lock:
@@ -348,6 +358,6 @@ class ArchivedPlaybackService:
         await asyncio.gather(*(job.task for job in jobs), return_exceptions=True)
         async with self.daily.lock:
             for job in jobs:
-                self._release(job)
+                await finish_cleanup(self._release(job))
             self.jobs.clear()
             await storage_io(self._evict, float("inf"))

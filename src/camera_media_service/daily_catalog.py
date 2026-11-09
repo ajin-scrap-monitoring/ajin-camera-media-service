@@ -250,6 +250,19 @@ class DailyCatalog:
             self.db.execute("DELETE FROM daily_snapshot_deltas WHERE day_id=?", (key,))
 
     def begin_segment(self, recording_id: str, start_at: float, end_at: float) -> dict:
+        pending = self.db.execute(
+            "SELECT body FROM daily_segments WHERE day_id=? AND start=? AND end=? "
+            "AND status='deferred' LIMIT 1",
+            (recording_id, start_at, end_at),
+        ).fetchone()
+        if pending:
+            body = json.loads(pending[0])
+            body["status"] = "processing"
+            self.db.execute(
+                "UPDATE daily_segments SET status='processing',body=? WHERE id=?",
+                (json.dumps(body), body["segment_id"]),
+            )
+            return body
         body = {
             "segment_id": str(uuid.uuid4()),
             "recording_id": recording_id,
@@ -274,6 +287,7 @@ class DailyCatalog:
             "SELECT body FROM daily_segments WHERE id=?", (segment_id,)
         ).fetchone()
         body = json.loads(row[0])
+        body.pop("capacity_reserve_bytes", None)
         if persist_measurement and self.root is not None and metadata.get("path"):
             record_generated_info(self.db, self.root, self.root / metadata["path"], metadata)
         if body["status"] != "ready":
