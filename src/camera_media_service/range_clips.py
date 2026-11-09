@@ -6,6 +6,7 @@ import asyncio
 import json
 import uuid
 
+from camera_media_service.catalog_pins import finish_cleanup
 from camera_media_service.recorded_clips import event_timestamp
 from camera_media_service.recording import ACTIVE, ApiError, iso
 
@@ -77,15 +78,15 @@ async def create_range(service, camera, event, start_at, end_at, *, retry_failed
                 >= recording.max_jobs
             ):
                 raise ApiError(503, "SERVICE_BUSY", "Too many active recordings.")
-            slices, gaps = service._select(camera, None, now, start, end)
+            slices, gaps = await service._select_async(camera, None, now, start, end)
             policy = old["recording_policy"] if old else recording._policy(camera)
             reserve = int(sum(s["size_bytes"] for s in slices) * 1.2) + 1048576
-            with service.db:
+            pinned = True
+            async with recording.transaction():
                 service.db.executemany(
                     "INSERT OR IGNORE INTO clip_recording_pins VALUES(?,?)",
                     ((key, s["recording_id"]) for s in slices),
                 )
-            pinned = True
             daily.storage_reservations[key] = reserve
             daily.storage_reservation_outputs[key] = (
                 recording.clips / f"{key}.tmp.mp4",
@@ -144,26 +145,27 @@ async def create_range(service, camera, event, start_at, end_at, *, retry_failed
                     {"start_at": iso(s["clip_start"]), "end_at": iso(s["clip_end"])} for s in slices
                 ],
             )
-            with service.db:
-                if old:
-                    recording._save(body)
-                else:
+
+            async def publish():
+                nonlocal admitted
+                async with recording.transaction():
+                    if old:
+                        recording._save(body)
+                    else:
+                        service.db.execute(
+                            "INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",
+                            (key, camera, event, now, start, end, "processing", json.dumps(body)),
+                        )
                     service.db.execute(
-                        "INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",
-                        (key, camera, event, now, start, end, "processing", json.dumps(body)),
+                        "INSERT OR REPLACE INTO clip_sources VALUES(?,?)", (key, json.dumps(slices))
                     )
-                service.db.execute(
-                    "INSERT OR REPLACE INTO clip_sources VALUES(?,?)", (key, json.dumps(slices))
-                )
-            task = asyncio.create_task(service._process(key, slices))
-            service.jobs[key] = task
-            task.add_done_callback(lambda done: service._done(key, done))
-            admitted = True
-            return body, True
+                task = asyncio.create_task(service._process(key, slices))
+                service.jobs[key] = task
+                task.add_done_callback(lambda done: service._done(key, done))
+                admitted = True
+                return body, True
+
+            return await finish_cleanup(publish())
     finally:
         if pinned and not admitted:
-            async with service.lock:
-                with service.db:
-                    service.db.execute("DELETE FROM clip_recording_pins WHERE clip_id=?", (key,))
-                daily.storage_reservations.pop(key, None)
-                daily.storage_reservation_outputs.pop(key, None)
+            await finish_cleanup(service._discard_unadmitted(key))

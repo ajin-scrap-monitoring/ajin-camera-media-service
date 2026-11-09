@@ -369,7 +369,9 @@ class DailyExportService:
 
     def _compaction_pressured(self):
         queue = self.daily.recording.queue
-        if queue is not None and (queue.qsize() > 60 or queue.queued_bytes > 8 * 1024**2):
+        if queue is not None and (
+            queue.qsize() > 60 or getattr(queue, "queued_bytes", 0) > 8 * 1024**2
+        ):
             return True
         return (
             self.background.pressured(ignore_backlog=bool(self.daily.capacity_pending))
