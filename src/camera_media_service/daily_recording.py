@@ -15,6 +15,7 @@ from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
+from camera_media_service.daily_capacity import workspace_requirement
 from camera_media_service.daily_catalog import DailyCatalog
 from camera_media_service.daily_coverage_tracking import install_coverage_tracking
 from camera_media_service.daily_gaps import build_gaps
@@ -921,28 +922,10 @@ class DailyRecordingService:
                 for key, paths in self.storage_reservation_outputs.items()
                 if any(Path(p).parent.name == "daily-exports" for p in paths)
             }
-            pending = []
-            if not active_archives:
-                # Select the few unarchived days first. Aggregating the entire
-                # segment history on every encoder admission blocks live input
-                # even though archived days need no additional workspace.
-                for row in self.db.execute(
-                    "SELECT id FROM daily_recordings "
-                    "WHERE status IN ('recording','finalizing','closed')"
-                ).fetchall():
-                    if self.catalog.get_state(row[0]).get("archive_state") == "mp4":
-                        continue
-                    size, count = self.db.execute(
-                        "SELECT coalesce(sum(json_extract(body,'$.size_bytes')),0),count(*) "
-                        "FROM daily_segments WHERE day_id=? AND status='ready'",
-                        (row[0],),
-                    ).fetchone()
-                    if count:
-                        pending.append(int(size * 1.2) + 1048576)
             # One archive runs at a time. Its reservation/output already occupies
             # the working room; do not reserve a *second* full archive during its
             # read-only verification. Success compacts TS, failure removes MP4.
-            workspace = 0 if active_archives else max([workspace_floor, *pending])
+            workspace = 0 if active_archives else None
 
         def usage():
             guard = getattr(self.recording, "storage_guard", None)
@@ -974,15 +957,21 @@ class DailyRecordingService:
             buffer_headroom = (
                 max(0, self.recording.max_buffer_bytes - buffer_bytes) if total_limit else 0
             )
+            required_workspace = workspace
+            if required_workspace is None:
+                required_workspace = workspace_requirement(self.recording.root, workspace_floor)
+            if guard is not None:
+                guard()
             return (
                 total,
                 media_total,
                 shutil.disk_usage(self.recording.root).free,
                 remaining,
                 buffer_headroom,
+                required_workspace,
             )
 
-        used, media_used, free, remaining, buffer_headroom = await storage_io(usage)
+        used, media_used, free, remaining, buffer_headroom, workspace = await storage_io(usage)
         if generation != self.recording._budget_generation:
             if _attempt >= 2:
                 error = ApiError(
