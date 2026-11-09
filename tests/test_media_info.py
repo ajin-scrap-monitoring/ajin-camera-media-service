@@ -50,7 +50,7 @@ async def test_inspection_reads_actual_headers_and_exact_stream_rate(
     path = make_video(tmp_path, width=width, height=height, rate=rate, suffix=suffix)
     module = importlib.import_module("camera_media_service.media_info")
     result = await module.inspect_media_info(imageio_ffmpeg.get_ffmpeg_exe(), path)
-    assert result == {
+    assert {k: v for k, v in result.items() if k not in ("measured_at", "metadata_origin")} == {
         "status": "ready",
         "source": "file_probe",
         "codec": "h264",

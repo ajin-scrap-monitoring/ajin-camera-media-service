@@ -9,7 +9,7 @@ from collections import OrderedDict
 
 from camera_media_service.catalog_pins import pinned_snapshot
 from camera_media_service.media_files import storage_io
-from camera_media_service.media_info import inspect_media_info, unknown_media_info
+from camera_media_service.media_info import inspect_media_info, response_info, unknown_media_info
 from camera_media_service.metadata_reads import read_measurement, read_segment_measurements
 from camera_media_service.persisted_media_info import (
     file_identity,
@@ -57,6 +57,7 @@ class MediaDetails:
             return unknown_media_info("file_unavailable")
         fingerprint = (str(path), *identity)
         result = self.cache.get(fingerprint)
+        origin = "memory_cache" if result is not None else "persisted_probe"
         persisted = (
             await storage_io(
                 read_measurement,
@@ -84,7 +85,7 @@ class MediaDetails:
                 except OSError:
                     return unknown_media_info("file_unavailable")
             self._remember(fingerprint, result)
-            return dict(result)
+            return response_info(result, origin)
         flight = self.flights.get(fingerprint)
         if flight is None:
             if self.active >= 8:
@@ -97,7 +98,7 @@ class MediaDetails:
             self.flights[fingerprint] = flight
         flight["waiters"] += 1
         try:
-            return dict(await asyncio.shield(flight["task"]))
+            return response_info(await asyncio.shield(flight["task"]), "request_probe")
         finally:
             flight["waiters"] -= 1
             if not flight["waiters"]:
