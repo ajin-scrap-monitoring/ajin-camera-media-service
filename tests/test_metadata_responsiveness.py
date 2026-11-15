@@ -86,7 +86,7 @@ async def test_archive_result_serialization_does_not_block_receipt_loop(tmp_path
 
     service, daily, clock, day = await recorded_day(tmp_path, monkeypatch)
     exports = make_exports(daily)
-    original = daily.catalog.save_day
+    original = daily.catalog.save_state
     commits, samples = [], []
 
     def slow(body, **kwargs):
@@ -101,7 +101,7 @@ async def test_archive_result_serialization_does_not_block_receipt_loop(tmp_path
             samples.append(time.monotonic())
             await asyncio.sleep(0.005)
 
-    monkeypatch.setattr(daily.catalog, "save_day", slow)
+    monkeypatch.setattr(daily.catalog, "save_state", slow)
     task = asyncio.create_task(heartbeat())
     try:
         await exports.maintenance(clock[0])

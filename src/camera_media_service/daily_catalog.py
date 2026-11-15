@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 
 from camera_media_service.daily_models import DailyWindow
+from camera_media_service.daily_queries import scan_snapshot
 from camera_media_service.persisted_media_info import record_generated_info
 from camera_media_service.recording import ApiError, iso
 
@@ -47,23 +48,27 @@ class DailyCatalog:
         # An older binary may have advanced the legacy body during an image rollback.
         # Reconcile small counters once at startup, never read the large body per segment.
         with db:
-            db.execute(
-                "UPDATE daily_revisions SET revision=(SELECT json_extract(body,'$.revision') "
-                "FROM daily_recordings WHERE id=day_id) WHERE revision < "
-                "(SELECT json_extract(body,'$.revision') FROM daily_recordings WHERE id=day_id)"
-            )
             # Run only before writers start: move legacy large arrays out of the
             # row whose status is updated at midnight/deletion. SQLite rewrites
             # overflow pages even for a status-only UPDATE on a large row.
             keys = [
                 r[0]
                 for r in db.execute(
-                    "SELECT id FROM daily_recordings WHERE length(body)>65536 OR id IN "
+                    "SELECT id FROM daily_recordings WHERE octet_length(body)>65536 OR id IN "
                     "(SELECT day_id FROM daily_snapshot_deltas "
                     "GROUP BY day_id HAVING count(*)>1024)"
                 )
             ]
             for key in keys:
+                stored_bytes = db.execute(
+                    "SELECT octet_length(body)+"
+                    "(SELECT coalesce(sum(octet_length(body)),0) "
+                    "FROM daily_snapshot_deltas WHERE day_id=?) FROM daily_recordings WHERE id=?",
+                    (key, key),
+                ).fetchone()[0]
+                if stored_bytes > 8 * 1024 * 1024:
+                    # Large historical snapshots remain intact; public readers stream them.
+                    continue
                 body = self.get_day(key)
                 arrays = {
                     name: {"keep": 0, "append": body[name]}
@@ -82,8 +87,13 @@ class DailyCatalog:
                         (key, json.dumps({"values": {}, "arrays": arrays})),
                     )
             # An older image may have changed the materialized body during rollback.
-            for row in db.execute("SELECT body FROM daily_recordings"):
-                self._save_state(self.decode_day(row[0]))
+            for row in db.execute("SELECT id FROM daily_recordings").fetchall():
+                state, _ = scan_snapshot(db, row[0], arrays=False)
+                self._save_state(state)
+                db.execute(
+                    "UPDATE daily_revisions SET revision=max(revision,?) WHERE day_id=?",
+                    (state.get("revision", 0), row[0]),
+                )
 
     def _save_state(self, body):
         state = {k: v for k, v in body.items() if k not in ("gaps", "available_intervals")}
@@ -97,8 +107,35 @@ class DailyCatalog:
             "SELECT body FROM daily_states WHERE day_id=?", (recording_id,)
         ).fetchone()
         if row is None:
-            return self.get_day(recording_id)
+            return scan_snapshot(self.db, recording_id, arrays=False)[0]
         return json.loads(row[0])
+
+    def save_state(self, body, *, notify=True):
+        """Scalar-only transition; preserve every timeline delta without decoding it."""
+        if "gaps" in body or "available_intervals" in body:
+            raise ValueError("Use save_day to change timeline arrays")
+        key = body["recording_id"]
+        prior = self.get_state(key)
+        revision = self.db.execute(
+            "SELECT revision FROM daily_revisions WHERE day_id=?", (key,)
+        ).fetchone()
+        if revision:
+            body["revision"] = max(body.get("revision", 0), revision[0])
+        values = {k: v for k, v in body.items() if k not in prior or prior[k] != v}
+        remove = list(prior.keys() - body.keys())
+        if values or remove:
+            self.db.execute(
+                "INSERT INTO daily_snapshot_deltas(day_id,body) VALUES(?,?)",
+                (key, json.dumps({"values": values, "arrays": {}, "remove": remove})),
+            )
+            self._save_state(body)
+        if prior["status"] != body["status"]:
+            self.db.execute(
+                "UPDATE daily_recordings SET status=? WHERE id=?", (body["status"], key)
+            )
+        observer = getattr(self, "thumbnail_change_observer", None)
+        if observer and notify:
+            observer("day", key, body["status"])
 
     def ensure_day(self, camera_id: str, window: DailyWindow, retention_days: int) -> dict:
         row = self.db.execute(

@@ -21,7 +21,8 @@ async def test_slow_catalogue_read_keeps_receiver_responsive_and_lock_until_work
     key = service.db.execute("SELECT id FROM daily_recordings").fetchone()[0]
     main_thread = threading.get_ident()
     entered, release = threading.Event(), threading.Event()
-    original = daily.catalog.decode_day
+    method = "get_state" if operation == "playback" else "decode_day"
+    original = getattr(daily.catalog, method)
 
     def blocked(raw):
         assert threading.get_ident() != main_thread, "Catalogue I/O blocks the receiver loop"
@@ -29,7 +30,7 @@ async def test_slow_catalogue_read_keeps_receiver_responsive_and_lock_until_work
         assert release.wait(5)
         return original(raw)
 
-    monkeypatch.setattr(daily.catalog, "decode_day", blocked)
+    monkeypatch.setattr(daily.catalog, method, blocked)
     call = {
         "listing": lambda: daily.list_days("camera-main", {}, 20, None),
         "detail": lambda: daily.get_day(key),
@@ -54,7 +55,7 @@ async def test_slow_catalogue_read_keeps_receiver_responsive_and_lock_until_work
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
-        monkeypatch.setattr(daily.catalog, "decode_day", original)
+        monkeypatch.setattr(daily.catalog, method, original)
         await daily.close()
         await service.close()
 

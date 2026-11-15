@@ -422,5 +422,7 @@ def create_http_app(
     if daily is not None:
         from camera_media_service.daily_http_api import register_daily_routes
 
-        register_daily_routes(app, daily, exports, media_details=media_details)
+        register_daily_routes(
+            app, daily, exports, media_details=media_details, storage_status=storage_status
+        )
     return app

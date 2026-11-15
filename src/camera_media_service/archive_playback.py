@@ -69,7 +69,7 @@ class ArchivedPlaybackService:
         return await storage_io(self._read_snapshot, recording_id, segment_id)
 
     def _read_snapshot(self, recording_id, segment_id):
-        day = self.daily.catalog.get_day(recording_id)
+        day = self.daily.catalog.get_state(recording_id)
         if day["status"] in ("deleted", "expired"):
             raise ApiError(
                 410, "DAILY_RECORDING_" + day["status"].upper(), "Recording is no longer available."

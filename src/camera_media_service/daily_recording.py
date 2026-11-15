@@ -1066,7 +1066,7 @@ class DailyRecordingService:
 
     async def playback_snapshot(self, recording_id: str) -> tuple[dict, list[dict]]:
         async with self.lock:
-            day = await storage_io(self.catalog.get_day, recording_id)
+            day = await storage_io(self.catalog.get_state, recording_id)
             if day["status"] in ("expired", "deleted"):
                 raise ApiError(
                     410,

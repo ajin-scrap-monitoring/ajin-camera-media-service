@@ -59,14 +59,14 @@ class DailyExportService:
         with self.db:
             # Recover unfinished deletion even if interrupted before queue insertion.
             for row in self.db.execute(
-                "SELECT body FROM daily_recordings WHERE status IN ('deleted','expired')"
+                "SELECT id FROM daily_recordings WHERE status IN ('deleted','expired')"
             ).fetchall():
-                day = daily.catalog.decode_day(row["body"])
+                day = daily.catalog.get_state(row["id"])
                 if day.get("cleanup_state") != "complete":
                     day.setdefault("cleanup_state", "pending")
                     day.update(cleanup_completed_at=None, space_reclaimed=None)
                     day.setdefault("cleanup_error", None)
-                    daily.catalog.save_day(day)
+                    daily.catalog.save_state(day)
                     self.db.execute(
                         "INSERT OR IGNORE INTO daily_cleanup VALUES(?)", (day["recording_id"],)
                     )
@@ -82,9 +82,9 @@ class DailyExportService:
                     "UPDATE daily_exports SET status=?,body=? WHERE day_id=?",
                     ("failed", json.dumps(job), row["day_id"]),
                 )
-                day = daily.catalog.get_day(row["day_id"])
+                day = daily.catalog.get_state(row["day_id"])
                 day.update(export_state="failed", error=job["error"], archive_retry_at=None)
-                daily.catalog.save_day(day)
+                daily.catalog.save_state(day)
                 (self.output / (row["day_id"] + ".tmp.mp4")).unlink(missing_ok=True)
                 (self.output / (row["day_id"] + ".ffconcat")).unlink(missing_ok=True)
 
@@ -106,7 +106,7 @@ class DailyExportService:
         async def commit():
             async with self.daily.recording.transaction():
                 if day is not None:
-                    self.daily.catalog.save_day(day)
+                    self.daily.catalog.save_state(day)
                 self.db.execute("DELETE FROM daily_compactions WHERE day_id=?", (key,))
                 if cleanup:
                     self.db.execute("DELETE FROM daily_cleanup WHERE day_id=?", (key,))
@@ -136,7 +136,7 @@ class DailyExportService:
     async def request_export(self, recording_id: str) -> tuple[dict, bool]:
         """Compatibility status check: never start whole-day file work from a click."""
         async with self.lock:
-            day = self.daily.catalog.get_day(recording_id)
+            day = self.daily.catalog.get_state(recording_id)
             self._exportable(day)
             if day.get("archive_state") == "mp4" and not self._path(recording_id).is_file():
                 raise ApiError(503, "RECORDING_STORAGE_ERROR", "Archived MP4 is unavailable.")
@@ -151,7 +151,7 @@ class DailyExportService:
             self.daily.recording.diagnostics.count("archive_admission_deferred")
             return
         async with self.lock:
-            day = self.daily.catalog.get_day(recording_id)
+            day = self.daily.catalog.get_state(recording_id)
             self._exportable(day)
             if day.get("archive_state") == "mp4" or self._has_job(recording_id):
                 return
@@ -164,7 +164,7 @@ class DailyExportService:
         if reserve:
             await self.daily.check_space(reserve)
         async with self.lock:
-            day = self.daily.catalog.get_day(recording_id)
+            day = self.daily.catalog.get_state(recording_id)
             self._exportable(day)
             if (
                 self.closed
@@ -193,7 +193,7 @@ class DailyExportService:
                     archive_retry_at=None,
                     error=None,
                 )
-                self.daily.catalog.save_day(day)
+                self.daily.catalog.save_state(day)
             self.reservations[recording_id] = reserve
             self.reservation_outputs[recording_id] = (
                 self.output / (recording_id + ".tmp.mp4"),
@@ -306,7 +306,7 @@ class DailyExportService:
 
     def _publish_archive(self, job, segments, final, metadata, error):
         recording_id = job["recording_id"]
-        day = self.daily.catalog.get_day(recording_id)
+        day = self.daily.catalog.get_state(recording_id)
         if day["status"] in ("expired", "deleted") or (
             day["expires_at"] and epoch(day["expires_at"]) <= self.daily.clock()
         ):
@@ -337,7 +337,7 @@ class DailyExportService:
                 error=None,
             )
             self.db.execute("INSERT OR IGNORE INTO daily_compactions VALUES(?)", (recording_id,))
-        self.daily.catalog.save_day(day, notify=False)
+        self.daily.catalog.save_state(day, notify=False)
         return error
 
     async def _stage_archive_mappings(self, job, segments, final):
@@ -446,7 +446,7 @@ class DailyExportService:
         if self._has_job(recording_id):
             return
         async with self.lock:
-            day = self.daily.catalog.get_day(recording_id)
+            day = self.daily.catalog.get_state(recording_id)
             if day["status"] in ("deleted", "expired"):
                 return
             if day.get("archive_state") != "mp4":
@@ -492,7 +492,7 @@ class DailyExportService:
     async def delete_day(self, recording_id: str) -> None:
         async with self.daily.recording.thumbnail_deletion("day", recording_id):
             async with self.lock:
-                day = self.daily.catalog.get_day(recording_id)
+                day = self.daily.catalog.get_state(recording_id)
                 if day["status"] in ("recording", "finalizing"):
                     raise ApiError(409, "RECORDING_ACTIVE", "Current day cannot be deleted.")
                 if self._has_job(recording_id):
@@ -523,7 +523,7 @@ class DailyExportService:
                     space_reclaimed=None,
                 )
                 async with self.daily.recording.transaction():
-                    self.daily.catalog.save_day(day)
+                    self.daily.catalog.save_state(day)
                     self.db.execute(
                         "INSERT OR IGNORE INTO daily_cleanup VALUES(?)", (recording_id,)
                     )
@@ -542,7 +542,7 @@ class DailyExportService:
                 "SELECT 1 FROM clip_recording_pins WHERE day_id=? LIMIT 1", (recording_id,)
             ).fetchone():
                 return False
-            day = self.daily.catalog.get_day(recording_id)
+            day = self.daily.catalog.get_state(recording_id)
             if day.get("cleanup_state") == "complete":
                 self._release_workspace(recording_id)
                 return True
@@ -553,7 +553,7 @@ class DailyExportService:
                 space_reclaimed=None,
             )
             async with self.daily.recording.transaction():
-                self.daily.catalog.save_day(day)
+                self.daily.catalog.save_state(day)
                 self.db.execute("INSERT OR IGNORE INTO daily_cleanup VALUES(?)", (recording_id,))
         uuid.UUID(recording_id)
 
@@ -578,7 +578,7 @@ class DailyExportService:
             await self._file_work(remove)
         except OSError:
             async with self.lock:
-                day = self.daily.catalog.get_day(recording_id)
+                day = self.daily.catalog.get_state(recording_id)
                 day.update(
                     cleanup_state="failed",
                     cleanup_completed_at=None,
@@ -586,10 +586,10 @@ class DailyExportService:
                     space_reclaimed=None,
                 )
                 async with self.daily.recording.transaction():
-                    self.daily.catalog.save_day(day)
+                    self.daily.catalog.save_state(day)
             raise
         async with self.lock:
-            day = self.daily.catalog.get_day(recording_id)
+            day = self.daily.catalog.get_state(recording_id)
             day.update(
                 cleanup_state="complete",
                 cleanup_completed_at=iso(self.daily.clock()),
@@ -612,7 +612,7 @@ class DailyExportService:
                     state = self.daily.catalog.get_state(row[0])
                     day = state
                     if day["expires_at"] and epoch(day["expires_at"]) <= now:
-                        day = self.daily.catalog.get_day(row[0])
+                        day = self.daily.catalog.get_state(row[0])
                         day.update(
                             status="expired",
                             playback_state="unavailable",
@@ -625,7 +625,7 @@ class DailyExportService:
                             cleanup_error=None,
                             space_reclaimed=None,
                         )
-                        self.daily.catalog.save_day(day)
+                        self.daily.catalog.save_state(day)
                         self.db.execute(
                             "INSERT OR IGNORE INTO daily_cleanup VALUES(?)", (day["recording_id"],)
                         )
@@ -675,7 +675,7 @@ class DailyExportService:
                     await self._enqueue(day["recording_id"])
                 except ApiError as exc:
                     async with self.lock:
-                        current = self.daily.catalog.get_day(day["recording_id"])
+                        current = self.daily.catalog.get_state(day["recording_id"])
                         if current["status"] == "closed":
                             current.update(
                                 export_state="failed",
@@ -683,7 +683,7 @@ class DailyExportService:
                                 archive_retry_at=iso(now + 30),
                             )
                             async with self.daily.recording.transaction():
-                                self.daily.catalog.save_day(current)
+                                self.daily.catalog.save_state(current)
                     # Avoid repeatedly reserving space for every old day on a full disk.
                     break
                 if self.jobs:
@@ -713,14 +713,14 @@ class DailyExportService:
         async with self.lock:
             async with self.daily.recording.transaction():
                 for key in keys:
-                    day = self.daily.catalog.get_day(key)
+                    day = self.daily.catalog.get_state(key)
                     if day["export_state"] == "processing":
                         day.update(
                             export_state="failed",
                             archive_retry_at=None,
                             error={"code": "JOB_INTERRUPTED", "message": "Archive interrupted."},
                         )
-                        self.daily.catalog.save_day(day)
+                        self.daily.catalog.save_state(day)
                         row = self.db.execute(
                             "SELECT body FROM daily_exports WHERE day_id=?", (key,)
                         ).fetchone()
