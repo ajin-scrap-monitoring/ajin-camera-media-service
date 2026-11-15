@@ -22,7 +22,9 @@ from camera_media_service.snapshot_stream import SnapshotJSONError
 STATES = {"recording", "finalizing", "closed", "failed", "deleted", "expired"}
 
 
-def register_daily_routes(app, daily, exports, *, media_details=None, storage_status=None) -> None:
+def register_daily_routes(
+    app, daily, exports, *, media_details=None, storage_status=None, policy_capacity=None
+) -> None:
     key = daily.recording.cursor_key
     snapshots = DailySnapshots(
         daily.recording.root / "catalog.sqlite3", response_bytes=RESPONSE_BYTES
@@ -93,12 +95,13 @@ def register_daily_routes(app, daily, exports, *, media_details=None, storage_st
     async def policy(request):
         query_fields(request, ())
         camera = request.match_info["camera_id"]
-        result = (
-            await daily.set_policy(camera, await body_json(request))
-            if request.method == "PUT"
-            else await daily.get_policy(camera)
-        )
-        return await storage_io(web.json_response, result)
+        if request.method in ("PUT", "POST"):
+            result = await policy_capacity.evaluate(
+                camera, await body_json(request), kind="daily", apply=request.method == "PUT"
+            )
+        else:
+            result = await daily.get_policy(camera)
+        return await storage_io(web.json_response, result, headers={"Cache-Control": "no-store"})
 
     async def listing(request):
         query_fields(request, ("from_date", "to_date", "status", "limit", "cursor"))
@@ -345,6 +348,7 @@ def register_daily_routes(app, daily, exports, *, media_details=None, storage_st
         prefix + "/cameras/{camera_id}/daily-recording-policy", policy, allow_head=False
     )
     app.router.add_put(prefix + "/cameras/{camera_id}/daily-recording-policy", policy)
+    app.router.add_post(prefix + "/cameras/{camera_id}/daily-recording-policy/validate", policy)
     app.router.add_get(prefix + "/cameras/{camera_id}/daily-recordings", listing, allow_head=False)
     app.router.add_get(
         prefix + "/cameras/{camera_id}/daily-recordings/summary", listing, allow_head=False
