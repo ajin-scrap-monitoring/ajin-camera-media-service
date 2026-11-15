@@ -238,7 +238,9 @@ class MediaDetails:
         try:
             result = await asyncio.shield(flight["task"])
             async with self.recording.lock:
-                self.exports._accessible(await storage_io(self.daily.catalog.get_day, recording_id))
+                self.exports._accessible(
+                    await storage_io(self.daily.catalog.get_state, recording_id)
+                )
             return result
         finally:
             flight["waiters"] -= 1
@@ -262,7 +264,7 @@ class MediaDetails:
         owner = "info:" + str(uuid.uuid4())
 
         def snapshot():
-            day = self.daily.catalog.get_day(recording_id)
+            day = self.daily.catalog.get_state(recording_id)
             self.recording._camera(day["camera_id"])
             self.exports._accessible(day)
             parts = self.daily.catalog.segments(recording_id, ready_only=True)
@@ -327,7 +329,9 @@ class MediaDetails:
             total = len(parts)
             mixed = True if len(formats) > 1 else False if measured == total and measured else None
             async with self.recording.lock:
-                self.exports._accessible(await storage_io(self.daily.catalog.get_day, recording_id))
+                self.exports._accessible(
+                    await storage_io(self.daily.catalog.get_state, recording_id)
+                )
             return {
                 "recording_id": recording_id,
                 "file": file_info,

@@ -193,3 +193,72 @@ async def test_restart_compacts_replay_and_rollback_keeps_revision_only_progress
         daily.initialized = False
         await daily.close()
         await recording.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_rebuilds_scalar_state_without_decoding_large_timeline(tmp_path, monkeypatch):
+    clock = [DailyWindow.from_date(date(2026, 11, 6)).start_at]
+    recording, daily = make_daily(tmp_path, clock, monkeypatch)
+    try:
+        await daily.tick(clock[0])
+        day = (await daily.list_days("camera-main", {}, 20, None))[0]
+        key = day["recording_id"]
+        patch = json.dumps(
+            {
+                "values": {"size_bytes": 12345},
+                "arrays": {
+                    "gaps": {
+                        "keep": 0,
+                        "append": [{"reason_code": "STORAGE_FULL", "n": i} for i in range(4000)],
+                    }
+                },
+            }
+        )
+        with recording.db:
+            recording.db.execute(
+                "INSERT INTO daily_snapshot_deltas(day_id,body) VALUES(?,?)", (key, patch)
+            )
+
+        def fail(*args):
+            raise AssertionError("startup must not materialize stored timelines")
+
+        monkeypatch.setattr(DailyCatalog, "decode_day", fail)
+        reopened = DailyCatalog(recording.db)
+        assert reopened.get_state(key)["size_bytes"] == 12345
+        for field in ("segment_seconds", "hls_target_duration", "storage_profile"):
+            assert reopened.get_state(key)[field] == day[field]
+        assert (
+            recording.db.execute(
+                "SELECT body FROM daily_snapshot_deltas WHERE day_id=? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (key,),
+            ).fetchone()[0]
+            == patch
+        )
+    finally:
+        daily.initialized = False
+        await daily.close()
+        await recording.close()
+
+
+@pytest.mark.asyncio
+async def test_scalar_transition_keeps_timeline_and_does_not_decode_it(tmp_path, monkeypatch):
+    clock = [DailyWindow.from_date(date(2026, 11, 6)).start_at]
+    recording, daily = make_daily(tmp_path, clock, monkeypatch)
+    try:
+        await daily.tick(clock[0])
+        day = (await daily.list_days("camera-main", {}, 20, None))[0]
+        day["gaps"] = [{"n": i} for i in range(4000)]
+        with recording.db:
+            daily.catalog.save_day(day)
+        original = daily.catalog.get_day(day["recording_id"])
+        state = daily.catalog.get_state(day["recording_id"])
+        state.update(status="expired", cleanup_state="pending")
+        with recording.db:
+            daily.catalog.save_state(state)
+        after = daily.catalog.get_day(day["recording_id"])
+        assert after == dict(original, status="expired", cleanup_state="pending")
+    finally:
+        daily.initialized = False
+        await daily.close()
+        await recording.close()
