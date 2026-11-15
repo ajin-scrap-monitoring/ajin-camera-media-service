@@ -32,6 +32,18 @@ LOG = logging.getLogger(__name__)
 POLICY = {"enabled": True, "retention_days": 30}
 
 
+def validate_daily_policy(body):
+    if (
+        not isinstance(body, dict)
+        or set(body) != set(POLICY)
+        or type(body["enabled"]) is not bool
+        or type(body["retention_days"]) is not int
+        or not 1 <= body["retention_days"] <= 365
+    ):
+        raise ApiError(400, "INVALID_ARGUMENT", "enabled and retention_days (1..365) are required.")
+    return dict(body)
+
+
 class DailyRecordingService:
     def __init__(
         self,
@@ -123,15 +135,7 @@ class DailyRecordingService:
 
     async def set_policy(self, camera_id: str, body: dict) -> dict:
         self.recording._camera(camera_id)
-        if (
-            set(body) != set(POLICY)
-            or type(body["enabled"]) is not bool
-            or type(body["retention_days"]) is not int
-            or not 1 <= body["retention_days"] <= 365
-        ):
-            raise ApiError(
-                400, "INVALID_ARGUMENT", "enabled and retention_days (1..365) are required."
-            )
+        body = validate_daily_policy(body)
         async with self.lock:
             async with self.recording.transaction():
                 self.db.execute(
@@ -914,7 +918,13 @@ class DailyRecordingService:
         with self.recording.diagnostics.measure("space_check"):
             await self._check_space(reserve, recording=recording)
 
-    async def _check_space(self, reserve: int = 0, *, recording: bool = False, _attempt=0) -> None:
+    async def inspect_capacity(self, *, recording=True):
+        """Advisory read only: no reservations, cleanup, or rejected-write counters."""
+        return await self._check_space(recording=recording, inspection=True)
+
+    async def _check_space(
+        self, reserve: int = 0, *, recording: bool = False, _attempt=0, inspection=False
+    ):
         # Snapshot on the event loop; file workers must not read mutable job maps.
         generation = self.recording._budget_generation
         reservations = dict(self.storage_reservations)
@@ -984,13 +994,24 @@ class DailyRecordingService:
         used, media_used, free, remaining, buffer_headroom, workspace = await storage_io(usage)
         if generation != self.recording._budget_generation:
             if _attempt >= 2:
+                if inspection:
+                    return {
+                        "status": "unknown",
+                        "observed_at": None,
+                        "reason_code": "CAPACITY_SNAPSHOT_BUSY",
+                        "budget": None,
+                        "available_recording_bytes": None,
+                        "limiting_conditions": [],
+                    }
                 error = ApiError(
                     503, "CAPACITY_SNAPSHOT_BUSY", "Storage reservations changed during admission."
                 )
                 error.condition = "reservation_changed"
                 error.budget = {"condition": error.condition, "attempts": _attempt + 1}
                 raise error
-            return await self._check_space(reserve, recording=recording, _attempt=_attempt + 1)
+            return await self._check_space(
+                reserve, recording=recording, _attempt=_attempt + 1, inspection=inspection
+            )
         reserve += remaining
         conditions = (
             ("daily_budget", used + reserve + workspace > self.settings.max_daily_storage_bytes),
@@ -1003,6 +1024,40 @@ class DailyRecordingService:
                 free - reserve - workspace - buffer_headroom < self.settings.min_free_storage_bytes,
             ),
         )
+        budget = {
+            "daily_used_bytes": used,
+            "media_used_bytes": media_used,
+            "filesystem_free_bytes": free,
+            "unallocated_reserved_bytes": remaining,
+            "additional_reserve_bytes": reserve - remaining,
+            "workspace_bytes": workspace,
+            "buffer_headroom_bytes": buffer_headroom,
+            "daily_limit_bytes": self.settings.max_daily_storage_bytes,
+            "media_limit_bytes": total_limit,
+            "minimum_free_bytes": self.settings.min_free_storage_bytes,
+        }
+        if inspection:
+            headroom = {
+                "daily_budget": self.settings.max_daily_storage_bytes - used - reserve - workspace,
+                "minimum_free": free
+                - reserve
+                - workspace
+                - buffer_headroom
+                - self.settings.min_free_storage_bytes,
+            }
+            if total_limit:
+                headroom["total_budget"] = (
+                    total_limit - media_used - reserve - workspace - buffer_headroom
+                )
+            blocked = [name for name, value in headroom.items() if value <= 0]
+            return {
+                "status": "insufficient_capacity" if blocked else "available",
+                "observed_at": iso(self.clock()),
+                "budget": budget,
+                "reason_code": None,
+                "available_recording_bytes": max(0, min(headroom.values())),
+                "limiting_conditions": blocked,
+            }
         for condition, rejected in conditions:
             if rejected:
                 self.recording.diagnostics.count("storage_rejected_" + condition)
@@ -1012,19 +1067,7 @@ class DailyRecordingService:
                     "Daily storage limit or free-space reserve reached.",
                 )
                 error.condition = condition
-                error.budget = {
-                    "condition": condition,
-                    "daily_used_bytes": used,
-                    "media_used_bytes": media_used,
-                    "filesystem_free_bytes": free,
-                    "unallocated_reserved_bytes": remaining,
-                    "additional_reserve_bytes": reserve - remaining,
-                    "workspace_bytes": workspace,
-                    "buffer_headroom_bytes": buffer_headroom,
-                    "daily_limit_bytes": self.settings.max_daily_storage_bytes,
-                    "media_limit_bytes": total_limit,
-                    "minimum_free_bytes": self.settings.min_free_storage_bytes,
-                }
+                error.budget = {"condition": condition, **budget}
                 raise error
 
     async def get_day(self, recording_id: str) -> dict:

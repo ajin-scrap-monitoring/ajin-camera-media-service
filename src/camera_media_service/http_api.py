@@ -82,6 +82,9 @@ def create_http_app(
     from camera_media_service.storage_status import StorageStatus
 
     storage_status = StorageStatus(service, daily)
+    from camera_media_service.policy_capacity import PolicyCapacity
+
+    policy_capacity = PolicyCapacity(service, daily, storage_status)
 
     @web.middleware
     async def boundary(request, handler):
@@ -166,11 +169,13 @@ def create_http_app(
     async def policy(request):
         query_fields(request, ())
         camera = request.match_info["camera_id"]
-        if request.method == "PUT":
-            result = await service.set_policy(camera, await body_json(request))
+        if request.method in ("PUT", "POST"):
+            result = await policy_capacity.evaluate(
+                camera, await body_json(request), kind="clip", apply=request.method == "PUT"
+            )
         else:
             result = await service.get_policy(camera)
-        return web.json_response(result)
+        return await storage_io(web.json_response, result, headers={"Cache-Control": "no-store"})
 
     async def camera_status(request):
         query_fields(request, ())
@@ -412,6 +417,7 @@ def create_http_app(
     app.router.add_get(prefix + "/cameras/{camera_id}/recording-policy", policy, allow_head=False)
     app.router.add_get(prefix + "/cameras/{camera_id}/status", camera_status, allow_head=False)
     app.router.add_put(prefix + "/cameras/{camera_id}/recording-policy", policy)
+    app.router.add_post(prefix + "/cameras/{camera_id}/recording-policy/validate", policy)
     app.router.add_get(prefix + "/cameras/{camera_id}/live", live, allow_head=False)
     app.router.add_post(prefix + "/clips", create)
     app.router.add_get(prefix + "/clips", listing, allow_head=False)
@@ -423,6 +429,11 @@ def create_http_app(
         from camera_media_service.daily_http_api import register_daily_routes
 
         register_daily_routes(
-            app, daily, exports, media_details=media_details, storage_status=storage_status
+            app,
+            daily,
+            exports,
+            media_details=media_details,
+            storage_status=storage_status,
+            policy_capacity=policy_capacity,
         )
     return app
