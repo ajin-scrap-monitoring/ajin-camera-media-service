@@ -107,6 +107,8 @@ class CapacityCleanup:
                 or pending["bytes"] < 0
             ):
                 raise ValueError()
+            if type(pending.get("files_counted", False)) is not bool:
+                raise ValueError()
             pressure_snapshot({"status": "available", "budget": pending.get("before")})
         measurement = saved.get("measurement")
         if measurement is not None:
@@ -294,13 +296,18 @@ class CapacityCleanup:
                 "success": False,
                 "space_recovery_confirmed": False,
             }
+            already_removed = (
+                await self.exports.pressure_intent_state(candidate["recording_id"]) == "complete"
+            )
+            s["last_attempt"]["phase"] = "reclaim_check" if already_removed else "delete"
             await self._save()
             try:
-                await self.exports.delete_day(
-                    candidate["recording_id"],
-                    reason="capacity_pressure",
-                    max_bytes=self.policy.max_bytes - used_bytes,
-                )
+                if not already_removed:
+                    await self.exports.delete_day(
+                        candidate["recording_id"],
+                        reason="capacity_pressure",
+                        max_bytes=self.policy.max_bytes - used_bytes,
+                    )
             except ApiError as exc:
                 if exc.status == 409:
                     intent = await self.exports.pressure_intent_state(candidate["recording_id"])
@@ -322,20 +329,23 @@ class CapacityCleanup:
             growth = max(
                 0, after["media_used_bytes"] - before["media_used_bytes"] + candidate["bytes"]
             )
-            confirmed = free_gain > 0 and daily_drop > 0
+            confirmed = (
+                free_gain > 0
+                and daily_drop > 0
+                and (free_gain + growth) * 100 >= candidate["bytes"] * 95
+            )
             s["last_attempt"].update(
                 success=True,
                 space_recovery_confirmed=confirmed,
                 observed_filesystem_free_increase_bytes=free_gain,
                 observed_daily_usage_decrease_bytes=daily_drop,
                 estimated_other_growth_bytes=growth,
+                required_recovery_bytes=(candidate["bytes"] * 95 + 99) // 100,
                 completed_at=iso(now),
             )
-            s.update(
-                pending=None,
-                successful_days=s["successful_days"] + 1,
-                observed_reclaimed_bytes=s["observed_reclaimed_bytes"] + free_gain,
-            )
+            if not candidate.get("files_counted", False):
+                s["successful_days"] += 1
+                candidate["files_counted"] = True
             completed += 1
             used_bytes += candidate["bytes"]
             if not confirmed:
@@ -346,6 +356,9 @@ class CapacityCleanup:
                     else "SPACE_NOT_RECLAIMED",
                 )
                 break
+            s.update(
+                pending=None, observed_reclaimed_bytes=s["observed_reclaimed_bytes"] + free_gain
+            )
             s.update(consecutive_failures=0, retry_at=0, last_progress_at=now)
             await self._save()
         if not s["pending"] and self._below_stop():
