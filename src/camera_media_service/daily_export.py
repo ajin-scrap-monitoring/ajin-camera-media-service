@@ -52,11 +52,15 @@ class DailyExportService:
         self.reservations = daily.storage_reservations
         self.reservation_outputs = daily.storage_reservation_outputs
         self.playback = ArchivedPlaybackService(daily)
+        from camera_media_service.capacity_cleanup import CapacityCleanup
+
+        self.pressure = CapacityCleanup(self)
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS daily_cleanup(day_id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS daily_compactions(day_id TEXT PRIMARY KEY);
         """)
         with self.db:
+            self.db.execute("DELETE FROM clip_recording_pins WHERE clip_id LIKE 'http:%'")
             # Recover unfinished deletion even if interrupted before queue insertion.
             for row in self.db.execute(
                 "SELECT id FROM daily_recordings WHERE status IN ('deleted','expired')"
@@ -500,10 +504,85 @@ class DailyExportService:
         async with self.lock:
             await self._commit_workspace_release(recording_id)
 
-    async def delete_day(self, recording_id: str) -> None:
-        async with self.daily.recording.thumbnail_deletion("day", recording_id):
+    def _pressure_protected(self, key):
+        return (
+            self._has_job(key)
+            or key in self.compaction_owners
+            or self._file_lock(key).locked()
+            or self.db.execute(
+                "SELECT 1 FROM clip_recording_pins WHERE day_id=? LIMIT 1", (key,)
+            ).fetchone()
+            is not None
+        )
+
+    async def pressure_candidate(self, max_bytes):
+        from camera_media_service.pressure_files import inspect
+
+        async with self.lock:
+            rows = self.db.execute(
+                "SELECT id FROM daily_recordings WHERE status='closed' ORDER BY date,id LIMIT 1001"
+            ).fetchall()
+            candidates = [self.daily.catalog.get_summary_state(r[0]) for r in rows[:1000]]
+            candidates.sort(key=lambda day: (epoch(day["window_end_at"]), day["recording_id"]))
+            protected = False
+            for day in candidates:
+                key = day["recording_id"]
+                if (
+                    day.get("archive_state") != "mp4"
+                    or day["export_state"] != "ready"
+                    or epoch(day["window_end_at"]) > self.daily.clock()
+                ):
+                    protected = True
+                    continue
+                if self._pressure_protected(key):
+                    protected = True
+                    continue
+                info = await storage_io(inspect, self.root, key, self.daily.recording.storage_guard)
+                master = self._path(key)
+                if not master.is_file() or master.stat().st_size != day.get("size_bytes"):
+                    raise OSError("Pressure target archive is missing or changed")
+                return {
+                    "recording_id": key,
+                    "window_end_at": day["window_end_at"],
+                    "bytes": info["bytes"],
+                }, None
+            return None, "CANDIDATE_SCAN_LIMIT" if len(
+                rows
+            ) > 1000 else "PROTECTED_TARGETS_ONLY" if protected else "TARGETS_EXHAUSTED"
+
+    async def delete_day(self, recording_id: str, *, reason=None, max_bytes=None) -> None:
+        pressure = reason == "capacity_pressure"
+        async with self.daily.recording.thumbnail_deletion("day", recording_id, protect=pressure):
             async with self.lock:
                 day = self.daily.catalog.get_state(recording_id)
+                if pressure:
+                    from camera_media_service.pressure_files import inspect
+
+                    resume = day["status"] == "deleted" and day.get("deletion_reason") == reason
+                    if not resume and (
+                        day["status"] != "closed"
+                        or day.get("archive_state") != "mp4"
+                        or day["export_state"] != "ready"
+                        or epoch(day["window_end_at"]) > self.daily.clock()
+                    ):
+                        raise ApiError(
+                            409, "RECORDING_ACTIVE", "Pressure target is not a completed archive."
+                        )
+                    if self._pressure_protected(recording_id):
+                        raise ApiError(409, "EXPORT_IN_PROGRESS", "Pressure target is protected.")
+                    info = await storage_io(
+                        inspect, self.root, recording_id, self.daily.recording.storage_guard
+                    )
+                    if type(max_bytes) is not int or info["bytes"] > max_bytes:
+                        raise ApiError(
+                            409,
+                            "CAPACITY_TARGET_EXCEEDS_LIMIT",
+                            "Pressure target exceeds the cycle limit.",
+                        )
+                    if not resume:
+                        master = self._path(recording_id)
+                        if not master.is_file() or master.stat().st_size != day.get("size_bytes"):
+                            raise OSError("Pressure target archive unavailable")
                 if day["status"] in ("recording", "finalizing"):
                     raise ApiError(409, "RECORDING_ACTIVE", "Current day cannot be deleted.")
                 if self._has_job(recording_id):
@@ -521,6 +600,8 @@ class DailyExportService:
                         status="deleted",
                         deleted_at=day.get("deleted_at") or iso(self.daily.clock()),
                     )
+                if pressure:
+                    day["deletion_reason"] = reason
                 day.update(
                     playback_state="unavailable",
                     playback_path=None,
@@ -569,6 +650,11 @@ class DailyExportService:
         uuid.UUID(recording_id)
 
         def remove():
+            if day.get("deletion_reason") == "capacity_pressure":
+                from camera_media_service.pressure_files import remove as remove_owned
+
+                remove_owned(self.root, recording_id, self.daily.recording.storage_guard)
+                return
             for category in ("daily", "daily-playback"):
                 folder = self.root / category / recording_id
                 if not folder.resolve().is_relative_to((self.root / category).resolve()):
@@ -600,6 +686,7 @@ class DailyExportService:
                     self.daily.catalog.save_state(day)
             raise
         async with self.lock:
+            self.daily.recording._invalidate_budget_snapshot()
             day = self.daily.catalog.get_state(recording_id)
             day.update(
                 cleanup_state="complete",
@@ -652,6 +739,10 @@ class DailyExportService:
                 pending = [r[0] for r in self.db.execute("SELECT day_id FROM daily_cleanup")]
                 compact = [r[0] for r in self.db.execute("SELECT day_id FROM daily_compactions")]
             for day_id in pending:
+                async with self.lock:
+                    state = self.daily.catalog.get_state(day_id)
+                if state.get("deletion_reason") == "capacity_pressure":
+                    continue
                 try:
                     await self._cleanup(day_id)
                 except OSError:
@@ -663,6 +754,7 @@ class DailyExportService:
                     await self._compact(day_id)
                 except OSError:
                     LOG.exception("Retrying source compaction: %s", day_id)
+            await self.pressure.tick(now)
             if (
                 self.closed
                 or self.jobs

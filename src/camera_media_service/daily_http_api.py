@@ -7,10 +7,12 @@ import base64
 import hmac
 import json
 import re
+import uuid
 from datetime import date
 
 from aiohttp import web
 
+from camera_media_service.catalog_pins import pinned_snapshot
 from camera_media_service.daily_playback import build_daily_playlist
 from camera_media_service.daily_queries import RESPONSE_BYTES, DailySnapshots
 from camera_media_service.http_api import body_json, query_fields
@@ -31,6 +33,25 @@ def register_daily_routes(
     )
     slot = asyncio.Semaphore(1)
     admitted = 0
+
+    def protect_stream(handler):
+        async def protected(request):
+            recording_id = request.match_info["recording_id"]
+
+            def snapshot():
+                day = daily.catalog.get_state(recording_id)
+                exports._accessible(day)
+
+            async with pinned_snapshot(
+                daily.recording, "http:" + str(uuid.uuid4()), recording_id, snapshot
+            ):
+                return await handler(request)
+
+        return protected
+
+    async def cleanup_status(request):
+        query_fields(request, ())
+        return web.json_response(exports.pressure.status(), headers={"Cache-Control": "no-store"})
 
     async def read_snapshot(function):
         nonlocal admitted
@@ -279,6 +300,7 @@ def register_daily_routes(
             headers=headers,
         )
 
+    @protect_stream
     async def segment(request):
         query_fields(request, ())
         await exports.refresh_retention(daily.clock())
@@ -318,6 +340,7 @@ def register_daily_routes(
             guard=getattr(daily.recording, "storage_guard", None),
         )
 
+    @protect_stream
     async def content(request):
         query_fields(request, ("download",))
         if request.query.get("download", "false") not in ("true", "false"):
@@ -348,6 +371,7 @@ def register_daily_routes(
         )
 
     prefix = "/api/v2"
+    app.router.add_get(prefix + "/capacity-cleanup/status", cleanup_status, allow_head=False)
     if storage_status is not None:
         app.router.add_get(
             prefix + "/recording-retention-status", retention_status, allow_head=False

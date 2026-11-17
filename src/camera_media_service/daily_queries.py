@@ -22,6 +22,7 @@ playback_protocol playback_path export_allowed export_state archive_state downlo
 size_bytes expires_at export_expires_at error retention_days revision deleted_at
 cleanup_state cleanup_completed_at cleanup_error space_reclaimed archive_retry_at
 media_info
+deletion_reason
 segment_seconds hls_target_duration storage_profile
 """.split()
 )
