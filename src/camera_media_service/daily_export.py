@@ -133,14 +133,25 @@ class DailyExportService:
         if day["recorded_seconds"] <= 0:
             raise ApiError(409, "NO_RECORDING_DATA", "No saved media.")
 
-    async def request_export(self, recording_id: str) -> tuple[dict, bool]:
+    async def request_export(self, recording_id: str, *, summary=False) -> tuple[dict, bool]:
         """Compatibility status check: never start whole-day file work from a click."""
         async with self.lock:
-            day = self.daily.catalog.get_state(recording_id)
-            self._exportable(day)
-            if day.get("archive_state") == "mp4" and not self._path(recording_id).is_file():
-                raise ApiError(503, "RECORDING_STORAGE_ERROR", "Archived MP4 is unavailable.")
-            return day, False
+
+            def checked():
+                self.daily.recording.storage_guard()
+                reader = (
+                    self.daily.catalog.get_summary_state
+                    if summary
+                    else self.daily.catalog.get_state
+                )
+                day = reader(recording_id)
+                self._exportable(day)
+                if day.get("archive_state") == "mp4" and not self._path(recording_id).is_file():
+                    raise ApiError(503, "RECORDING_STORAGE_ERROR", "Archived MP4 is unavailable.")
+                self.daily.recording.storage_guard()
+                return day
+
+            return await storage_io(checked), False
 
     def _path(self, recording_id: str):
         uuid.UUID(recording_id)

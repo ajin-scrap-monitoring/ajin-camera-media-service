@@ -262,13 +262,21 @@ def register_daily_routes(
         query_fields(request, ())
         if request.can_read_body and await body_json(request):
             raise ApiError(400, "INVALID_ARGUMENT", "Export request takes an empty object.")
-        body, _ = await exports.request_export(request.match_info["recording_id"])
-        body = await read_snapshot(lambda: snapshots.read(body["recording_id"]))
+        summary = request.path.endswith("/exports/summary")
+        if summary:
+            body, _ = await exports.request_export(request.match_info["recording_id"], summary=True)
+        else:
+            body, _ = await exports.request_export(request.match_info["recording_id"])
+            body = await read_snapshot(lambda: snapshots.read(body["recording_id"]))
+        location = f"/api/v2/daily-recordings/{body['recording_id']}"
+        headers = {"Location": location + ("/summary" if summary else "")}
+        if summary:
+            headers["Cache-Control"] = "no-store"
         return await storage_io(
             web.json_response,
             body,
             status=200 if body["export_state"] == "ready" else 202,
-            headers={"Location": f"/api/v2/daily-recordings/{body['recording_id']}"},
+            headers=headers,
         )
 
     async def segment(request):
@@ -362,5 +370,6 @@ def register_daily_routes(
     app.router.add_get(base + "/hls/index.m3u8", playlist)
     app.router.add_get(base + "/media/{segment_id}.ts", segment)
     app.router.add_post(base + "/exports", prepare)
+    app.router.add_post(base + "/exports/summary", prepare)
     app.router.add_get(base + "/content", content)
     app.router.add_get(base + "/media-info", media_info, allow_head=False)
