@@ -514,11 +514,13 @@ class ThumbnailService:
             self.recording.capacity_outputs.pop(owner, None)
 
     @asynccontextmanager
-    async def deletion(self, kind, key):
+    async def deletion(self, kind, key, *, protect=False):
         # Exclude re-admission until the caller commits the parent's tombstone.
         # Workers do not take admission while draining, so lock order stays
         # admission -> video catalogue and child cleanup can always finish.
         async with self.admission:
+            if protect and ((kind, key) in self.jobs or (kind, key) in self.admitting):
+                raise ApiError(409, "EXPORT_IN_PROGRESS", "Thumbnail source is protected.")
             await self.cancel_for_delete(kind, key)
             yield
 

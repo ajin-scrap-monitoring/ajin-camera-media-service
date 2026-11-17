@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from camera_media_service.capacity_policy import CleanupPolicy
 
 
 @dataclass(slots=True)
@@ -48,6 +50,7 @@ class Settings:
     daily_width: int = 1920
     daily_height: int = 1080
     daily_fps: int = 30
+    capacity_cleanup: CleanupPolicy = field(default_factory=CleanupPolicy)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> Settings:
@@ -166,6 +169,7 @@ class Settings:
             daily_width=daily_width,
             daily_height=daily_height,
             daily_fps=_read_int(environ, "DAILY_FPS", 30, 1, 60),
+            capacity_cleanup=CleanupPolicy.from_env(environ),
         )
 
 

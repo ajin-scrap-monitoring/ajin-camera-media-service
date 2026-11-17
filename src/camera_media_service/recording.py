@@ -428,10 +428,11 @@ class RecordingService:
             return [json.loads(r[0]) for r in self.db.execute(sql, (*args, limit))]
 
     @asynccontextmanager
-    async def thumbnail_deletion(self, kind, key):
+    async def thumbnail_deletion(self, kind, key, *, protect=False):
         manager = getattr(self, "thumbnail_manager", None)
         if manager:
-            async with manager.deletion(kind, key):
+            options = {"protect": True} if protect else {}
+            async with manager.deletion(kind, key, **options):
                 yield
         else:
             yield

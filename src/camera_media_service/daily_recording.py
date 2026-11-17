@@ -982,16 +982,20 @@ class DailyRecordingService:
                 required_workspace = workspace_requirement(self.recording.root, workspace_floor)
             if guard is not None:
                 guard()
+            disk = shutil.disk_usage(self.recording.root)
             return (
                 total,
                 media_total,
-                shutil.disk_usage(self.recording.root).free,
+                disk.free,
                 remaining,
                 buffer_headroom,
                 required_workspace,
+                getattr(disk, "total", None),
             )
 
-        used, media_used, free, remaining, buffer_headroom, workspace = await storage_io(usage)
+        used, media_used, free, remaining, buffer_headroom, workspace, fs_total = await storage_io(
+            usage
+        )
         if generation != self.recording._budget_generation:
             if _attempt >= 2:
                 if inspection:
@@ -1028,6 +1032,7 @@ class DailyRecordingService:
             "daily_used_bytes": used,
             "media_used_bytes": media_used,
             "filesystem_free_bytes": free,
+            "filesystem_total_bytes": fs_total,
             "unallocated_reserved_bytes": remaining,
             "additional_reserve_bytes": reserve - remaining,
             "workspace_bytes": workspace,
