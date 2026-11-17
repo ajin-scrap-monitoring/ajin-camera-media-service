@@ -66,6 +66,9 @@ class Fixture:
             return None, "TARGETS_EXHAUSTED"
         return self.days[0], None
 
+    async def pressure_intent_state(self, key):
+        return "uncommitted" if any(d["recording_id"] == key for d in self.days) else "complete"
+
     async def delete_day(self, key, **kwargs):
         self.deleted.append(key)
         self.days.pop(0)
@@ -207,6 +210,8 @@ async def test_single_runner_does_not_duplicate_deletion(tmp_path):
         ("attempts", False),
         ("last_cycle_at", float("nan")),
         ("critical", 1),
+        ("measurement", []),
+        ("observed_at", "bad-date"),
         ("pending", {"recording_id": "oldest", "bytes": -1, "before": {}}),
     ],
 )

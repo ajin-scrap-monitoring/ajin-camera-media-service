@@ -72,7 +72,7 @@ class CapacityCleanup:
                     self.state.update(
                         consecutive_failures=0, retry_at=0, reset_id=self.policy.reset_id
                     )
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError, OverflowError):
                 self.error = "CLEANUP_STATE_UNAVAILABLE"
 
     @staticmethod
@@ -110,7 +110,14 @@ class CapacityCleanup:
             pressure_snapshot({"status": "available", "budget": pending.get("before")})
         measurement = saved.get("measurement")
         if measurement is not None:
+            if not isinstance(measurement, dict):
+                raise ValueError()
             pressure_snapshot({"status": "available", "budget": measurement.get("budget")})
+        observed = saved.get("observed_at")
+        if observed is not None and (
+            not isinstance(observed, str) or not math.isfinite(epoch(observed))
+        ):
+            raise ValueError()
 
     def status(self):
         result = json.loads(json.dumps(self.state))
@@ -179,10 +186,11 @@ class CapacityCleanup:
 
     async def _measure(self, now):
         self.recording.storage_guard()
-        value = pressure_snapshot(await self.daily.inspect_capacity(recording=True))
+        measured = await self.daily.inspect_capacity(recording=True)
+        value = pressure_snapshot(measured)
         self.state.update(
             measurement=value,
-            observed_at=iso(now),
+            observed_at=measured.get("observed_at") or iso(now),
             critical=any(
                 p["used_bytes"] * 100 >= p["limit_bytes"] * self.policy.critical_percent
                 for p in value["pressures"].values()
@@ -215,7 +223,14 @@ class CapacityCleanup:
                 LOG.exception("Capacity cleanup stopped: unavailable guarded state")
             finally:
                 self.state["last_cycle_at"] = now
+                self.state["stalled"] = bool(
+                    self.state["active"]
+                    and self.state["last_progress_at"] is not None
+                    and now - self.state["last_progress_at"] >= self.policy.stall_seconds
+                )
                 try:
+                    if self.state["measurement"] is not None:
+                        self._notice(now)
                     await finish_cleanup(self._save())
                 except (OSError, sqlite3.Error, ValueError):
                     self.error = "CLEANUP_STATE_UNAVAILABLE"
@@ -231,7 +246,14 @@ class CapacityCleanup:
             if not s["active"]:
                 s["last_progress_at"] = now
             s["active"] = True
-        self._notice(now)
+        if s["pending"] is not None:
+            intent = await self.exports.pressure_intent_state(s["pending"]["recording_id"])
+            if intent == "obsolete" or (
+                intent == "uncommitted" and (self._below_stop() or not s["active"])
+            ):
+                s["pending"] = None
+        if self._below_stop():
+            s["active"] = False
         if s["consecutive_failures"] >= self.policy.max_failures:
             s.update(mode="suspended", reason_code="FAILURE_LIMIT_REACHED")
             return
@@ -281,7 +303,11 @@ class CapacityCleanup:
                 )
             except ApiError as exc:
                 if exc.status == 409:
-                    s.update(mode="blocked", reason_code=exc.code)
+                    intent = await self.exports.pressure_intent_state(candidate["recording_id"])
+                    if intent in ("uncommitted", "obsolete"):
+                        s.update(mode="blocked", reason_code=exc.code, pending=None)
+                    else:
+                        self._failure(now, exc.code)
                     break
                 self._failure(now, "DELETE_ERROR")
                 break
@@ -331,7 +357,6 @@ class CapacityCleanup:
             and s["last_progress_at"] is not None
             and now - s["last_progress_at"] >= self.policy.stall_seconds
         )
-        self._notice(now)
 
     def _failure(self, now, reason):
         s = self.state

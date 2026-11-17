@@ -550,6 +550,24 @@ class DailyExportService:
                 rows
             ) > 1000 else "PROTECTED_TARGETS_ONLY" if protected else "TARGETS_EXHAUSTED"
 
+    async def pressure_intent_state(self, key):
+        async with self.lock:
+            try:
+                day = self.daily.catalog.get_summary_state(key)
+            except ApiError as exc:
+                if exc.status == 404:
+                    return "obsolete"
+                raise
+            if day["status"] == "deleted" and day.get("deletion_reason") == "capacity_pressure":
+                return "complete" if day.get("cleanup_state") == "complete" else "committed"
+            if (
+                day["status"] == "closed"
+                and day.get("archive_state") == "mp4"
+                and day["export_state"] == "ready"
+            ):
+                return "uncommitted"
+            return "obsolete"
+
     async def delete_day(self, recording_id: str, *, reason=None, max_bytes=None) -> None:
         pressure = reason == "capacity_pressure"
         async with self.daily.recording.thumbnail_deletion("day", recording_id, protect=pressure):
