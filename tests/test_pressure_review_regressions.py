@@ -10,6 +10,32 @@ from camera_media_service.recording import ApiError
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("final_free,expected_mode", [(1001, "suspended"), (1100, "idle")])
+async def test_tiny_partial_recovery_does_not_authorize_deleting_another_archive(
+    tmp_path, final_free, expected_mode
+):
+    f = Fixture(tmp_path)
+
+    async def tiny_gain(key, **kwargs):
+        f.deleted.append(key)
+        f.days.pop(0)
+        f.budget = measurement(810, 1001)
+
+    f.delete_day = tiny_gain
+    c = cleaner(f)
+    await c.tick(100)
+    assert c.status()["last_attempt"]["space_recovery_confirmed"] is False
+    assert c.status()["pending"]["recording_id"] == "oldest"
+    assert c.status()["successful_days"] == 1
+    c = cleaner(f)
+    f.budget = measurement(810, final_free)
+    await c.tick(110)
+    assert f.deleted == ["oldest"] and c.status()["successful_days"] == 1
+    assert c.status()["mode"] == expected_mode
+    assert c.status()["last_attempt"]["space_recovery_confirmed"] is (final_free == 1100)
+
+
+@pytest.mark.asyncio
 async def test_rejected_uncommitted_intent_does_not_delete_after_recovery(tmp_path):
     f = Fixture(tmp_path)
     real = f.delete_day

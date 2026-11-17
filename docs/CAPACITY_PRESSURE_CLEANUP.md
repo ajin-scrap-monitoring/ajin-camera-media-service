@@ -51,7 +51,9 @@
 
 한 날짜가 남은 byte 상한보다 크면 `TARGET_EXCEEDS_LIMIT`로 중단하며 더 큰 삭제나 범위 확대를 하지 않는다. SQLite에 active·미완료 대상·시도/실패/알림 상태를 보존해 재시작 후 이어 간다. 선택만 하고 논리 삭제하지 않은 대상과 이미 tombstone을 기록한 대상을 구분한다. 전자는 압박 해제 시 폐기하고 보호/상태 변경으로 거절되면 재선정한다. 후자의 미완료 파일 정리는85% 아래에서도 마무리하되 보호·처리량·재시도 제한을 유지한다. 미완료 용량 정리는 일반5초 정리 큐가 무제한 재시도하지 않으며 이 정책의 대기/실패 상한을 따른다. disabled/suspended이면 미완료 용량 정리도 자동 재개하지 않는다. RESET_ID는 삭제 대상·예산·보호 범위를 확대하지 않는다.
 
-파일 제거와 실제 공간 회수는 별도다. 삭제 전후 물리 free 증가와 날짜 사용량 감소를 모두 관찰해야 `space_recovery_confirmed=true`이다. 그 차이는 동시 녹화·다른 작업의 영향을 받는 **관측 순변화**이며 삭제 파일의 정확한 블록 수나 누적 절대 회수량이 아니다. 회수가 확인되지 않으면 해당 순회를 중단하고 제한된 재시도/중단 정책으로 처리한다. `estimated_other_growth_bytes`도 파일 크기와 순변화로 산출한 추정치이며 생성량 우세의 진단 근거이지 원인 확정값은 아니다.
+파일 제거와 실제 공간 회수는 별도다. 삭제 전후 물리 free 증가와 날짜 사용량 감소를 모두 관찰하고, `free 증가 + 추정 동시 생성량 >= 대상 논리 크기×95%`도 충족해야 `space_recovery_confirmed=true`이다. 이95%는 긴급 상태 임계값과 별개의 회수 확인 허용오차이다. 작은 썸네일만 해제됐다고 큰 MP4 전체가 회수됐다고 판단하지 않는다. 차이는 동시 녹화·다른 작업의 영향을 받는 **관측 순변화**이며 삭제 파일의 정확한 블록 수나 누적 절대 회수량이 아니다. 압축/희소 파일 등에서도 보수적으로 회수 미확인으로 남을 수 있다.
+
+회수가 확인되지 않으면 해당 순회를 중단하고 같은 완료된 날짜의 공간 회수만 제한적으로 재확인한다. 다음 날짜를 계속 삭제하지 않으며 상한 도달 시 suspended로 보고한다. 해당 건의 파일 정리는 다시 실행하지 않고 완료 건수도 한 번만 집계한다. 회수 확인에 성공한 때에만 `observed_reclaimed_bytes` 합계를 갱신한다. `estimated_other_growth_bytes`는 파일 크기와 순변화로 산출한 추정치이며 생성량 우세의 진단 근거이지 원인 확정값은 아니다.
 
 ## 조회·로그·백엔드 후속 연결
 
@@ -69,7 +71,7 @@
 - `reason_code`, `stalled`, `retry_at`, `consecutive_failures`: 중단/정체/재시도 정보. epoch인 `*_at` 숫자와 UTC ISO8601 문자열 필드를 구분한다.
 - `attempts`, `successful_days`, `observed_reclaimed_bytes`: 누적 시도·파일 정리 완료 건수·관측된 free 양의 순증가 합. `successful_days`만으로 공간 회수를 보장하지 않는다.
 - `pending`: 중단 복구용 선택된 날짜·예상 bytes·이전 budget, 없으면null.
-- `last_attempt`: 대상ID·시도/완료 UTC·예상 bytes·success·회수 확인·관측 free 증가/날짜 사용 감소·기타 증가 추정·error_code. 없으면null.
+- `last_attempt`: 대상ID·시도/완료 UTC·예상 bytes·success·회수 확인·관측 free 증가/날짜 사용 감소·기타 증가 추정·error_code. `phase`는 delete/reclaim_check, `required_recovery_bytes`는 확인 기준byte다. 없으면null.
 - `scope=closed_ready_daily_mp4`, `default_retention_days=30`, `minimum_retention_guaranteed=false`.
 
 주요 reason_code는 `TARGETS_EXHAUSTED`, `PROTECTED_TARGETS_ONLY`, `CANDIDATE_SCAN_LIMIT`, `TARGET_EXCEEDS_LIMIT`, 기존409 코드(보호/잠금/재검사 불일치), `CYCLE_LIMIT_REACHED`, `DELETE_ERROR`, `SPACE_NOT_RECLAIMED`, `GENERATION_OUTPACES_CLEANUP`, `FAILURE_LIMIT_REACHED`, `MEASUREMENT_UNAVAILABLE`다. DELETE_ERROR가 나면 pending 원본과 기존 cleanup_state/cleanup_error를 함께 확인한다. journal 손상·저장 실패는 `configuration_error=CLEANUP_STATE_UNAVAILABLE`로 정리만 중지한다.
