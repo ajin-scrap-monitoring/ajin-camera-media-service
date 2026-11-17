@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from camera_media_service.daily_models import DailyWindow
-from camera_media_service.daily_queries import scan_snapshot
+from camera_media_service.daily_queries import PUBLIC, scan_snapshot
 from camera_media_service.persisted_media_info import record_generated_info
 from camera_media_service.recording import ApiError, iso
 
@@ -109,6 +111,64 @@ class DailyCatalog:
         if row is None:
             return scan_snapshot(self.db, recording_id, arrays=False)[0]
         return json.loads(row[0])
+
+    def get_summary_state(self, recording_id):
+        """Strict bounded scalar read: never recover by replaying historical arrays."""
+        row = self.db.execute(
+            "SELECT CASE WHEN octet_length(s.body)<=65536 THEN s.body END "
+            "FROM daily_recordings d LEFT JOIN daily_states s ON s.day_id=d.id WHERE d.id=?",
+            (recording_id,),
+        ).fetchone()
+        if row is None:
+            raise ApiError(404, "DAILY_RECORDING_NOT_FOUND", "Daily recording does not exist.")
+        try:
+            state = json.loads(row[0]) if row[0] is not None else None
+            required = {
+                "recording_id",
+                "status",
+                "expires_at",
+                "window_end_at",
+                "recorded_seconds",
+                "export_state",
+            }
+            if (
+                not isinstance(state, dict)
+                or not required <= state.keys()
+                or state["recording_id"] != recording_id
+                or type(state.get("revision", 0)) is not int
+            ):
+                raise ValueError()
+            seconds = state["recorded_seconds"]
+            if (
+                type(seconds) not in (int, float)
+                or not math.isfinite(seconds)
+                or seconds < 0
+                or state["status"]
+                not in ("recording", "finalizing", "closed", "failed", "deleted", "expired")
+                or state["export_state"] not in ("not_requested", "processing", "failed", "ready")
+            ):
+                raise ValueError()
+            for name in ("window_end_at", "expires_at"):
+                value = state[name]
+                if value is None and name == "expires_at":
+                    continue
+                if (
+                    not isinstance(value, str)
+                    or datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is None
+                ):
+                    raise ValueError()
+            # The entire cached row is bounded; reject non-JSON numeric values anywhere.
+            json.dumps(state, allow_nan=False)
+        except (ValueError, TypeError, OverflowError):
+            raise ApiError(
+                503, "CATALOG_SUMMARY_UNAVAILABLE", "Bounded daily summary metadata is unavailable."
+            ) from None
+        revision = self.db.execute(
+            "SELECT revision FROM daily_revisions WHERE day_id=?", (recording_id,)
+        ).fetchone()
+        if revision:
+            state["revision"] = max(state.get("revision", 0), revision[0])
+        return {key: value for key, value in state.items() if key in PUBLIC}
 
     def save_state(self, body, *, notify=True):
         """Scalar-only transition; preserve every timeline delta without decoding it."""
