@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "camera-media-service"
-version = "0.1.0"
+version = "1.0.0"
 description = "Camera media ingest, live session, and storage runtime packaging"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"

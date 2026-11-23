@@ -1,16 +1,82 @@
-# ajin-camera-media-service
+# Ajin Camera Media Service
 
-외부 전달용 회신 MD는 로컬 전용이며 원격 저장소에 올리지 않습니다. `docs/INTEGRATION_REPLY_*.md`와 `.local-replies/`는 Git 추적에서 제외합니다.
+라즈베리파이 카메라가 보내는 JPEG를 수신해 실시간 MJPEG, 이벤트 MP4, 날짜별 HLS 재생과 MP4 다운로드로 제공하는 Python 미디어 서비스입니다. 카메라 입력이 한 번 들어오면 라이브 전달과 녹화에 각각 사용합니다. 백엔드는 내부 HTTP API로 정책을 설정하고, 영상 요청과 사용자 권한을 중개합니다.
 
-2026-11-03 카메라 미디어 후속 항목은 [추가 계약](docs/INTEGRATION_HANDOFF_2026-11-03.md), [SD 이전 절차](docs/SD_STORAGE.md)를 참조하세요. LC-5 라이다 배치는 제외합니다. 실제 적용 버전·전후 측정·남은 제한은 [검증 기록](docs/VALIDATION.md)을 따릅니다.
+**기술 스택** · Python 3.13 · asyncio · aiohttp · WebSocket · FFmpeg · SQLite WAL · Docker
 
-2026-11-07 후속 수정은 녹화 우선 보관 처리, 선택 영상 정보 DB의 커밋 분리, 날짜 MP4가 없는 진행 중 녹화의 대표 이미지 자동 준비입니다. 기존 SD·디스크 JPEG 버퍼2GiB·저장 예산을 유지합니다. 운영 적용·측정 결과와 복구 한계는 [검증 기록](docs/VALIDATION.md), 백엔드 변경 조건은 [날짜 이미지 확장 계약](docs/DAILY_THUMBNAIL_CONTRACT_2026-11-07.md)을 참조하세요. 짧은 시험을24시간 무누락 보장으로 확대하지 않습니다.
+## 담당 범위와 주요 구현
 
-카메라 엣지의 JPEG/WSS 수신, HTTP MJPEG 실시간 전달, 이벤트 전후 MP4와 한국 날짜별 상시 녹화/HLS/하루 MP4 다운로드 API를 제공하는 Python 서비스입니다.
+카메라 엣지에서 미디어 서버로 영상을 받는 인터페이스부터, 프레임 저장·영상 처리·백엔드 연동 API·Linux 운영 배포까지 미디어 서비스 영역을 설계하고 구현했습니다. 백엔드와는 이벤트 구간 요청, 재생·다운로드, 누락 정보, 저장소 상태의 계약을 정의했습니다. 아래 흐름의 라즈베리파이 송신과 백엔드·대시보드는 미디어 서비스의 연동 지점입니다.
 
-백엔드 연동 규격은 [BACKEND_API_CONTRACT.md](docs/BACKEND_API_CONTRACT.md)에 있습니다. WHEP/WebRTC 송출은 제공하지 않습니다.
+| 구현 항목 | 처리 방식과 설계 이유 |
+| --- | --- |
+| 실시간 영상 | WebSocket으로 받은 최신 JPEG를 재인코딩 없이 HTTP MJPEG로 전송합니다. [수신 코드](src/camera_media_service/ingest.py) · [HTTP API](src/camera_media_service/http_api.py) |
+| 프레임 저장과 적체 처리 | 디스크 JPEG 묶음과 SQLite 일괄 인덱싱으로 파일 생성·DB 커밋 횟수를 줄였습니다. 입력 큐를 프레임 수와 바이트로 제한하고, 디스크에 남은 미처리 프레임은 오래된 구간부터 처리합니다. 상시 녹화에 필요한 프레임은 JPEG 디코딩 전에 고릅니다. [녹화 코드](src/camera_media_service/daily_recording.py) · [인코딩 코드](src/camera_media_service/encoding.py) |
+| 날짜별 녹화와 다운로드 | 한국 시간 자정으로 날짜를 나누고 녹화 중에는 완료된 H.264/TS 조각으로 HLS를 제공합니다. 마감 뒤에는 조각을 MP4로 스트림 복사하고, 파일 검증과 재생 시각 매핑 저장을 마친 뒤 중복 TS를 정리합니다. 다운로드는 준비된 MP4를 HTTP Range로 읽습니다. [보관 코드](src/camera_media_service/daily_export.py) |
+| 이벤트 구간 추출 | `event_at` 또는 `start_at`·`end_at`으로 기존 녹화에서 필요한 구간을 추출합니다. 요청한 구간과 실제 확보 구간, 누락, 키프레임에 따른 경계 차이를 응답에 기록합니다. 시각을 생략한 기존 요청은 JPEG 버퍼 경로를 사용합니다. [연동 계약](docs/BACKEND_API_CONTRACT.md) |
+| 대용량 메타데이터 조회 | 날짜 목록·요약과 누락·재생 구간 페이지를 분리했습니다. 다운로드 준비 상태는 경량 `exports/summary`에서 확인하고, 대형 이력 배열을 재구성하지 않습니다. [요약·페이지 규격](docs/DAILY_RECORDING_PAGINATION.md) · [경량 exports](docs/DAILY_EXPORT_SUMMARY.md) |
+| 대표 이미지와 파일 정보 | 영상에서 대표 JPEG를 생성하고 기존 결과를 재사용합니다. 영상의 코덱·해상도·프레임레이트는 실제 파일 검사 결과로 제공하며, 지원되지 않는 원본 촬영 시각은 미확인으로 표기합니다. [대표 이미지 계약](docs/DAILY_THUMBNAIL_CONTRACT_2026-11-07.md) · [파일 정보 코드](src/camera_media_service/media_details.py) |
+| 운영과 장애 대응 | 카메라 수신 상태와 저장소 상태를 별도로 보고하고, 마감 영상의 정리에는 사용 중인 파일 보호와 공간 회수 확인을 적용했습니다. 날짜·전체 저장 예산과 물리 여유를 함께 판단합니다. [용량 압박 정리 규격](docs/CAPACITY_PRESSURE_CLEANUP.md) · [검증 기록](docs/VALIDATION.md) |
 
-동료에게 전달할 날짜 녹화 연동 문서는 [DAILY_RECORDING_API_GUIDE.md](docs/DAILY_RECORDING_API_GUIDE.md)입니다. 날짜 기능은 기본 비활성이며 아래 운영 설정으로 활성화합니다.
+## 처리 흐름
+
+```mermaid
+flowchart TB
+    Edge["Raspberry Pi 카메라 엣지"] -->|JPEG over WSS| Ingest["프레임 검증 · 서버 수신 시각 기록"]
+    subgraph Media["카메라 미디어 서비스"]
+        Ingest --> Live["최신 프레임 · HTTP MJPEG"]
+        Ingest --> Buffer["디스크 JPEG 버퍼 · SQLite 인덱스"]
+        Buffer --> Encode["FFmpeg · H.264/TS 녹화"]
+        Encode --> HLS["날짜별 HLS"]
+        Encode --> Archive["마감 후 MP4 보관 · 검증"]
+        Archive --> HLS
+        Buffer -->|기존 접수 시각 모드| Clip["이벤트 MP4"]
+        Encode -->|녹화 중 구간 추출| Clip
+        Archive -->|마감 날짜 구간 추출| Clip
+        Live --> API["미디어 HTTP API"]
+        HLS --> API
+        Archive -->|기존 파일 HTTP Range| API
+        Clip --> API
+    end
+    API <-->|영상 · 정책 · 상태| Backend["백엔드 게이트웨이"]
+    Backend <-->|인증된 요청 · 응답| Dashboard["대시보드"]
+```
+
+상시 녹화가 먼저 저장해 둔 MP4를 다운로드에 사용합니다. 아래는 백엔드가 경량 exports 계약으로 연결할 때의 호출 순서입니다.
+
+```mermaid
+sequenceDiagram
+    participant U as 대시보드
+    participant B as 백엔드
+    participant M as 미디어 서비스
+    U->>B: 날짜 영상 다운로드 요청
+    B->>M: GET /api/v2/daily-recordings/{id}/summary
+    M-->>B: 날짜 요약과 카메라 ID
+    Note over B: 카메라 소유 관계와 권한 확인
+    B->>M: POST /api/v2/daily-recordings/{id}/exports/summary
+    M-->>B: 보관 상태와 파일 존재 확인 결과
+    alt 보관 MP4 준비 완료
+        B->>M: GET download_path · 필요 시 Range
+        M-->>B: 기존 MP4 바이트 전송
+        B-->>U: 인증된 다운로드 응답
+    else 미준비 또는 오류
+        B-->>U: 준비 상태 또는 오류 표시
+    end
+```
+
+용량 압박 자동 정리를 활성화하면 관련 한도 중 하나가 **90% 이상**일 때 가장 오래된 마감 MP4부터 후보로 검사하고, 모든 한도가 **85% 이하**가 되면 추가 정리를 멈춥니다. **95% 이상**은 긴급 상태로 보고합니다. 파일을 제거한 뒤 물리 공간과 날짜 영상 사용량을 다시 확인하고, 회수를 확인하지 못하면 같은 건의 상태를 확인합니다. 날짜 녹화의 기본 보관기간은 30일이며, 용량 압박 시 더 일찍 정리될 수 있습니다. [정리 대상·보호 조건·상태 API](docs/CAPACITY_PRESSURE_CLEANUP.md)
+
+## 버전 구분
+
+| 구분 | 버전 | 의미 |
+| --- | --- | --- |
+| 첫 정식 릴리즈 | `1.0.0` · 태그 `v1.0.0` | 패키지 메타데이터와 릴리즈 태그가 가리키는 첫 정식 버전입니다. [패키지 메타데이터](pyproject.toml) |
+| 이전 개발 버전 | `0.1.0` | 첫 정식 릴리즈 전 패키지에 사용한 버전입니다. |
+| HTTP API | `/api/v1` · `/api/v2` | `/api/v1`은 라이브·이벤트 클립, `/api/v2`는 날짜 녹화·보관 및 정리 상태를 제공하는 경로 구분입니다. 두 경로는 같은 서비스에서 사용합니다. |
+
+## AI 활용
+
+이 README의 초안 작성, 기술 설명 정리, Mermaid 다이어그램 제작에 생성형 AI인 OpenAI Codex를 사용했습니다.
 
 ## 실행
 
@@ -79,7 +145,9 @@ HTTP API와 이벤트 녹화는 서비스 시작 시 항상 활성화됩니다. 
 | `DAILY_EXPORT_CACHE_HOURS` | 이전 환경 호환용. 보관 MP4는 날짜 `expires_at`까지 유지 |
 | `MAX_DAILY_EXPORT_JOBS` | 이전 환경 호환용. 자동 MP4 준비는 한 번에1개 |
 
-보관 기간 기본30일은 카메라별 v2 정책으로 정합니다. MP4 준비 중 TS와 MP4가 함께 존재할 추가 공간이 필요하며, 부족하면 TS를 유지하고 자동 재시도합니다. 검증은 백그라운드에서 디코더2스레드로 수행하므로 CPU·디스크 읽기 부하는 남습니다. 버퍼·이벤트·DB는 날짜 예산에 포함하지 않습니다. 날짜 예산 도달 시 기존 자료를 임의로 조기 삭제하지 않고 새 저장 누락을 보고합니다. 새 프로파일로 기존 날짜 MP4를 재인코딩하지 않습니다.
+기본 보관기간 30일은 카메라별 v2 정책으로 정합니다. MP4 준비 중에는 TS와 MP4가 함께 들어갈 공간이 필요하며, 부족하면 TS를 유지하고 자동 재시도합니다. 검증은 백그라운드에서 디코더 2스레드로 수행합니다. 날짜 예산은 날짜 녹화 관련 파일에 적용되고, JPEG 버퍼·이벤트·DB는 전체 미디어 예산에서 계산합니다. 새 프로파일은 다음 날짜부터 적용합니다.
+
+`MEDIA_CAPACITY_CLEANUP_ENABLED`의 기본값은 `false`입니다. 활성화된 환경은 압박률에 따라 만료 전 마감 MP4도 정리할 수 있습니다. 저장 공간을 확보하지 못하면 기록 대기 또는 누락 상태를 보고합니다. 환경 변수와 상세 기준은 [용량 압박 자동 정리](docs/CAPACITY_PRESSURE_CLEANUP.md)를 참조하세요.
 
 ## 날짜 녹화 적체 처리
 
@@ -89,7 +157,7 @@ HTTP API와 이벤트 녹화는 서비스 시작 시 항상 활성화됩니다. 
 
 ## 녹화 썸네일
 
-ready 클립·완료 날짜의 기존 MP4에서 실제 첫 프레임 JPEG를 준비합니다. 최대640×360, 종횡비 유지·확대 금지, 512KiB이며 생성은 한 번에1개/대기 포함4개로 제한합니다. 신규 파일 완료 후 선택 기능으로 준비하며, 과거 파일은 명시적 POST로만 준비합니다. 목록·GET·재시작에서 전체 과거 파일을 변환하지 않습니다.
+준비된 이벤트 MP4와 날짜 MP4 또는 확정된 날짜 녹화 조각에서 실제 프레임을 대표 JPEG로 준비합니다. 최대 640×360, 512KiB이고 원본 종횡비를 유지합니다. 생성은 한 번에 1개, 대기 포함 4개로 제한합니다. 기존 결과와 원본의 관계를 확인해 재사용하고, 날짜 원본이 삭제되거나 만료되면 대표 이미지도 정리합니다. [날짜 대표 이미지 계약](docs/DAILY_THUMBNAIL_CONTRACT_2026-11-07.md)
 
 기존 `media-info.thumbnail`은 백엔드 호환을 위해 unsupported/null을 유지합니다. 별도 JSON·POST·GET/HEAD 경로와 시각의 null 규칙, 브라우저 인증 게이트웨이 작업은 [썸네일 계약](docs/THUMBNAIL_API_CONTRACT_2026-11-04.md)을 참조하세요. 썸네일 오류는 영상 상태를 실패로 바꾸지 않습니다.
 
@@ -135,6 +203,9 @@ docker build -t camera-media-service .
 
 ## 검증
 
+- 2026-11-17 격리 검증에서 Linux 전체 **665개**, 디스크 기반 집중 회귀 **76개**가 통과했습니다. 자동 정리 임계값, 사용 중인 파일 보호, 공간 회수 실패 처리와 기존 녹화 API를 검증한 결과입니다. [검증 범위 및 CI](https://github.com/ajin-scrap-monitoring/ajin-camera-media-service/pull/18)
+- 준비된 MP4가 있던 대형 이력 날짜에서 경량 `exports/summary`는 운영 미디어 API 호출 5회 모두 `200`과 **1,318바이트** 응답을 반환했습니다. 해당 날짜의 단일 요청 검증이며 전체 백엔드·화면 성능 수치와는 별개입니다. [경량 exports 구현](https://github.com/ajin-scrap-monitoring/ajin-camera-media-service/pull/16)
+
 ```bash
 uv sync --frozen --extra dev
 uv run pytest
@@ -152,11 +223,16 @@ uv run ruff format --check .
 - [검증 기록](docs/VALIDATION.md)
 - [남은 운영 검증](docs/REMAINING_WORK.md)
 - [서버 A 배포와 백엔드 연결](docs/SERVER_DEPLOYMENT.md)
+- [SD 저장소 이전 절차](docs/SD_STORAGE.md)
+- [날짜 녹화 연동 가이드](docs/DAILY_RECORDING_API_GUIDE.md)
+- [추가 연동 계약](docs/INTEGRATION_HANDOFF_2026-11-03.md)
+
+외부 전달용 운영 회신은 로컬에서 관리합니다. `docs/INTEGRATION_REPLY_*.md`와 `.local-replies/`는 Git 추적에서 제외합니다.
 
 ## 이용 조건
 
 이 Repository는 코드 검토와 참고를 위해 Public으로 제공하며 프로젝트 소스 코드에 별도 라이선스를 부여하지 않는다. 외부 라이브러리에는 각 라이선스가 적용됩니다.
-# 날짜 메타데이터 저장과 구버전 롤백
+## 날짜 메타데이터 저장과 구버전 롤백
 
 날짜 조회 응답은 기존 JSON과 `daily_snapshot_deltas`의 변경분을 합쳐 제공합니다.
 `daily_states`는 보관 작업에 쓰는 작은 상태 요약입니다. 녹화 커서와 변경분은 같은
